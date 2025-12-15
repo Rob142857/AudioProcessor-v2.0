@@ -4,7 +4,11 @@ High-performance audio and video transcription for Windows x64 using OpenAI Whis
 
 ## What It Does
 
-Converts audio/video files into professionally formatted text transcripts. Automatically detects and utilizes NVIDIA GPUs for 3-5x faster processing, with CPU fallback.
+Converts audio/video files into professionally formatted text transcripts with advanced AI-powered punctuation restoration. Automatically detects and utilizes NVIDIA GPUs for 3-5x faster processing, with CPU fallback.
+
+### ✨ New: Advanced Punctuation Restoration
+
+Now includes specialized BERT-based punctuation refinement (`oliverguhr/fullstop-punctuation-multilang-large`) that significantly improves sentence and paragraph boundary detection in spoken language transcripts. See [PUNCTUATION_QUICKSTART.md](PUNCTUATION_QUICKSTART.md) for details.
 
 ## Installation
 

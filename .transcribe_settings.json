@@ -53,16 +53,17 @@
       "quality_mode": 1,
       "max_repeat_cap": 3,
       "whisper_model": "large-v3",
-      "initial_prompt": "Lecture on Spiritual teachings"
+      "initial_prompt": ""
     },
     "C:/Users/RobertEvans/OneDrive - RME Solutions Technology/_PG Completed Recordings 84-97/1988 MW": {
-      "domain_terms_file": "c:\\Users\\RobertEvans\\Downloads\\AudioProcessorAlphaVersion\\awkward_words.txt",
+      "domain_terms_file": "C:\\Users\\RobertEvans\\Downloads\\AudioProcessorAlphaVersion\\special_words.txt",
       "recursive": 0,
       "skip_existing": 0,
       "time_header": 1,
       "quality_mode": 1,
-      "max_repeat_cap": 3,
-      "whisper_model": "large-v3"
+      "max_repeat_cap": 10,
+      "whisper_model": "large-v3",
+      "initial_prompt": ""
     },
     "C:/Users/RobertEvans/OneDrive - RME Solutions Technology/_PG Completed Recordings 84-97/1996 MW": {
       "domain_terms_file": "c:\\Users\\RobertEvans\\Downloads\\AudioProcessorAlphaVersion\\awkward_words.txt",
@@ -117,6 +118,16 @@
       "quality_mode": 1,
       "max_repeat_cap": 3,
       "whisper_model": "large-v3",
+      "initial_prompt": ""
+    },
+    "C:/Users/RobertEvans/Downloads/bext2": {
+      "domain_terms_file": "C:\\Users\\RobertEvans\\Downloads\\AudioProcessorAlphaVersion\\special_words.txt",
+      "recursive": 0,
+      "skip_existing": 0,
+      "time_header": 1,
+      "quality_mode": 1,
+      "max_repeat_cap": 3,
+      "whisper_model": "large-v3-turbo",
       "initial_prompt": ""
     }
   }

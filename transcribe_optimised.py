@@ -1216,6 +1216,11 @@ def transcribe_with_dataset_optimization(input_path: str, output_dir=None, threa
         condition_on_previous_text=False,
         temperature=0.0,
         verbose=False,  # Reduce verbosity for batch processing
+        # Improve sentence boundary detection for long sentences
+        prepend_punctuations="\"'([{-",
+        append_punctuations="\"'.,:!?)]}",
+        # Enable word timestamps for prosody-based sentence merging
+        word_timestamps=True
     )
     
     # Model-specific tuning for accuracy
@@ -3080,6 +3085,26 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
         full_text = "[No speech detected or transcription failed]"
 
     print(f"⚡ Hardware utilised: {device_name}")
+    
+    # Apply prosody-based sentence merging if segments available
+    if isinstance(result, dict) and result.get("segments") and not _is_verbatim_mode():
+        try:
+            from prosody_sentence_merger import create_prosody_merger
+            print("🎵 Analyzing prosody for intelligent sentence merging...")
+            prosody_merger = create_prosody_merger(pitch_drop_threshold=0.20)  # Require 20% pitch drop for sentence end
+            
+            # Analyze boundaries using audio + timestamps
+            is_sentence_end = prosody_merger.analyze_sentence_boundaries(
+                working_input_path, 
+                result["segments"]
+            )
+            
+            # Merge based on prosody
+            full_text = prosody_merger.merge_segments(result["segments"], is_sentence_end)
+            print(f"✅ Prosody-based sentence merging complete")
+            
+        except Exception as prosody_e:
+            print(f"⚠️  Prosody analysis unavailable: {prosody_e}")
 
     # Post-processing with ULTRA/enhanced processors (skipped in verbatim)
     try:
@@ -3098,12 +3123,10 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
                 full_text, music_removed = _remove_music_hallucinations(full_text)
                 if music_removed:
                     print(f"🎵 Removed {music_removed} music/hallucination pattern(s)")
-                try:
-                    from deepmultilingualpunctuation import PunctuationModel
-                    pm_ultra = PunctuationModel()
-                    full_text = pm_ultra.restore_punctuation(full_text)
-                except Exception as punc_e:
-                    print(f"⚠️  Punctuation pre-pass unavailable: {punc_e} — proceeding with ULTRA-only punctuation fixes")
+                
+                # Punctuation refinement disabled - BERT models were introducing errors
+                # Whisper large-v3's punctuation is reliable as-is
+                
                 full_text = ultra_processor.process_text_ultra(full_text, passes=6)
                 full_text = _collapse_single_word_runs(full_text, max_repeats=2)
                 full_text = _split_long_sentences(full_text, max_chars=170)
@@ -3115,6 +3138,27 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
                 full_text, global_freq_stats = _limit_global_sentence_frequency(full_text)
                 full_text, loop_stats = _detect_and_break_loops(full_text)
                 full_text, late_artifact_stats = _remove_extended_artifacts(full_text)
+                
+                # NEW: Semantic paragraph segmentation based on topic shifts
+                # This replaces the advanced paragraph formatter for better topic-aware breaks
+                try:
+                    from paragraph_segmenter import create_paragraph_segmenter
+                    print("📊 Applying semantic paragraph segmentation...")
+                    para_segmenter = create_paragraph_segmenter(similarity_threshold=0.50)
+                    full_text = para_segmenter.segment_paragraphs(full_text, verbose=False)
+                    # Refine paragraph lengths for readability
+                    formatted_text = para_segmenter.refine_paragraphs(full_text, min_paragraph_length=150, max_paragraph_length=800)
+                except Exception as para_e:
+                    print(f"⚠️  Semantic paragraph segmentation unavailable: {para_e}")
+                    # Fallback to advanced paragraph formatter
+                    try:
+                        paragraph_formatter = create_advanced_paragraph_formatter(max_workers=text_workers)
+                        formatted_text = paragraph_formatter.format_paragraphs_advanced(full_text, target_length=600)
+                    except Exception as pf_e:
+                        print(f"⚠️  Advanced paragraph formatter failed: {pf_e} — using basic split_into_paragraphs")
+                        formatted = split_into_paragraphs(full_text, max_length=600)
+                        formatted_text = "\n\n".join(formatted) if isinstance(formatted, list) else full_text
+                
                 quality_stats = {
                     "early_artifacts": early_artifact_stats,
                     "global_frequency": global_freq_stats,
@@ -3122,13 +3166,6 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
                     "late_artifacts": late_artifact_stats,
                     "music_hallucinations_removed": music_removed,
                 }
-                try:
-                    paragraph_formatter = create_advanced_paragraph_formatter(max_workers=text_workers)
-                    formatted_text = paragraph_formatter.format_paragraphs_advanced(full_text, target_length=600)
-                except Exception as pf_e:
-                    print(f"⚠️  Advanced paragraph formatter failed: {pf_e} — using basic split_into_paragraphs")
-                    formatted = split_into_paragraphs(full_text, max_length=600)
-                    formatted_text = "\n\n".join(formatted) if isinstance(formatted, list) else full_text
             except ImportError:
                 print("⚠️  Ultra processor not available, falling back to enhanced processor")
                 if _enhanced_processor_available and create_enhanced_processor is not None:
