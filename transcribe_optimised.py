@@ -1481,35 +1481,26 @@ def transcribe_with_dataset_optimization(input_path: str, output_dir=None, threa
         print(f"⚠️  Text formatting failed: {e}")
         formatted_text = full_text
 
-    # Save files (same as original)
+    # Save files to Temp folder
     base_name = os.path.splitext(os.path.basename(input_path))[0]
-    txt_path = os.path.join(output_dir, f"{base_name}.txt")
-    docx_path = os.path.join(output_dir, f"{base_name}.docx")
+    
+    # Create Temp folder in the same directory as the source audio file
+    source_dir = os.path.dirname(input_path)
+    temp_folder = os.path.join(source_dir, "Temp")
+    os.makedirs(temp_folder, exist_ok=True)
+    
+    txt_path = os.path.join(temp_folder, f"{base_name}.txt")
 
     try:
         with open(txt_path, "w", encoding="utf-8") as f:
+            # Write full path header at the top
+            f.write(f"Source: {os.path.abspath(input_path)}\n")
+            f.write(f"Output: {os.path.abspath(txt_path)}\n\n")
             f.write(formatted_text)
         print(f"✅ Text file saved: {txt_path}")
     except Exception as e:
         print(f"❌ Failed to save text file: {e}")
         txt_path = None
-
-    try:
-        from docx import Document
-        from docx.shared import Pt, Inches, RGBColor
-        from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
-        from docx.enum.style import WD_STYLE_TYPE
-        import datetime
-        
-        doc = Document()
-        
-        # Set document properties/metadata
-        core_props = doc.core_properties
-        core_props.author = "Audio Transcription Tool"
-        core_props.title = base_name
-        core_props.subject = "Transcription"
-        core_props.created = datetime.datetime.now()
-        core_props.keywords = "transcription, audio, speech-to-text"
         
         # Set document margins (narrower for more content)
         for section in doc.sections:
@@ -1578,17 +1569,10 @@ def transcribe_with_dataset_optimization(input_path: str, output_dir=None, threa
             doc.add_paragraph('')
             
             doc.add_paragraph(formatted_text[:5000])
-            doc.save(docx_path)
-            print(f"✅ Basic Word document saved: {docx_path}")
-        except Exception as e2:
-            print(f"❌ Failed to save even basic Word document: {e2}")
-            docx_path = None
-
-    # Final stats
+        # Final stats
     elapsed = time.time() - start_time
     print("\n🎉 DATASET-OPTIMIZED TRANSCRIPTION COMPLETE!")
     print(f"📄 Text file: {txt_path}")
-    print(f"📄 Word document: {docx_path}")
     print(f"⏱️  Total time: {format_duration(elapsed)}")
 
     # Cleanup
@@ -3237,56 +3221,31 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
         formatted_text = full_text
 
     base_name = os.path.splitext(os.path.basename(input_path))[0]
-    txt_path = None  # TXT output disabled
-    docx_path = os.path.join(output_dir, f"{base_name}.docx")
-    quality_path = os.path.join(output_dir, f"{base_name}_quality_report.json")
+    
+    # Create Temp folder in the same directory as the source audio file
+    source_dir = os.path.dirname(input_path)
+    temp_folder = os.path.join(source_dir, "Temp")
+    os.makedirs(temp_folder, exist_ok=True)
+    
+    txt_path = os.path.join(temp_folder, f"{base_name}.txt")
+    quality_path = os.path.join(temp_folder, f"{base_name}_quality_report.json")
 
-    # TXT output disabled - only saving DOCX
-
-    # Save DOCX with fallback
+    # Save TXT file to Temp folder
     try:
-        doc = Document()
-        doc.add_heading(f'{base_name}', 0)
-        
-        # Add model and location info (use original selection for clarity)
-        parent_folder = os.path.basename(os.path.dirname(input_path))
-        doc.add_paragraph(f'Model: {original_model_selection}')
-        doc.add_paragraph(f'Folder: {parent_folder}')
-        doc.add_paragraph('')
-        
-        elapsed_total = time.time() - start_time
-        if os.environ.get("TRANSCRIBE_HIDE_TIME", "").lower() not in ("1", "true", "yes"):
-            doc.add_paragraph(f'Transcription time: {format_duration_hms(elapsed_total)}')
-            doc.add_paragraph('')
-        for para in formatted_text.split("\n\n"):
-            if para.strip():
-                doc.add_paragraph(para.strip())
-        doc.save(docx_path)
-        print(f"✅ Word document saved: {docx_path}")
+        with open(txt_path, "w", encoding="utf-8") as f:
+            # Write full path header at the top
+            f.write(f"Source: {os.path.abspath(input_path)}\n")
+            f.write(f"Output: {os.path.abspath(txt_path)}\n\n")
+            f.write(formatted_text)
+        print(f"✅ Text file saved: {txt_path}")
     except Exception as e:
-        print(f"❌ Failed to create Word document: {e}")
-        try:
-            doc = Document()
-            doc.add_heading(f'Transcription: {base_name}', 0)
-            
-            # Add model and location info (fallback - use original selection)
-            parent_folder = os.path.basename(os.path.dirname(input_path))
-            doc.add_paragraph(f'Model: {original_model_selection}')
-            doc.add_paragraph(f'Folder: {parent_folder}')
-            doc.add_paragraph('')
-            
-            doc.add_paragraph(formatted_text[:5000])
-            doc.save(docx_path)
-            print(f"✅ Basic Word document saved: {docx_path}")
-        except Exception as e2:
-            print(f"❌ Failed to save even basic Word document: {e2}")
-            docx_path = None
+        print(f"❌ Failed to save text file: {e}")
+        txt_path = None
 
     # Final stats
     elapsed = time.time() - start_time
     print("\n🎉 TRANSCRIPTION COMPLETE!")
     print(f"📄 Text file: {txt_path}")
-    print(f"📄 Word document: {docx_path}")
     print(f"⏱️  Total time: {format_duration(elapsed)}")
     try:
         base_quality = _summarize_quality(formatted_text, {"pipeline": quality_stats})

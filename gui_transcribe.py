@@ -148,9 +148,8 @@ def run_transcription(input_file: str, outdir: Optional[str], output_queue: queu
         )
 
         if out_txt and os.path.exists(out_txt):
-            output_queue.put("Transcription complete! Files saved next to the source file.\n")
-            output_queue.put("  Text file: {}\n".format(os.path.basename(out_txt)))
-            output_queue.put("  Word document: {}\n".format(os.path.basename(out_txt.replace('.txt', '.docx'))))
+            output_queue.put("Transcription complete! Text file saved to Temp folder.\n")
+            output_queue.put("  Text file: {}\n".format(out_txt))
         else:
             output_queue.put("Transcription failed or no output generated.\n")
 
