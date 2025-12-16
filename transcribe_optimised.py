@@ -1216,11 +1216,9 @@ def transcribe_with_dataset_optimization(input_path: str, output_dir=None, threa
         condition_on_previous_text=False,
         temperature=0.0,
         verbose=False,  # Reduce verbosity for batch processing
-        # Improve sentence boundary detection for long sentences
-        prepend_punctuations="\"'([{-",
-        append_punctuations="\"'.,:!?)]}",
-        # Enable word timestamps for prosody-based sentence merging
-        word_timestamps=True
+        # Whisper's default punctuation handling is best - don't override
+        # word_timestamps disabled for performance (not needed without prosody analysis)
+        word_timestamps=False
     )
     
     # Model-specific tuning for accuracy
@@ -3086,25 +3084,8 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
 
     print(f"⚡ Hardware utilised: {device_name}")
     
-    # Apply prosody-based sentence merging if segments available
-    if isinstance(result, dict) and result.get("segments") and not _is_verbatim_mode():
-        try:
-            from prosody_sentence_merger import create_prosody_merger
-            print("🎵 Analyzing prosody for intelligent sentence merging...")
-            prosody_merger = create_prosody_merger(pitch_drop_threshold=0.20)  # Require 20% pitch drop for sentence end
-            
-            # Analyze boundaries using audio + timestamps
-            is_sentence_end = prosody_merger.analyze_sentence_boundaries(
-                working_input_path, 
-                result["segments"]
-            )
-            
-            # Merge based on prosody
-            full_text = prosody_merger.merge_segments(result["segments"], is_sentence_end)
-            print(f"✅ Prosody-based sentence merging complete")
-            
-        except Exception as prosody_e:
-            print(f"⚠️  Prosody analysis unavailable: {prosody_e}")
+    # Prosody analysis disabled - pure Whisper output is best
+    # All attempts to modify sentence boundaries have introduced more errors than they fixed
 
     # Post-processing with ULTRA/enhanced processors (skipped in verbatim)
     try:
@@ -3256,18 +3237,11 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
         formatted_text = full_text
 
     base_name = os.path.splitext(os.path.basename(input_path))[0]
-    txt_path = os.path.join(output_dir, f"{base_name}.txt")
+    txt_path = None  # TXT output disabled
     docx_path = os.path.join(output_dir, f"{base_name}.docx")
     quality_path = os.path.join(output_dir, f"{base_name}_quality_report.json")
 
-    # Save TXT
-    try:
-        with open(txt_path, "w", encoding="utf-8") as f:
-            f.write(formatted_text)
-        print(f"✅ Text file saved: {txt_path}")
-    except Exception as e:
-        print(f"❌ Failed to save text file: {e}")
-        txt_path = None
+    # TXT output disabled - only saving DOCX
 
     # Save DOCX with fallback
     try:

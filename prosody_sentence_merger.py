@@ -124,47 +124,55 @@ class ProsodySentenceMerger:
     def _linguistic_heuristic(self, text: str) -> bool:
         """
         Fallback heuristic when prosody unavailable.
-        Look for linguistic patterns indicating continuation vs. end.
+        AGGRESSIVE merging - assume continuation unless strong evidence of sentence end.
         """
         text = text.strip()
         
-        # Very short fragments (under 5 words) likely continuations unless clear sentence end
+        # Count words
         word_count = len(text.split())
-        if word_count < 5 and not re.search(r'[.!?]\s*$', text):
-            return False
+        
+        # Anything under 8 words: MERGE (unless has proper ending punctuation and reasonable length)
+        if word_count < 8:
+            # Only allow break if ends with proper punctuation AND has at least 5 words
+            if word_count >= 5 and re.search(r'[.!?]\s*$', text):
+                # Check it's not a fragment like "Is red." or "For example."
+                if word_count <= 3 or re.match(r'^(For example|Is |Are |Was |Were |And |But |Or |So )', text, re.IGNORECASE):
+                    return False  # Still merge
+                return True  # OK to end
+            return False  # Merge
         
         # Strong indicators of continuation (should NOT end sentence)
         continuation_patterns = [
-            r'\b(and|but|or|so|because|if|when|while|as|for|with|to|in|on|at|by|from|about|into|through)\s*$',
-            r'\b(the|a|an|this|that|these|those|our|my|your|his|her|its|their)\s*$',
-            r'\b(is|are|was|were|be|been|being|have|has|had|will|would|should|could|may|might|must|can)\s*$',
-            r'\b(who|what|where|when|why|how|which)\s*$',
-            r'\b(very|really|quite|rather|somewhat|extremely)\s*$',
+            r'\b(and|but|or|so|because|if|when|while|as|for|with|to|in|on|at|by|from|about|into|through|of|that|which|who)\s*$',
+            r'\b(the|a|an|this|that|these|those|our|my|your|his|her|its|their|some|any|each|every|all)\s*$',
+            r'\b(is|are|was|were|be|been|being|have|has|had|will|would|should|could|may|might|must|can|do|does|did)\s*$',
             r',\s*$',  # Ends with comma
             r':\s*$',  # Ends with colon
             r'-\s*$',  # Ends with dash
+            r'\.\s*$',  # Even with period, check other factors
         ]
         
         for pattern in continuation_patterns:
             if re.search(pattern, text, re.IGNORECASE):
                 return False  # Continuation, not sentence end
         
-        # Fragment patterns (incomplete sentences)
-        if not re.search(r'\b(is|are|was|were|be|been|being|have|has|had|will|would|do|does|did)\b', text, re.IGNORECASE):
-            # No verb - likely fragment, should continue
-            if word_count < 10:
-                return False
+        # Check for proper sentence structure - needs both subject and predicate
+        # If missing verb, definitely continue
+        has_verb = re.search(r'\b(is|are|was|were|be|been|being|have|has|had|will|would|should|could|may|might|must|can|do|does|did|go|goes|went|come|came|make|made|take|took|get|got|see|saw|know|knew|think|thought|say|said|tell|told)\b', text, re.IGNORECASE)
         
-        # Strong indicators of sentence end
-        if re.search(r'[.!?]\s*$', text):
-            return True
+        if not has_verb and word_count < 15:
+            return False  # No verb = fragment = merge
         
-        # If sentence is reasonably long (15+ words) and has a verb, likely complete
-        if word_count >= 15:
-            return True
+        # Must be reasonably long (20+ words) to be a complete thought
+        if word_count < 20:
+            # Check if it reads as complete (has subject + verb + object/complement)
+            # Simple heuristic: if it has conjunctions mid-sentence, likely complete
+            if re.search(r'\b(and|but|or)\b', text, re.IGNORECASE) and word_count >= 12:
+                return True
+            return False  # Default: merge shorter sentences
         
-        # Default for medium-length: merge to avoid fragments
-        return False if word_count < 10 else True
+        # Long sentence (20+) with verb: likely complete
+        return True
     
     def merge_segments(self, segments: List[dict], is_sentence_end: List[bool]) -> str:
         """

@@ -358,7 +358,9 @@ def launch_gui(default_outdir: Optional[str] = None, *, default_threads: Optiona
                     proj_settings = _load_project_settings(d)
                     domain_var.set(proj_settings.get("domain_terms_file", _repo_default_terms_file() or ""))
                     recursive_var.set(proj_settings.get("recursive", 0))
-                    skip_existing_var.set(proj_settings.get("skip_existing", 1))
+                    replace_before_enabled_var.set(proj_settings.get("replace_before_enabled", 0))
+                    date_var.set(proj_settings.get("replace_before_date", datetime.datetime.now().strftime("%Y-%m-%d")))
+                    time_var.set(proj_settings.get("replace_before_time", "00:00"))
                     time_header_var.set(proj_settings.get("time_header", 1))
                     quality_mode_var.set(proj_settings.get("quality_mode", 1))
                     max_repeat_var.set(proj_settings.get("max_repeat_cap", 3))
@@ -445,27 +447,49 @@ def launch_gui(default_outdir: Optional[str] = None, *, default_threads: Optiona
 
         # Row 6: Batch options
         recursive_var = tk.IntVar(value=proj_settings.get("recursive", 0))
-        skip_existing_var = tk.IntVar(value=proj_settings.get("skip_existing", 1))
         tk.Checkbutton(combined_frame, text="Process subfolders (recursive)", variable=recursive_var, bg='white', fg='#374151', selectcolor='white', activebackground='white').grid(column=0, row=6, columnspan=2, sticky='w', padx=20, pady=(0, 8))
-        tk.Checkbutton(combined_frame, text="Skip files with existing outputs (.txt and .docx)", variable=skip_existing_var, bg='white', fg='#374151', selectcolor='white', activebackground='white').grid(column=2, row=6, columnspan=2, sticky='w', padx=20, pady=(0, 8))
+        
+        # Replace output files before date/time (for resuming incomplete batches)
+        tk.Label(combined_frame, text="Replace outputs before:", bg='white', fg='#374151', font=('Segoe UI', 10)).grid(column=2, row=6, sticky='w', padx=20, pady=(0, 8))
+        
+        replace_before_enabled_var = tk.IntVar(value=proj_settings.get("replace_before_enabled", 0))
+        tk.Checkbutton(combined_frame, text="Enable", variable=replace_before_enabled_var, bg='white', fg='#374151', selectcolor='white', activebackground='white').grid(column=3, row=6, sticky='w', padx=(0, 20), pady=(0, 8))
+        
+        # Row 6b: Date/time picker
+        datetime_frame = tk.Frame(combined_frame, bg='white')
+        datetime_frame.grid(column=2, row=7, columnspan=2, sticky='w', padx=20, pady=(0, 8))
+        
+        import datetime
+        default_date = proj_settings.get("replace_before_date", datetime.datetime.now().strftime("%Y-%m-%d"))
+        default_time = proj_settings.get("replace_before_time", "00:00")
+        
+        tk.Label(datetime_frame, text="Date:", bg='white', fg='#6b7280', font=('Segoe UI', 9)).pack(side='left', padx=(0, 4))
+        date_var = tk.StringVar(value=default_date)
+        tk.Entry(datetime_frame, textvariable=date_var, width=12, bg='#f9fafb', fg='#111827', relief='flat').pack(side='left', padx=(0, 12))
+        
+        tk.Label(datetime_frame, text="Time:", bg='white', fg='#6b7280', font=('Segoe UI', 9)).pack(side='left', padx=(0, 4))
+        time_var = tk.StringVar(value=default_time)
+        tk.Entry(datetime_frame, textvariable=time_var, width=8, bg='#f9fafb', fg='#111827', relief='flat').pack(side='left')
+        
+        tk.Label(datetime_frame, text="(YYYY-MM-DD HH:MM)", bg='white', fg='#9ca3af', font=('Segoe UI', 8)).pack(side='left', padx=(8, 0))
 
-        # Row 7: Output options
+        # Row 8: Output options
         time_header_var = tk.IntVar(value=proj_settings.get("time_header", 1))
-        tk.Checkbutton(combined_frame, text="Show 'Transcription time' in DOCX header", variable=time_header_var, bg='white', fg='#374151', selectcolor='white', activebackground='white').grid(column=0, row=7, columnspan=4, sticky='w', padx=20, pady=(0, 8))
+        tk.Checkbutton(combined_frame, text="Show 'Transcription time' in DOCX header", variable=time_header_var, bg='white', fg='#374151', selectcolor='white', activebackground='white').grid(column=0, row=8, columnspan=4, sticky='w', padx=20, pady=(0, 8))
 
         # Thin separator before quality options
-        ttk.Separator(combined_frame, orient='horizontal').grid(column=0, row=8, columnspan=4, sticky='ew', padx=20, pady=(4, 10))
+        ttk.Separator(combined_frame, orient='horizontal').grid(column=0, row=9, columnspan=4, sticky='ew', padx=20, pady=(4, 10))
 
-        # Row 9: Quality options
+        # Row 10: Quality options
         quality_mode_var = tk.IntVar(value=proj_settings.get("quality_mode", 1))  # Default to ON
-        tk.Checkbutton(combined_frame, text="Quality mode (Whisper beam search, better punctuation)", variable=quality_mode_var, bg='white', fg='#374151', selectcolor='white', activebackground='white').grid(column=0, row=9, columnspan=2, sticky='w', padx=20, pady=(0, 6))
+        tk.Checkbutton(combined_frame, text="Quality mode (Whisper beam search, better punctuation)", variable=quality_mode_var, bg='white', fg='#374151', selectcolor='white', activebackground='white').grid(column=0, row=10, columnspan=2, sticky='w', padx=20, pady=(0, 6))
 
-        tk.Label(combined_frame, text="Max repeat cap:", bg='white', fg='#374151', font=('Segoe UI', 10)).grid(column=2, row=9, sticky='w', padx=(20, 6), pady=(0, 6))
+        tk.Label(combined_frame, text="Max repeat cap:", bg='white', fg='#374151', font=('Segoe UI', 10)).grid(column=2, row=10, sticky='w', padx=(20, 6), pady=(0, 6))
         max_repeat_var = tk.IntVar(value=proj_settings.get("max_repeat_cap", 3))
-        tk.Spinbox(combined_frame, from_=1, to=10, textvariable=max_repeat_var, width=5, bg='#f9fafb', fg='#111827', relief='flat').grid(column=3, row=9, sticky='w', padx=(6, 20), pady=(0, 6))
+        tk.Spinbox(combined_frame, from_=1, to=10, textvariable=max_repeat_var, width=5, bg='#f9fafb', fg='#111827', relief='flat').grid(column=3, row=10, sticky='w', padx=(6, 20), pady=(0, 6))
 
-        # Row 9b: Model selection - expanded with multiple backends
-        tk.Label(combined_frame, text="Transcription Model:", bg='white', fg='#374151', font=('Segoe UI', 10, 'bold')).grid(column=0, row=10, sticky='w', padx=20, pady=(8, 6))
+        # Row 11: Model selection - expanded with multiple backends
+        tk.Label(combined_frame, text="Transcription Model:", bg='white', fg='#374151', font=('Segoe UI', 10, 'bold')).grid(column=0, row=11, sticky='w', padx=20, pady=(8, 6))
         
         # Available models with descriptions
         MODEL_OPTIONS = [
@@ -765,7 +789,9 @@ def launch_gui(default_outdir: Optional[str] = None, *, default_threads: Optiona
                         proj_settings = _load_project_settings(current_folder)
                         proj_settings["domain_terms_file"] = dom_path
                         proj_settings["recursive"] = recursive_var.get()
-                        proj_settings["skip_existing"] = skip_existing_var.get()
+                        proj_settings["replace_before_enabled"] = replace_before_enabled_var.get()
+                        proj_settings["replace_before_date"] = date_var.get()
+                        proj_settings["replace_before_time"] = time_var.get()
                         proj_settings["time_header"] = time_header_var.get()
                         proj_settings["quality_mode"] = quality_mode_var.get()
                         proj_settings["max_repeat_cap"] = max_repeat_var.get()
@@ -826,13 +852,35 @@ def launch_gui(default_outdir: Optional[str] = None, *, default_threads: Optiona
                         def _is_supported(filename: str) -> bool:
                             return os.path.splitext(filename)[1].lower() in SUPPORTED_EXTS
 
-                        def _has_outputs(path: str) -> bool:
+                        def _should_skip_file(path: str) -> bool:
+                            """Check if file should be skipped based on output file modification time."""
+                            if replace_before_enabled_var.get() == 0:
+                                return False  # Feature disabled, never skip
+                            
                             base = os.path.splitext(os.path.basename(path))[0]
                             folder = os.path.dirname(path)
-                            txt_path = os.path.join(folder, base + ".txt")
                             docx_path = os.path.join(folder, base + ".docx")
-                            # Skip only if BOTH outputs exist
-                            return os.path.exists(txt_path) and os.path.exists(docx_path)
+                            
+                            # Check if DOCX output exists
+                            if not os.path.exists(docx_path):
+                                return False  # No output, don't skip
+                            
+                            # Parse cutoff datetime
+                            try:
+                                import datetime
+                                cutoff_str = f"{date_var.get()} {time_var.get()}"
+                                cutoff_dt = datetime.datetime.strptime(cutoff_str, "%Y-%m-%d %H:%M")
+                                
+                                # Get DOCX modification time
+                                docx_mtime = os.path.getmtime(docx_path)
+                                docx_dt = datetime.datetime.fromtimestamp(docx_mtime)
+                                
+                                # Skip if output is NEWER than cutoff (was created after the cutoff)
+                                return docx_dt >= cutoff_dt
+                                
+                            except Exception as e:
+                                q.put(f"Warning: Could not parse date/time: {e}\n")
+                                return False  # On error, don't skip
 
                         files = []
                         skipped = 0
@@ -843,9 +891,9 @@ def launch_gui(default_outdir: Optional[str] = None, *, default_threads: Optiona
                                         if not _is_supported(name):
                                             continue
                                         full = os.path.join(dirpath, name)
-                                        if skip_existing_var.get() == 1 and _has_outputs(full):
+                                        if _should_skip_file(full):
                                             rel = os.path.relpath(full, inp)
-                                            q.put(f"Skipping (outputs exist): {rel}\n")
+                                            q.put(f"Skipping (output newer than cutoff): {rel}\n")
                                             skipped += 1
                                             continue
                                         files.append(full)
@@ -853,8 +901,8 @@ def launch_gui(default_outdir: Optional[str] = None, *, default_threads: Optiona
                                 for name in sorted(os.listdir(inp)):
                                     full = os.path.join(inp, name)
                                     if os.path.isfile(full) and _is_supported(name):
-                                        if skip_existing_var.get() == 1 and _has_outputs(full):
-                                            q.put(f"Skipping (outputs exist): {name}\n")
+                                        if _should_skip_file(full):
+                                            q.put(f"Skipping (output newer than cutoff): {name}\n")
                                             skipped += 1
                                             continue
                                         files.append(full)
