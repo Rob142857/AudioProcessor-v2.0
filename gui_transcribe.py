@@ -15,6 +15,7 @@ import sys
 import subprocess
 import json
 from typing import Optional, List
+import gc
 
 # GUI toolkit
 import tkinter as tk
@@ -44,6 +45,9 @@ DEFAULT_DOWNLOADS = os.path.normpath(os.path.join(os.path.expanduser("~"), "Down
 # Repo root (folder containing this script)
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_PATH = os.path.join(REPO_ROOT, ".transcribe_settings.json")
+
+# Global stop flag for transcription cancellation
+STOP_FLAG = threading.Event()
 
 def _load_settings() -> dict:
     try:
@@ -84,6 +88,11 @@ def run_transcription(input_file: str, outdir: Optional[str], output_queue: queu
 
     Output directory defaults to the source file directory if not provided.
     """
+    # Check stop flag before processing
+    if STOP_FLAG.is_set():
+        output_queue.put("Transcription cancelled by user.\n")
+        return
+    
     try:
         # Memory cleanup BEFORE processing each file
         print("🧹 Performing memory cleanup before file processing...")
@@ -215,6 +224,14 @@ def run_batch_transcription(paths: List[str], outdir_override: Optional[str], ou
         progress_win.set_file_progress(0, total)
 
     for idx, p in enumerate(paths, start=1):
+        # Check stop flag before each file
+        if STOP_FLAG.is_set():
+            output_queue.put("\nBatch processing cancelled by user.\n")
+            output_queue.put("Successfully processed: {} files\n".format(successful))
+            if failed > 0:
+                output_queue.put("Failed: {} files\n".format(failed))
+            return
+        
         output_queue.put("\n[{} / {}] Processing: {}\n".format(idx, total, os.path.basename(p)))
         
         # Update progress window
@@ -752,6 +769,8 @@ def launch_gui(default_outdir: Optional[str] = None, *, default_threads: Optiona
             log_text.insert('end', "Starting transcription...\n")
             log_text.configure(state='disabled')
             run_btn.configure(state='disabled')
+            stop_btn.configure(state='normal')
+            STOP_FLAG.clear()  # Reset stop flag
 
             def worker():
                 old_out, old_err = sys.stdout, sys.stderr
@@ -942,11 +961,94 @@ def launch_gui(default_outdir: Optional[str] = None, *, default_threads: Optiona
                         except:
                             pass
                     root.after(0, lambda: run_btn.configure(state='normal'))
+                    root.after(0, lambda: stop_btn.configure(state='disabled'))
 
             threading.Thread(target=worker, daemon=True).start()
 
-        run_btn = tk.Button(mainframe, text="Start Transcription", command=start_transcription_thread, font=('Segoe UI', 12, 'bold'), bg='#007acc', fg='white', relief='flat', borderwidth=0, padx=30, pady=12, activebackground='#0056b3', activeforeground='white', cursor='hand2')
-        run_btn.grid(column=1, row=12, pady=(10, 0))
+        # Button frame for run, stop, and clear cache buttons
+        button_frame = tk.Frame(mainframe, bg='white')
+        button_frame.grid(column=0, row=12, columnspan=3, pady=(10, 0))
+        
+        run_btn = tk.Button(button_frame, text="Start Transcription", command=start_transcription_thread, font=('Segoe UI', 12, 'bold'), bg='#007acc', fg='white', relief='flat', borderwidth=0, padx=30, pady=12, activebackground='#0056b3', activeforeground='white', cursor='hand2')
+        run_btn.pack(side='left', padx=(0, 10))
+        
+        def stop_transcription():
+            """Stop the running transcription process."""
+            STOP_FLAG.set()
+            stop_btn.configure(state='disabled')
+            log_text.configure(state='normal')
+            log_text.insert('end', "\n🛑 Stopping transcription...\n")
+            log_text.configure(state='disabled')
+            log_text.see('end')
+        
+        stop_btn = tk.Button(button_frame, text="Stop", command=stop_transcription, font=('Segoe UI', 12, 'bold'), bg='#dc2626', fg='white', relief='flat', borderwidth=0, padx=30, pady=12, activebackground='#b91c1c', activeforeground='white', cursor='hand2', state='disabled')
+        stop_btn.pack(side='left', padx=(0, 10))
+        
+        def clear_cache():
+            """Clear GPU, RAM, and model cache."""
+            log_text.configure(state='normal')
+            log_text.insert('end', "\n🧹 Clearing cache...\n")
+            log_text.configure(state='disabled')
+            log_text.see('end')
+            
+            def clear_worker():
+                try:
+                    # Force garbage collection
+                    collected = gc.collect()
+                    log_text.configure(state='normal')
+                    log_text.insert('end', f"   Garbage collected: {collected} objects\n")
+                    log_text.configure(state='disabled')
+                    
+                    # Clear GPU cache if available
+                    try:
+                        import torch
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                            torch.cuda.synchronize()
+                            log_text.configure(state='normal')
+                            log_text.insert('end', "   GPU cache cleared\n")
+                            log_text.configure(state='disabled')
+                            
+                            # Show GPU memory
+                            try:
+                                gpu_memory = torch.cuda.memory_allocated() / 1024**3
+                                log_text.configure(state='normal')
+                                log_text.insert('end', f"   GPU memory: {gpu_memory:.2f} GB\n")
+                                log_text.configure(state='disabled')
+                            except:
+                                pass
+                    except ImportError:
+                        log_text.configure(state='normal')
+                        log_text.insert('end', "   PyTorch not available, GPU cache not cleared\n")
+                        log_text.configure(state='disabled')
+                    
+                    # Show RAM usage
+                    try:
+                        import psutil
+                        process = psutil.Process(os.getpid())
+                        memory_mb = process.memory_info().rss / 1024 / 1024
+                        log_text.configure(state='normal')
+                        log_text.insert('end', f"   RAM usage: {memory_mb:.1f} MB\n")
+                        log_text.configure(state='disabled')
+                    except:
+                        pass
+                    
+                    log_text.configure(state='normal')
+                    log_text.insert('end', "✅ Cache cleared successfully\n")
+                    log_text.configure(state='disabled')
+                    log_text.see('end')
+                    
+                except Exception as e:
+                    log_text.configure(state='normal')
+                    log_text.insert('end', f"❌ Error clearing cache: {e}\n")
+                    log_text.configure(state='disabled')
+                    log_text.see('end')
+            
+            threading.Thread(target=clear_worker, daemon=True).start()
+        
+        cache_btn = tk.Button(button_frame, text="Clear Cache", command=clear_cache, font=('Segoe UI', 12, 'bold'), bg='#f59e0b', fg='white', relief='flat', borderwidth=0, padx=30, pady=12, activebackground='#d97706', activeforeground='white', cursor='hand2')
+        cache_btn.pack(side='left')
+        
         poll_queue()
         root.mainloop()
     except Exception as e:
