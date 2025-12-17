@@ -1,0 +1,74 @@
+{
+  "total_sentences": 879,
+  "unique_sentences": 873,
+  "top_repeated": [
+    [
+      "i",
+      3
+    ],
+    [
+      "yes",
+      2
+    ],
+    [
+      "because it's white",
+      2
+    ],
+    [
+      "the dove",
+      2
+    ],
+    [
+      "gurdjieff",
+      2
+    ]
+  ],
+  "pipeline": {
+    "early_artifacts": {
+      "patterns": {},
+      "lines_removed": 0,
+      "inline_removed": {
+        "as written": 1
+      }
+    },
+    "global_frequency": {
+      "unique_sentences": 873,
+      "total_sentences": 879,
+      "dropped_sentences": 0,
+      "cap": 4,
+      "top_repeated": [
+        [
+          "i",
+          3
+        ],
+        [
+          "yes",
+          2
+        ],
+        [
+          "because it's white",
+          2
+        ],
+        [
+          "the dove",
+          2
+        ],
+        [
+          "gurdjieff",
+          2
+        ]
+      ]
+    },
+    "loop_detection": {
+      "loop_events": 0,
+      "original_sentences": 879,
+      "final_sentences": 879
+    },
+    "late_artifacts": {
+      "patterns": {},
+      "lines_removed": 0,
+      "inline_removed": {}
+    },
+    "music_hallucinations_removed": 6
+  }
+}

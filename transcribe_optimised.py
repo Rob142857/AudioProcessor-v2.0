@@ -1501,75 +1501,8 @@ def transcribe_with_dataset_optimization(input_path: str, output_dir=None, threa
     except Exception as e:
         print(f"❌ Failed to save text file: {e}")
         txt_path = None
-        
-        # Set document margins (narrower for more content)
-        for section in doc.sections:
-            section.top_margin = Inches(0.75)
-            section.bottom_margin = Inches(0.75)
-            section.left_margin = Inches(1.0)
-            section.right_margin = Inches(1.0)
-        
-        # Configure default paragraph style
-        style = doc.styles['Normal']
-        font = style.font
-        font.name = 'Calibri'
-        font.size = Pt(11)
-        para_format = style.paragraph_format
-        para_format.space_after = Pt(8)
-        para_format.line_spacing_rule = WD_LINE_SPACING.MULTIPLE
-        para_format.line_spacing = 1.15
-        
-        # Add title
-        title = doc.add_heading(f'{base_name}', 0)
-        title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        
-        # Add metadata in smaller italic text
-        parent_folder = os.path.basename(os.path.dirname(input_path))
-        meta_para = doc.add_paragraph()
-        meta_run = meta_para.add_run(f'Model: {selected_model_name}  •  Source: {parent_folder}')
-        meta_run.font.size = Pt(9)
-        meta_run.font.italic = True
-        meta_run.font.color.rgb = RGBColor(128, 128, 128)
-        meta_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-        elapsed_total = time.time() - start_time
-        if os.environ.get("TRANSCRIBE_HIDE_TIME", "").lower() not in ("1", "true", "yes"):
-            time_para = doc.add_paragraph()
-            time_run = time_para.add_run(f'Transcription time: {format_duration_hms(elapsed_total)}')
-            time_run.font.size = Pt(9)
-            time_run.font.italic = True
-            time_run.font.color.rgb = RGBColor(128, 128, 128)
-            time_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        
-        # Add separator line
-        doc.add_paragraph('─' * 50).alignment = WD_ALIGN_PARAGRAPH.CENTER
-        doc.add_paragraph('')  # Spacing
-
-        if _is_verbatim_mode():
-            # Preserve raw text as a single block to avoid reflow changes
-            doc.add_paragraph(formatted_text)
-        else:
-            for para in formatted_text.split("\n\n"):
-                if para.strip():
-                    p = doc.add_paragraph(para.strip())
-                    p.paragraph_format.first_line_indent = Inches(0.25)
-        
-        doc.save(docx_path)
-        print(f"✅ Word document saved: {docx_path}")
-    except Exception as e:
-        print(f"❌ Failed to create Word document: {e}")
-        try:
-            doc = Document()
-            doc.add_heading(f'Transcription: {base_name}', 0)
-            
-            # Add model and location info (fallback)
-            parent_folder = os.path.basename(os.path.dirname(input_path))
-            doc.add_paragraph(f'Model: {selected_model_name}')
-            doc.add_paragraph(f'Folder: {parent_folder}')
-            doc.add_paragraph('')
-            
-            doc.add_paragraph(formatted_text[:5000])
-        # Final stats
+    # Final stats
     elapsed = time.time() - start_time
     print("\n🎉 DATASET-OPTIMIZED TRANSCRIPTION COMPLETE!")
     print(f"📄 Text file: {txt_path}")

@@ -1,0 +1,64 @@
+{
+  "total_sentences": 1138,
+  "unique_sentences": 1134,
+  "top_repeated": [
+    [
+      "yes",
+      2
+    ],
+    [
+      "they love to misunderstand",
+      2
+    ],
+    [
+      "we put things out of the mind",
+      2
+    ],
+    [
+      "what did you feel it was about",
+      2
+    ]
+  ],
+  "pipeline": {
+    "early_artifacts": {
+      "patterns": {},
+      "lines_removed": 0,
+      "inline_removed": {}
+    },
+    "global_frequency": {
+      "unique_sentences": 1134,
+      "total_sentences": 1138,
+      "dropped_sentences": 0,
+      "cap": 4,
+      "top_repeated": [
+        [
+          "yes",
+          2
+        ],
+        [
+          "they love to misunderstand",
+          2
+        ],
+        [
+          "we put things out of the mind",
+          2
+        ],
+        [
+          "what did you feel it was about",
+          2
+        ]
+      ]
+    },
+    "loop_detection": {
+      "loop_events": 0,
+      "original_sentences": 1138,
+      "final_sentences": 1138
+    },
+    "late_artifacts": {
+      "patterns": {},
+      "lines_removed": 0,
+      "inline_removed": {}
+    },
+    "music_hallucinations_removed": 3
+  }
+}

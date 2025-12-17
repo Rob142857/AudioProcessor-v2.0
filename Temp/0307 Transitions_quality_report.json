@@ -1,0 +1,48 @@
+{
+  "total_sentences": 1071,
+  "unique_sentences": 1067,
+  "top_repeated": [
+    [
+      "yes",
+      4
+    ],
+    [
+      "true",
+      2
+    ]
+  ],
+  "pipeline": {
+    "early_artifacts": {
+      "patterns": {},
+      "lines_removed": 0,
+      "inline_removed": {}
+    },
+    "global_frequency": {
+      "unique_sentences": 1067,
+      "total_sentences": 1073,
+      "dropped_sentences": 2,
+      "cap": 4,
+      "top_repeated": [
+        [
+          "yes",
+          6
+        ],
+        [
+          "true",
+          2
+        ]
+      ]
+    },
+    "loop_detection": {
+      "loop_events": 0,
+      "original_sentences": 1071,
+      "final_sentences": 1071
+    },
+    "late_artifacts": {
+      "patterns": {},
+      "lines_removed": 0,
+      "inline_removed": {}
+    },
+    "music_hallucinations_removed": 2
+  }
+}

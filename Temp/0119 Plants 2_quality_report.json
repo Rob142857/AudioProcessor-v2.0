@@ -1,0 +1,48 @@
+{
+  "total_sentences": 465,
+  "unique_sentences": 463,
+  "top_repeated": [
+    [
+      "no film of water is required",
+      2
+    ],
+    [
+      "yes",
+      2
+    ]
+  ],
+  "pipeline": {
+    "early_artifacts": {
+      "patterns": {},
+      "lines_removed": 0,
+      "inline_removed": {}
+    },
+    "global_frequency": {
+      "unique_sentences": 463,
+      "total_sentences": 465,
+      "dropped_sentences": 0,
+      "cap": 4,
+      "top_repeated": [
+        [
+          "no film of water is required",
+          2
+        ],
+        [
+          "yes",
+          2
+        ]
+      ]
+    },
+    "loop_detection": {
+      "loop_events": 0,
+      "original_sentences": 465,
+      "final_sentences": 465
+    },
+    "late_artifacts": {
+      "patterns": {},
+      "lines_removed": 0,
+      "inline_removed": {}
+    },
+    "music_hallucinations_removed": 2
+  }
+}

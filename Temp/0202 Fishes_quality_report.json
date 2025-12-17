@@ -1,0 +1,48 @@
+{
+  "total_sentences": 890,
+  "unique_sentences": 886,
+  "top_repeated": [
+    [
+      "dr",
+      4
+    ],
+    [
+      "yes",
+      2
+    ]
+  ],
+  "pipeline": {
+    "early_artifacts": {
+      "patterns": {},
+      "lines_removed": 0,
+      "inline_removed": {}
+    },
+    "global_frequency": {
+      "unique_sentences": 886,
+      "total_sentences": 890,
+      "dropped_sentences": 0,
+      "cap": 4,
+      "top_repeated": [
+        [
+          "dr",
+          4
+        ],
+        [
+          "yes",
+          2
+        ]
+      ]
+    },
+    "loop_detection": {
+      "loop_events": 0,
+      "original_sentences": 890,
+      "final_sentences": 890
+    },
+    "late_artifacts": {
+      "patterns": {},
+      "lines_removed": 0,
+      "inline_removed": {}
+    },
+    "music_hallucinations_removed": 1
+  }
+}

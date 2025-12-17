@@ -1,0 +1,64 @@
+{
+  "total_sentences": 1052,
+  "unique_sentences": 1044,
+  "top_repeated": [
+    [
+      "yes",
+      4
+    ],
+    [
+      "dr",
+      4
+    ],
+    [
+      "self-love",
+      2
+    ],
+    [
+      "our attitudes are like sponges",
+      2
+    ]
+  ],
+  "pipeline": {
+    "early_artifacts": {
+      "patterns": {},
+      "lines_removed": 0,
+      "inline_removed": {}
+    },
+    "global_frequency": {
+      "unique_sentences": 1044,
+      "total_sentences": 1053,
+      "dropped_sentences": 1,
+      "cap": 4,
+      "top_repeated": [
+        [
+          "yes",
+          5
+        ],
+        [
+          "dr",
+          4
+        ],
+        [
+          "self-love",
+          2
+        ],
+        [
+          "our attitudes are like sponges",
+          2
+        ]
+      ]
+    },
+    "loop_detection": {
+      "loop_events": 0,
+      "original_sentences": 1052,
+      "final_sentences": 1052
+    },
+    "late_artifacts": {
+      "patterns": {},
+      "lines_removed": 0,
+      "inline_removed": {}
+    },
+    "music_hallucinations_removed": 3
+  }
+}

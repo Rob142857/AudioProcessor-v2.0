@@ -1,0 +1,56 @@
+{
+  "total_sentences": 1226,
+  "unique_sentences": 1222,
+  "top_repeated": [
+    [
+      "yes",
+      3
+    ],
+    [
+      "it's not going to be lost",
+      2
+    ],
+    [
+      "it's a mess",
+      2
+    ]
+  ],
+  "pipeline": {
+    "early_artifacts": {
+      "patterns": {},
+      "lines_removed": 0,
+      "inline_removed": {}
+    },
+    "global_frequency": {
+      "unique_sentences": 1222,
+      "total_sentences": 1226,
+      "dropped_sentences": 0,
+      "cap": 4,
+      "top_repeated": [
+        [
+          "yes",
+          3
+        ],
+        [
+          "it's not going to be lost",
+          2
+        ],
+        [
+          "it's a mess",
+          2
+        ]
+      ]
+    },
+    "loop_detection": {
+      "loop_events": 0,
+      "original_sentences": 1226,
+      "final_sentences": 1226
+    },
+    "late_artifacts": {
+      "patterns": {},
+      "lines_removed": 0,
+      "inline_removed": {}
+    },
+    "music_hallucinations_removed": 3
+  }
+}

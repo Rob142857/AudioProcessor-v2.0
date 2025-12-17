@@ -1,0 +1,30 @@
+{
+  "total_sentences": 24,
+  "unique_sentences": 24,
+  "top_repeated": [],
+  "pipeline": {
+    "early_artifacts": {
+      "patterns": {},
+      "lines_removed": 0,
+      "inline_removed": {}
+    },
+    "global_frequency": {
+      "unique_sentences": 24,
+      "total_sentences": 24,
+      "dropped_sentences": 0,
+      "cap": 4,
+      "top_repeated": []
+    },
+    "loop_detection": {
+      "loop_events": 0,
+      "original_sentences": 24,
+      "final_sentences": 24
+    },
+    "late_artifacts": {
+      "patterns": {},
+      "lines_removed": 0,
+      "inline_removed": {}
+    },
+    "music_hallucinations_removed": 3
+  }
+}

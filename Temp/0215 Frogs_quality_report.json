@@ -1,0 +1,72 @@
+{
+  "total_sentences": 887,
+  "unique_sentences": 882,
+  "top_repeated": [
+    [
+      "it's an idiot",
+      2
+    ],
+    [
+      "it's a change of internal state",
+      2
+    ],
+    [
+      "wouldn't matter",
+      2
+    ],
+    [
+      "yes",
+      2
+    ],
+    [
+      "how do you bring fun into it",
+      2
+    ]
+  ],
+  "pipeline": {
+    "early_artifacts": {
+      "patterns": {},
+      "lines_removed": 0,
+      "inline_removed": {}
+    },
+    "global_frequency": {
+      "unique_sentences": 882,
+      "total_sentences": 887,
+      "dropped_sentences": 0,
+      "cap": 4,
+      "top_repeated": [
+        [
+          "it's an idiot",
+          2
+        ],
+        [
+          "it's a change of internal state",
+          2
+        ],
+        [
+          "wouldn't matter",
+          2
+        ],
+        [
+          "yes",
+          2
+        ],
+        [
+          "how do you bring fun into it",
+          2
+        ]
+      ]
+    },
+    "loop_detection": {
+      "loop_events": 0,
+      "original_sentences": 887,
+      "final_sentences": 887
+    },
+    "late_artifacts": {
+      "patterns": {},
+      "lines_removed": 0,
+      "inline_removed": {}
+    },
+    "music_hallucinations_removed": 4
+  }
+}
