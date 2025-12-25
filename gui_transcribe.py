@@ -517,7 +517,8 @@ def launch_gui(default_outdir: Optional[str] = None, *, default_threads: Optiona
             ("insanely-fast-whisper", "Insanely-Fast-Whisper (GPU optimized, batched)"),
         ]
         
-        model_choice_var = tk.StringVar(value=proj_settings.get("whisper_model", "large-v3-turbo"))
+        # Default to best-accuracy native Whisper model unless project overrides.
+        model_choice_var = tk.StringVar(value=proj_settings.get("whisper_model", "large-v3"))
         
         model_frame = tk.Frame(combined_frame, bg='white')
         model_frame.grid(column=1, row=10, columnspan=3, sticky='w', padx=(12, 20), pady=(8, 6))
@@ -843,6 +844,18 @@ def launch_gui(default_outdir: Optional[str] = None, *, default_threads: Optiona
                     try:
                         selected_model = model_choice_var.get()
                         os.environ["TRANSCRIBE_MODEL_NAME"] = selected_model
+
+                        # If user picked a native Whisper model explicitly, prefer native backend.
+                        # This disables the low-VRAM auto-switch-to-faster-whisper heuristic.
+                        is_native_selection = not (
+                            selected_model.startswith("faster-whisper-")
+                            or selected_model.startswith("distil-whisper-")
+                            or selected_model == "insanely-fast-whisper"
+                        )
+                        if is_native_selection:
+                            os.environ["TRANSCRIBE_FORCE_NATIVE_WHISPER"] = "1"
+                        else:
+                            os.environ.pop("TRANSCRIBE_FORCE_NATIVE_WHISPER", None)
                     except Exception:
                         pass
 

@@ -102,7 +102,7 @@ def _apply_recommended_env_defaults() -> None:
         "TRANSCRIBE_VERBATIM": "0",            # Enable post-processing for better punctuation/formatting
         "TRANSCRIBE_PARAGRAPH_GAP": "1.8",     # Silence gap (seconds) for paragraph breaks (nudge up for clearer topic shifts)
         # Model selection
-        "TRANSCRIBE_MODEL_NAME": "large-v3-turbo",   # Turbo model for good speed/accuracy balance
+        "TRANSCRIBE_MODEL_NAME": "large-v3",   # Best accuracy (slower)
         # GPU safety / fragmentation mitigation
         "TRANSCRIBE_GPU_FRACTION": "0.92",     # Leave headroom instead of 0.99 to reduce OOM risk
         # Processing feature toggles - QUALITY MODE ENABLED BY DEFAULT
@@ -113,6 +113,7 @@ def _apply_recommended_env_defaults() -> None:
         # Optional force flags disabled
         "TRANSCRIBE_FORCE_GPU": "0",           # Respect preflight memory heuristic
         "TRANSCRIBE_FORCE_FP16": "0",          # Stability over memory unless user demands
+        "TRANSCRIBE_FORCE_NATIVE_WHISPER": "0", # If set, do not auto-switch to faster-whisper
         # Perf mode off (user can enable for aggressive thread tweaks)
         "TRANSCRIBE_MAX_PERF": "0",
         # Allow domain-specific prompts for better word recognition
@@ -2269,10 +2270,13 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
                     torch_api.set_float32_matmul_precision("high")
                 except Exception:
                     pass
-                # Enable GPU memory pooling for better shared memory utilization
+                # Only raise memory fraction aggressively on high-VRAM GPUs.
+                # On 8GB-class GPUs, forcing 0.99 increases OOM risk for large models.
                 try:
-                    torch_api.cuda.set_per_process_memory_fraction(0.99, device=0)
-                    print("🧩 ULTRA GPU Memory Pooling: Enabled for 15GB+ shared memory utilization")
+                    total_vram = float(config.get("cuda_total_vram_gb") or 0.0)
+                    if total_vram >= 12:
+                        torch_api.cuda.set_per_process_memory_fraction(0.99, device=0)
+                        print("🧩 GPU Memory Pooling: Enabled (high-VRAM)")
                 except Exception:
                     pass
             except Exception:
@@ -2290,7 +2294,9 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
             
             # Use the backend determined from model name parsing above
             # Auto-switch to faster-whisper for large models on low-VRAM GPUs (only if native)
-            if backend == "native" and total_vram <= 8 and selected_model_name in ["large-v3", "large-v3-turbo"]:
+            # Allow explicit override to keep native Whisper when requested.
+            force_native = os.environ.get("TRANSCRIBE_FORCE_NATIVE_WHISPER", "0").strip().lower() in ("1", "true", "yes")
+            if (not force_native) and backend == "native" and total_vram <= 8 and selected_model_name in ["large-v3", "large-v3-turbo"]:
                 backend = "faster-whisper"
                 print(f"🎯 Auto-switching to faster-whisper backend for {selected_model_name} on {total_vram:.1f}GB GPU")
             
