@@ -160,6 +160,57 @@ def convert_txt_to_docx(txt_path: Path, year: Optional[int] = None) -> Path:
     return out_path
 
 
+def convert_txt_to_docx_from_text(body_text: str, source_audio_path: Path, year: Optional[int] = None) -> Path:
+    """Convert transcript text directly to DOCX, saving next to the source audio file.
+    
+    Args:
+        body_text: The formatted transcript text to include in the document
+        source_audio_path: Path to the original audio/video file (DOCX will be saved next to it)
+        year: Optional year override for date inference
+    
+    Returns:
+        Path to the created DOCX file
+    """
+    # Infer year from the directory structure if not provided explicitly.
+    if year is None:
+        year = infer_year_from_ancestors(source_audio_path.parent)
+
+    # Infer date from filename MMDD (using source audio filename)
+    d = infer_date_from_filename(source_audio_path.name, year)
+    weekday = d.strftime("%A")
+    month_name = d.strftime("%B")
+    date_line = f"{weekday}, {d.day} {month_name} {d.year}"
+
+    # Build title from source audio filename
+    title = make_title_from_filename(source_audio_path.name)
+
+    # Create DOCX
+    doc = Document()
+
+    # Title
+    heading = doc.add_heading(title, level=0)
+    heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    # Date line
+    p_date = doc.add_paragraph(date_line)
+    p_date.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    # Author line
+    p_author = doc.add_paragraph("by Dr Philip Groves")
+    p_author.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    # Blank line before body
+    doc.add_paragraph("")
+
+    # Body paragraphs
+    add_paragraphs_from_text(doc, body_text)
+
+    # Output path: same folder as source audio, .docx extension
+    out_path = source_audio_path.with_suffix(".docx")
+    doc.save(out_path)
+    return out_path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Convert transcript .txt file(s) to formatted .docx files ready to print. Can process a single file or all .txt files in a folder.")
     parser.add_argument("input", help="Path to a transcript .txt file or a folder containing .txt files")

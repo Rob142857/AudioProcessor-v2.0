@@ -1959,7 +1959,7 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
     - No VAD; transcribe the entire file
     - Robust DOCX save with fallback
     - Safe cleanup that avoids torch re-import problems
-    Returns path to the .txt file.
+    Returns path to the .docx file saved next to the source file.
     """
     # Initialize all variables at the beginning to ensure they're always accessible
     use_vad = False
@@ -3042,41 +3042,31 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
 
     base_name = os.path.splitext(os.path.basename(input_path))[0]
     
-    # Create Temp folder in the same directory as the source audio file
+    # Create Temp folder in the same directory as the source audio file (for quality report only)
     source_dir = os.path.dirname(input_path)
     temp_folder = os.path.join(source_dir, "Temp")
     os.makedirs(temp_folder, exist_ok=True)
     
-    txt_path = os.path.join(temp_folder, f"{base_name}.txt")
+    # Quality report goes to Temp folder
     quality_path = os.path.join(temp_folder, f"{base_name}_quality_report.json")
+    
+    # We no longer save the TXT file - only DOCX output is needed
+    txt_path = None
 
-    # Save TXT file to Temp folder
-    try:
-        with open(txt_path, "w", encoding="utf-8") as f:
-            # Write full path header at the top
-            f.write(f"Source: {os.path.abspath(input_path)}\n")
-            f.write(f"Output: {os.path.abspath(txt_path)}\n\n")
-            f.write(formatted_text)
-        print(f"✅ Text file saved: {txt_path}")
-    except Exception as e:
-        print(f"❌ Failed to save text file: {e}")
-        txt_path = None
-
-    # Auto-generate DOCX from TXT
+    # Generate DOCX directly next to the source audio file
     docx_path = None
-    if txt_path and os.path.exists(txt_path):
-        try:
-            from txt_to_docx import convert_txt_to_docx
-            from pathlib import Path
-            docx_path = convert_txt_to_docx(Path(txt_path))
-            print(f"✅ DOCX file saved: {docx_path}")
-        except Exception as docx_err:
-            print(f"⚠️  Failed to generate DOCX: {docx_err}")
+    try:
+        from txt_to_docx import convert_txt_to_docx_from_text
+        from pathlib import Path
+        source_path = Path(input_path)
+        docx_path = convert_txt_to_docx_from_text(formatted_text, source_path)
+        print(f"✅ DOCX file saved: {docx_path}")
+    except Exception as docx_err:
+        print(f"⚠️  Failed to generate DOCX: {docx_err}")
 
     # Final stats
     elapsed = time.time() - start_time
     print("\n🎉 TRANSCRIPTION COMPLETE!")
-    print(f"📄 Text file: {txt_path}")
     if docx_path:
         print(f"📄 DOCX file: {docx_path}")
     print(f"⏱️  Total time: {format_duration(elapsed)}")
@@ -3112,7 +3102,7 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
     except Exception as _cleanup_e:
         print(f"⚠️  Failed to remove temporary file: {_cleanup_e}")
 
-    return txt_path
+    return str(docx_path) if docx_path else None
 
 
 def transcribe_file_optimised(input_path, model_name="medium", output_dir=None, force_optimised=True, *, threads_override: Optional[int] = None):
