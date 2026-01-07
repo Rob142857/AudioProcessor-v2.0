@@ -99,7 +99,7 @@ def _apply_recommended_env_defaults() -> None:
     """
     defaults = {
         # Fidelity & formatting
-        "TRANSCRIBE_VERBATIM": "0",            # Enable post-processing for better punctuation/formatting
+        "TRANSCRIBE_VERBATIM": "1",            # Use Whisper's native punctuation with segment-based paragraphs (cleanest output)
         "TRANSCRIBE_PARAGRAPH_GAP": "1.8",     # Silence gap (seconds) for paragraph breaks (nudge up for clearer topic shifts)
         # Model selection
         "TRANSCRIBE_MODEL_NAME": "large-v3",   # Best accuracy (slower)
@@ -3010,154 +3010,35 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
     # Prosody analysis disabled - pure Whisper output is best
     # All attempts to modify sentence boundaries have introduced more errors than they fixed
 
-    # Post-processing with ULTRA/enhanced processors (skipped in verbatim)
+    # STREAMLINED POST-PROCESSING:
+    # - Keep Whisper's natural punctuation (no sentence splitting)
+    # - Apply ONLY semantic paragraph segmentation for meaning-based breaks
+    # - Skip all other aggressive text manipulation
     try:
-        if _is_verbatim_mode():
+        # Light cleanup: only remove obvious repetitions and music hallucinations
+        full_text = _collapse_repetitions(full_text, max_repeats=3)
+        full_text, music_removed = _remove_music_hallucinations(full_text)
+        if music_removed:
+            print(f"🎵 Removed {music_removed} music/hallucination pattern(s)")
+        
+        # Semantic paragraph segmentation - meaning-based breaks without altering sentences
+        try:
+            from paragraph_segmenter import create_paragraph_segmenter
+            print("📊 Applying semantic paragraph segmentation...")
+            para_segmenter = create_paragraph_segmenter(similarity_threshold=0.50)
+            formatted_text = para_segmenter.segment_paragraphs(full_text, verbose=False)
+            # Refine paragraph lengths for readability
+            formatted_text = para_segmenter.refine_paragraphs(formatted_text, min_paragraph_length=150, max_paragraph_length=800)
+            quality_stats = {"semantic_paragraphs": True, "music_hallucinations_removed": music_removed}
+        except Exception as para_e:
+            print(f"⚠️  Semantic paragraph segmentation unavailable: {para_e}")
+            # Fallback to segment-based paragraphs (silence gaps)
             formatted_text = full_text
-            quality_stats = {"verbatim": True}
-        else:
-            try:
-                from text_processor_ultra import create_ultra_processor, create_advanced_paragraph_formatter
-                text_workers = max(2, min(8, config.get("cpu_threads", 4) // 2))
-                print(f"🚀 Using ULTRA text processor with {text_workers} workers and 6 specialized passes")
-                t0 = time.time()
-                ultra_processor = create_ultra_processor(max_workers=text_workers)
-                full_text = _collapse_repetitions(full_text, max_repeats=3)
-                # Remove music/silence hallucinations early (before punctuation restoration)
-                full_text, music_removed = _remove_music_hallucinations(full_text)
-                if music_removed:
-                    print(f"🎵 Removed {music_removed} music/hallucination pattern(s)")
-                
-                # Punctuation refinement disabled - BERT models were introducing errors
-                # Whisper large-v3's punctuation is reliable as-is
-                
-                full_text = ultra_processor.process_text_ultra(full_text, passes=6)
-                full_text = _collapse_single_word_runs(full_text, max_repeats=2)
-                full_text = _split_long_sentences(full_text, max_chars=170)
-                t1 = time.time()
-                print(f"✅ Ultra text processing completed ({t1 - t0:.1f}s)")
-                full_text, early_artifact_stats = _remove_extended_artifacts(full_text)
-                full_text = _refine_capitalization(_fix_whisper_artifacts(full_text))
-                full_text = _collapse_sentence_repetitions(full_text, max_repeats=3)
-                full_text, global_freq_stats = _limit_global_sentence_frequency(full_text)
-                full_text, loop_stats = _detect_and_break_loops(full_text)
-                full_text, late_artifact_stats = _remove_extended_artifacts(full_text)
-                
-                # NEW: Semantic paragraph segmentation based on topic shifts
-                # This replaces the advanced paragraph formatter for better topic-aware breaks
-                try:
-                    from paragraph_segmenter import create_paragraph_segmenter
-                    print("📊 Applying semantic paragraph segmentation...")
-                    para_segmenter = create_paragraph_segmenter(similarity_threshold=0.50)
-                    full_text = para_segmenter.segment_paragraphs(full_text, verbose=False)
-                    # Refine paragraph lengths for readability
-                    formatted_text = para_segmenter.refine_paragraphs(full_text, min_paragraph_length=150, max_paragraph_length=800)
-                except Exception as para_e:
-                    print(f"⚠️  Semantic paragraph segmentation unavailable: {para_e}")
-                    # Fallback to advanced paragraph formatter
-                    try:
-                        paragraph_formatter = create_advanced_paragraph_formatter(max_workers=text_workers)
-                        formatted_text = paragraph_formatter.format_paragraphs_advanced(full_text, target_length=600)
-                    except Exception as pf_e:
-                        print(f"⚠️  Advanced paragraph formatter failed: {pf_e} — using basic split_into_paragraphs")
-                        formatted = split_into_paragraphs(full_text, max_length=600)
-                        formatted_text = "\n\n".join(formatted) if isinstance(formatted, list) else full_text
-                
-                quality_stats = {
-                    "early_artifacts": early_artifact_stats,
-                    "global_frequency": global_freq_stats,
-                    "loop_detection": loop_stats,
-                    "late_artifacts": late_artifact_stats,
-                    "music_hallucinations_removed": music_removed,
-                }
-            except ImportError:
-                print("⚠️  Ultra processor not available, falling back to enhanced processor")
-                if _enhanced_processor_available and create_enhanced_processor is not None:
-                    processor = create_enhanced_processor(use_spacy=True, use_transformers=False)
-                    t0 = time.time()
-                    full_text = processor.restore_punctuation(full_text)
-                    full_text = processor.restore_punctuation(full_text)
-                    full_text = processor.restore_punctuation(full_text)
-                    t1 = time.time()
-                    print(f"✅ Enhanced punctuation restoration completed (3 passes | {t1 - t0:.1f}s)")
-                    full_text = _collapse_single_word_runs(full_text, max_repeats=2)
-                    full_text = _split_long_sentences(full_text, max_chars=170)
-                    full_text, early_artifact_stats = _remove_extended_artifacts(full_text)
-                    full_text = _refine_capitalization(_fix_whisper_artifacts(full_text))
-                    full_text = _collapse_sentence_repetitions(full_text, max_repeats=3)
-                    full_text, global_freq_stats = _limit_global_sentence_frequency(full_text)
-                    full_text, loop_stats = _detect_and_break_loops(full_text)
-                    full_text, late_artifact_stats = _remove_extended_artifacts(full_text)
-                    quality_stats = {
-                        "early_artifacts": early_artifact_stats,
-                        "global_frequency": global_freq_stats,
-                        "loop_detection": loop_stats,
-                        "late_artifacts": late_artifact_stats,
-                    }
-                    formatted = split_into_paragraphs(full_text, max_length=600)
-                    if isinstance(formatted, list):
-                        formatted_text = "\n\n".join(formatted)
-                    else:
-                        formatted_text = full_text
-                else:
-                    from deepmultilingualpunctuation import PunctuationModel
-                    pm = PunctuationModel()
-                    t0 = time.time()
-                    full_text = pm.restore_punctuation(full_text)
-                    full_text = pm.restore_punctuation(full_text)
-                    full_text = pm.restore_punctuation(full_text)
-                    full_text = pm.restore_punctuation(full_text)
-                    t1 = time.time()
-                    print(f"✅ Basic punctuation restoration completed (4 passes | {t1 - t0:.1f}s)")
-                    full_text = _collapse_single_word_runs(full_text, max_repeats=2)
-                    full_text = _split_long_sentences(full_text, max_chars=170)
-                    full_text, early_artifact_stats = _remove_extended_artifacts(full_text)
-                    full_text = _refine_capitalization(_fix_whisper_artifacts(full_text))
-                    full_text = _collapse_sentence_repetitions(full_text, max_repeats=3)
-                    full_text, global_freq_stats = _limit_global_sentence_frequency(full_text)
-                    full_text, loop_stats = _detect_and_break_loops(full_text)
-                    full_text, late_artifact_stats = _remove_extended_artifacts(full_text)
-                    quality_stats = {
-                        "early_artifacts": early_artifact_stats,
-                        "global_frequency": global_freq_stats,
-                        "loop_detection": loop_stats,
-                        "late_artifacts": late_artifact_stats,
-                    }
-                    formatted = split_into_paragraphs(full_text, max_length=600)
-                    if isinstance(formatted, list):
-                        formatted_text = "\n\n".join(formatted)
-                    else:
-                        formatted_text = full_text
+            quality_stats = {"fallback_paragraphs": True, "music_hallucinations_removed": music_removed}
     except Exception as e:
         print(f"⚠️  Text processing failed: {e}")
         formatted_text = full_text
         quality_stats = {}
-
-    # Refine capitalization to fix artifacts (applies to all processing paths)
-    try:
-        if not _is_verbatim_mode():
-            # Fix Whisper-specific artifacts and capitalization only in enhanced mode
-            formatted_text = _fix_whisper_artifacts(formatted_text)
-            formatted_text = _refine_capitalization(formatted_text)
-            print("✅ Capitalization & artifact refinement completed")
-    except Exception as e:
-        print(f"⚠️  Capitalization refinement failed: {e}")
-
-    # Final quality check and validation (skip in verbatim)
-    try:
-        if not _is_verbatim_mode():
-            if formatted_text and len(formatted_text) > 10:
-                if not formatted_text.endswith(('.', '!', '?')):
-                    formatted_text += '.'
-                if formatted_text and not formatted_text[0].isupper():
-                    formatted_text = formatted_text[0].upper() + formatted_text[1:]
-                print("✅ Final text validation completed")
-            else:
-                print("⚠️  Formatted text too short, using original")
-                formatted_text = full_text
-    except Exception as e:
-        print(f"⚠️  Text validation failed: {e}")
-        formatted_text = full_text
 
     base_name = os.path.splitext(os.path.basename(input_path))[0]
     
@@ -3181,10 +3062,23 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
         print(f"❌ Failed to save text file: {e}")
         txt_path = None
 
+    # Auto-generate DOCX from TXT
+    docx_path = None
+    if txt_path and os.path.exists(txt_path):
+        try:
+            from txt_to_docx import convert_txt_to_docx
+            from pathlib import Path
+            docx_path = convert_txt_to_docx(Path(txt_path))
+            print(f"✅ DOCX file saved: {docx_path}")
+        except Exception as docx_err:
+            print(f"⚠️  Failed to generate DOCX: {docx_err}")
+
     # Final stats
     elapsed = time.time() - start_time
     print("\n🎉 TRANSCRIPTION COMPLETE!")
     print(f"📄 Text file: {txt_path}")
+    if docx_path:
+        print(f"📄 DOCX file: {docx_path}")
     print(f"⏱️  Total time: {format_duration(elapsed)}")
     try:
         base_quality = _summarize_quality(formatted_text, {"pipeline": quality_stats})
