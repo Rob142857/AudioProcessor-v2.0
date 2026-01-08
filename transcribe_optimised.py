@@ -53,6 +53,55 @@ def _clear_model_cache() -> None:
     except:
         pass
 
+def log_gpu_memory_status(context=""):
+    """Log current GPU memory usage for debugging model unload issues.
+    Supports both PyTorch CUDA and CTranslate2 memory tracking.
+    """
+    try:
+        import torch
+        if torch.cuda.is_available():
+            # Try PyTorch CUDA memory (for native Whisper)
+            mem_allocated = torch.cuda.memory_allocated() / (1024 ** 3)
+            mem_reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+            mem_total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+            mem_free = mem_total - mem_reserved
+            
+            # Also try to get CTranslate2 memory via nvidia-smi (for Faster-Whisper)
+            ct2_memory = 0.0
+            try:
+                import subprocess
+                result = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=2
+                )
+                if result.returncode == 0:
+                    ct2_memory = float(result.stdout.strip()) / 1024  # Convert MB to GB
+            except:
+                pass
+            
+            print(f"📊 GPU Memory ({context}):")
+            if mem_allocated > 0.1:  # PyTorch has memory allocated
+                print(f"   • PyTorch Allocated: {mem_allocated:.2f} GB / {mem_total:.2f} GB ({mem_allocated/mem_total*100:.1f}%)")
+                print(f"   • PyTorch Reserved: {mem_reserved:.2f} GB")
+                print(f"   • Free: {mem_free:.2f} GB")
+            elif ct2_memory > 0.1:  # CTranslate2 has memory (Faster-Whisper)
+                print(f"   • CTranslate2 VRAM: {ct2_memory:.2f} GB / {mem_total:.2f} GB ({ct2_memory/mem_total*100:.1f}%)")
+                print(f"   • Free: {mem_total - ct2_memory:.2f} GB")
+                print(f"   👍 Model is loaded and using CTranslate2 runtime")
+            else:
+                print(f"   • Allocated: {mem_allocated:.2f} GB / {mem_total:.2f} GB ({mem_allocated/mem_total*100:.1f}%)")
+                print(f"   • Reserved: {mem_reserved:.2f} GB")
+                print(f"   • Free: {mem_free:.2f} GB")
+                if "transcription" in context.lower():
+                    print(f"   ⚠️  WARNING: No GPU memory detected - model may not be loaded or using CPU")
+            
+            # Warn if memory is critically low
+            actual_free = mem_total - max(mem_reserved, ct2_memory)
+            if actual_free < 0.5:  # Less than 500MB free
+                print(f"   ⚠️  WARNING: Low GPU memory! Only {actual_free*1024:.0f} MB free")
+    except Exception as e:
+        print(f"⚠️  Could not read GPU memory status: {e}")
+
 # IMPORTANT: Import torch once at module import time. Do NOT delete torch.* from sys.modules.
 try:
     import torch  # type: ignore
@@ -101,6 +150,10 @@ def _apply_recommended_env_defaults() -> None:
         # Fidelity & formatting
         "TRANSCRIBE_VERBATIM": "1",            # Use Whisper's native punctuation with segment-based paragraphs (cleanest output)
         "TRANSCRIBE_PARAGRAPH_GAP": "1.8",     # Silence gap (seconds) for paragraph breaks (nudge up for clearer topic shifts)
+        "TRANSCRIBE_QUALITY_MODE": "1",        # Enable maximum quality mode by default
+        "TRANSCRIBE_MAX_REPEAT_CAP": "10",     # Cap repetitions at 10 occurrences
+        "TRANSCRIBE_PREPROCESS": "1",          # Always preprocess audio (mandatory)
+        "TRANSCRIBE_PREPROC_MODE": "vintage_tape",  # Optimized for tape lecture recordings
         # Model selection
         "TRANSCRIBE_MODEL_NAME": "large-v3",   # Best accuracy (slower)
         # GPU safety / fragmentation mitigation
@@ -304,8 +357,28 @@ def preprocess_audio_with_padding(input_path: str, temp_dir: str = None) -> str:
             temp_output
         ]
         
+        # Determine timeout based on input file duration
+        # For long files (>1 hour), preprocessing can take significant time
+        try:
+            import subprocess as sp
+            probe_cmd = [ffmpeg_cmd, "-i", input_path]
+            probe_result = sp.run(probe_cmd, capture_output=True, text=True, timeout=10)
+            # Extract duration from ffmpeg output
+            duration_match = re.search(r"Duration: (\d{2}):(\d{2}):(\d{2})", probe_result.stderr)
+            if duration_match:
+                hours, mins, secs = map(int, duration_match.groups())
+                file_duration_seconds = hours * 3600 + mins * 60 + secs
+                # Set timeout to 3x the file duration (very generous)
+                # Minimum 5 minutes, maximum 2 hours
+                timeout = max(300, min(file_duration_seconds * 3, 7200))
+                print(f"📏 File duration: {hours:02d}:{mins:02d}:{secs:02d} (timeout: {timeout}s)")
+            else:
+                timeout = 600  # Default 10 minutes if can't detect duration
+        except:
+            timeout = 600  # Default 10 minutes on error
+        
         print(f"🔧 Running ffmpeg preprocessing...")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         
         if result.returncode != 0:
             print(f"❌ FFmpeg preprocessing failed:")
@@ -324,7 +397,7 @@ def preprocess_audio_with_padding(input_path: str, temp_dir: str = None) -> str:
             return input_path
             
     except subprocess.TimeoutExpired:
-        print(f"⚠️  FFmpeg preprocessing timed out after 5 minutes, using original file")
+        print(f"⚠️  FFmpeg preprocessing timed out after {timeout}s, using original file")
         return input_path
     except Exception as e:
         print(f"⚠️  Audio preprocessing failed: {e}")
@@ -534,8 +607,8 @@ def build_initial_prompt(terms: list, max_chars: int = 600) -> Optional[str]:
 def _collapse_repetitions(text: str, max_repeats: int = 10) -> str:
     """Collapse excessive immediate repetitions of the same phrase.
 
-    This targets simple loops like "to grow, to grow, to grow, ..." and reduces
-    them to at most `max_repeats` consecutive occurrences.
+    This targets simple loops like "to grow, to grow, to grow" and "and and and and".
+    Reduces them to at most `max_repeats` consecutive occurrences.
     """
     try:
         # Check for environment override for max repeats
@@ -546,35 +619,39 @@ def _collapse_repetitions(text: str, max_repeats: int = 10) -> str:
             except Exception:
                 pass  # Use default if invalid
         
-        # Normalize spaces around commas for matching
-        t = re.sub(r"\s*,\s*", ", ", text)
+        result = text
+        changes_made = False
         
-        # First pass: Handle longer phrase repetitions (up to 20 words)
-        # This catches cases like "telekinesis is the ability to know..." repeated many times
-        for phrase_len in range(20, 0, -1):  # Start with longest phrases
-            pattern = r"\b((?:[A-Za-z']+\s+){" + str(phrase_len - 1) + r"}[A-Za-z']+)(?:\s+\1){" + str(max_repeats) + r",}"
-            
-            def repl(m):
-                phrase = m.group(1)
-                # Keep only max_repeats occurrences
-                return " ".join([phrase] * max_repeats)
-            
-            t = re.sub(pattern, repl, t, flags=re.IGNORECASE)
+        # Pattern 1: Space-separated single word repetitions (most common)
+        # Matches: "and and and and" or "to to to to"
+        pattern1 = r'\b(\w+)(?:\s+\1){' + str(max_repeats - 1) + r',}\b'
+        def repl1(m):
+            word = m.group(1)
+            # Keep only max_repeats occurrences
+            return ' '.join([word] * max_repeats)
         
-        # Second pass: Handle comma-separated repetitions
-        pattern = r"\b((?:[A-Za-z']+\s+){0,10}[A-Za-z']+)\b(?:,\s*\1\b){" + str(max_repeats) + ",}"
-
+        new_result = re.sub(pattern1, repl1, result, flags=re.IGNORECASE)
+        if new_result != result:
+            changes_made = True
+            result = new_result
+        
+        # Pattern 2: Comma-separated phrase repetitions
+        # Matches: "phrase, phrase, phrase, phrase"
+        pattern2 = r'\b([\w\s]+?)(?:,\s*\1){' + str(max_repeats - 1) + r',}\b'
         def repl2(m):
-            phrase = m.group(1)
-            return ", ".join([phrase] * max_repeats)
-
-        # Apply repeatedly a few times to catch nested patterns
-        for _ in range(3):
-            new_t = re.sub(pattern, repl2, t)
-            if new_t == t:
-                break
-            t = new_t
-        return t
+            phrase = m.group(1).strip()
+            return ', '.join([phrase] * max_repeats)
+        
+        new_result = re.sub(pattern2, repl2, result, flags=re.IGNORECASE)
+        if new_result != result:
+            changes_made = True
+            result = new_result
+        
+        # Report if we found and fixed repetitions
+        if changes_made:
+            print(f"🔧 Collapsed excessive repetitions (capped at {max_repeats} occurrences)")
+        
+        return result
     except Exception as e:
         print(f"⚠️  Repetition collapse warning: {e}")
         return text
@@ -1200,10 +1277,14 @@ def transcribe_with_dataset_optimization(input_path: str, output_dir=None, threa
                 pass
 
             # Load model for GPU
+            print(f"🔄 Loading {selected_model_name} model onto GPU...")
             model = whisper.load_model(selected_model_name, device="cuda")
             # Note: FP16 conversion currently disabled due to dtype compatibility issues
             # Will use FP32 for stability
             model_is_fp16 = False
+            
+            # Log GPU memory after model load
+            log_gpu_memory_status("after model load")
             print(f"✅ Model loaded in FP32 (stable for parallel processing)")
         else:
             chosen_device = "cpu"
@@ -1211,6 +1292,15 @@ def transcribe_with_dataset_optimization(input_path: str, output_dir=None, threa
             print(f"🎯 Device: {device_name}")
             model = whisper.load_model(selected_model_name, device="cpu")
             model_is_fp16 = False  # CPU doesn't use FP16
+    except RuntimeError as e:
+        if "CUDA out of memory" in str(e) or "OOM" in str(e):
+            print(f"❌ CUDA OUT OF MEMORY ERROR: {e}")
+            print(f"💡 Try using a smaller model or reduce batch size")
+            if torch_api.cuda.is_available():
+                log_gpu_memory_status("after OOM error")
+        else:
+            print(f"❌ Model load failed: {e}")
+        raise
     except Exception as e:
         print(f"❌ Model load failed: {e}")
         raise
@@ -1267,46 +1357,45 @@ def transcribe_with_dataset_optimization(input_path: str, output_dir=None, threa
     print("🔄 Transcribing audio...")
     print("─" * 80)
     
-    # Configure transcription parameters once
+    # Configure transcription parameters for HIGH QUALITY (balanced for reliability)
+    # FIXED: Use reasonable beam_size/best_of values to prevent incomplete output
     seg_kwargs = dict(
-        language="en",  # Optimized for English language
-        compression_ratio_threshold=2.4,
-        logprob_threshold=-1.0,
-        no_speech_threshold=0.3,
-        # Enable conditioning for better punctuation and context awareness
-        # This helps prevent repetition loops and improves punctuation
-        condition_on_previous_text=True,
-        temperature=0.0,
-        verbose=False,  # Reduce verbosity for batch processing
-        # Whisper's default punctuation handling is best - don't override
-        # word_timestamps disabled for performance (not needed without prosody analysis)
-        word_timestamps=False
+        language="en",
+        # Balanced thresholds for quality without over-filtering
+        compression_ratio_threshold=2.4,  # Stricter to catch repetition (was 3.0)
+        logprob_threshold=-1.0,           # Standard confidence threshold
+        no_speech_threshold=0.5,          # Balanced silence detection (was 0.6)
+        condition_on_previous_text=False, # CRITICAL: Prevents repetition loops
+        temperature=0.0,                  # Deterministic for consistency
+        verbose=False,
+        word_timestamps=False             # Disabled for performance
     )
     
     # Model-specific tuning for accuracy
     if selected_model_name == "large-v3-turbo":
-        # Turbo-specific: tighter thresholds for better accuracy
+        # Turbo-specific: slightly tighter thresholds
         seg_kwargs["compression_ratio_threshold"] = 2.2
-        seg_kwargs["logprob_threshold"] = -1.5
         seg_kwargs["no_speech_threshold"] = 0.4
     elif selected_model_name == "large-v3":
-        # Large-v3: slightly more permissive for natural speech flow
-        seg_kwargs["compression_ratio_threshold"] = 2.6
-        seg_kwargs["logprob_threshold"] = -2.2
+        # Large-v3: balanced settings
+        seg_kwargs["compression_ratio_threshold"] = 2.4
     
-    # Apply quality mode if enabled
+    # Apply quality mode if enabled - FIXED: Reasonable values
     quality_mode = os.environ.get("TRANSCRIBE_QUALITY_MODE", "").strip() in ("1", "true", "True")
     if quality_mode:
-        if selected_model_name == "large-v3-turbo":
-            seg_kwargs["beam_size"] = 10
-            seg_kwargs["patience"] = 3.0
-            seg_kwargs["best_of"] = 10
-            seg_kwargs["temperature"] = 0.0
-        else:
-            seg_kwargs["beam_size"] = 10
-            seg_kwargs["patience"] = 3.0
-            seg_kwargs["best_of"] = 10
-            seg_kwargs["temperature"] = 0.0
+        print("🎯 QUALITY mode enabled (balanced for complete output)")
+        # FIXED: beam_size=5 is industry standard for quality (was 10-15)
+        seg_kwargs["beam_size"] = 5
+        seg_kwargs["patience"] = 1.5      # Moderate patience (was 2.0-3.0)
+        seg_kwargs["best_of"] = 5         # Reasonable candidates (was 10-15)
+        seg_kwargs["temperature"] = 0.0   # Single temperature for consistency
+        print("   Settings: beam=5, best_of=5, patience=1.5")
+    else:
+        # Standard quality - still good
+        seg_kwargs["beam_size"] = 5
+        seg_kwargs["patience"] = 1.0
+        seg_kwargs["best_of"] = 5
+        seg_kwargs["temperature"] = 0.0
     
     # Only allow domain bias when explicitly enabled
     if initial_prompt and str(os.environ.get("TRANSCRIBE_ALLOW_PROMPT", "0")).lower() in ("1","true","yes"):
@@ -2168,8 +2257,15 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
         output_dir = os.path.dirname(input_path)
 
     # Preprocess audio with silence padding to prevent missed words
+    # Preprocessing is MANDATORY for optimal quality with tape recordings
     try:
-        preprocessed_path = preprocess_audio_with_padding(input_path)
+        skip_preprocessing = os.environ.get("TRANSCRIBE_SKIP_PREPROCESS", "").strip() in ("1", "true", "yes")
+        if skip_preprocessing:
+            print("⏭️  Preprocessing disabled by user (not recommended), using original file")
+            preprocessed_path = input_path
+        else:
+            # Always preprocess - timeout is now calculated dynamically based on file duration
+            preprocessed_path = preprocess_audio_with_padding(input_path)
     except Exception as _pre_e:
         print(f"⚠️  Preprocessing step failed early: {_pre_e} - using original file")
         preprocessed_path = input_path
@@ -2605,6 +2701,7 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
         nonlocal transcription_complete, transcription_result, transcription_error, use_vad, using_fw
         try:
             print("🔄 Starting transcription process...")
+            log_gpu_memory_status("start of transcription")
             if model is None:
                 raise RuntimeError("Transcription model is not loaded")
 
@@ -2634,56 +2731,37 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
                 transcribe_kwargs["compression_ratio_threshold"] = 2.6
                 print("🎯 Large-v3 model: repetition-guard thresholds applied")
             
-            # Apply quality mode if enabled
+            # Apply quality mode if enabled - OPTIMIZED FOR FASTER-WHISPER
+            # FIXED: Use reasonable beam_size/best_of values to prevent incomplete transcriptions
             quality_mode = os.environ.get("TRANSCRIBE_QUALITY_MODE", "").strip() in ("1", "true", "True")
-            if quality_mode:
-                if selected_model_name == "large-v3-turbo":
-                    # Turbo with MAXIMUM quality mode: aggressive beam search for best accuracy
-                    transcribe_kwargs["beam_size"] = 10  # Maximum beam width
-                    transcribe_kwargs["patience"] = 3.0  # Maximum patience
-                    transcribe_kwargs["best_of"] = 10  # Try many candidates
-                    transcribe_kwargs["temperature"] = 0.0  # Greedy decoding for consistency
-                    transcribe_kwargs["compression_ratio_threshold"] = 2.8  # More lenient
-                    transcribe_kwargs["no_speech_threshold"] = 0.4  # Less aggressive silence detection
-                    print("🎯 ULTRA Quality mode (turbo): beam_size=10, patience=3.0, best_of=10, temp=0")
-                else:
-                    # Large-v3 with maximum quality mode
-                    transcribe_kwargs["beam_size"] = 10
-                    transcribe_kwargs["patience"] = 3.0
-                    transcribe_kwargs["best_of"] = 10
-                    transcribe_kwargs["temperature"] = 0.0
-                    transcribe_kwargs["compression_ratio_threshold"] = 2.8
-                    transcribe_kwargs["no_speech_threshold"] = 0.4
-                    print("🎯 ULTRA Quality mode (large-v3): beam_size=10, patience=3.0, best_of=10, temp=0")
             
-            # Tune defaults when using faster-whisper to avoid over-pruning
+            # Tune settings based on backend (faster-whisper vs native)
             if using_fw:
-                # Check if quality mode is enabled - if so, use high-quality beam search
                 if quality_mode:
-                    # MAXIMUM Quality mode for vintage tape recordings: 
-                    # Optimized for challenging audio with room reverb and tape artifacts
-                    transcribe_kwargs["beam_size"] = 15  # Increased from 10 - explore more hypotheses
-                    transcribe_kwargs["best_of"] = 15    # Increased from 10 - evaluate more candidates
-                    transcribe_kwargs["patience"] = 3.0  # Increased from 2.0 - allow more time for convergence
-                    transcribe_kwargs["temperature"] = [0.0, 0.2, 0.4]  # Progressive fallback for difficult segments
-                    transcribe_kwargs["no_speech_threshold"] = 0.5  # More conservative - don't skip uncertain segments
-                    transcribe_kwargs["compression_ratio_threshold"] = 2.6  # Slightly stricter to avoid repetition
-                    transcribe_kwargs["log_prob_threshold"] = -1.0  # More lenient - accept lower confidence for difficult audio
-                    transcribe_kwargs["condition_on_previous_text"] = True  # Use context for better accuracy
-                    transcribe_kwargs["vad_filter"] = False  # Disable VAD - we already preprocessed
-                    transcribe_kwargs["chunk_length"] = 30
-                    print("🎯 FW MAXIMUM QUALITY (Vintage Tape): beam=15, best_of=15, patience=3.0, temp=[0.0,0.2,0.4]")
+                    # HIGH QUALITY mode for Faster-Whisper (balanced for complete output)
+                    # CRITICAL: condition_on_previous_text=False prevents repetition loops and early termination
+                    transcribe_kwargs["beam_size"] = 5          # Standard beam search (was 15 - too extreme)
+                    transcribe_kwargs["best_of"] = 5            # Reasonable candidate count (was 15)
+                    transcribe_kwargs["patience"] = 1.5         # Moderate patience (was 3.0 - too slow)
+                    transcribe_kwargs["temperature"] = 0.0      # Deterministic decoding (single temperature)
+                    transcribe_kwargs["no_speech_threshold"] = 0.5  # Balanced silence detection
+                    transcribe_kwargs["compression_ratio_threshold"] = 2.4  # Stricter to catch repetition
+                    transcribe_kwargs["log_prob_threshold"] = -1.0  # Accept lower confidence for difficult audio
+                    transcribe_kwargs["condition_on_previous_text"] = False  # CRITICAL: prevents loops/early stop
+                    transcribe_kwargs["vad_filter"] = False     # Disable VAD - we already preprocessed
+                    print("🎯 FW QUALITY mode: beam=5, best_of=5, patience=1.5, condition_on_prev=False")
                 else:
-                    # Greedy capture but still apply repetition guard by disabling conditioning
-                    transcribe_kwargs["beam_size"] = 1
-                    transcribe_kwargs.pop("patience", None)
-                    transcribe_kwargs["best_of"] = 1
-                    transcribe_kwargs["no_speech_threshold"] = 0.25
-                    # Keep compression ratio guard off to avoid over-pruning empty results for FW
-                    transcribe_kwargs["compression_ratio_threshold"] = None
-                    transcribe_kwargs["vad_filter"] = False
-                    transcribe_kwargs["chunk_length"] = 30
-                    print("🎯 FW tuning: greedy decode (fast mode)")
+                    # STANDARD mode for Faster-Whisper (fast and reliable)
+                    transcribe_kwargs["beam_size"] = 5          # Good quality without slowdown
+                    transcribe_kwargs["best_of"] = 5            # Reasonable candidate count
+                    transcribe_kwargs["patience"] = 1.0         # Standard patience
+                    transcribe_kwargs["temperature"] = 0.0      # Deterministic
+                    transcribe_kwargs["no_speech_threshold"] = 0.4  # Standard threshold
+                    transcribe_kwargs["compression_ratio_threshold"] = 2.4  # Stricter for clean output
+                    transcribe_kwargs["log_prob_threshold"] = -1.0  # Standard confidence threshold
+                    transcribe_kwargs["condition_on_previous_text"] = False  # CRITICAL: prevents loops
+                    transcribe_kwargs["vad_filter"] = False     # Disable VAD
+                    print("🎯 FW STANDARD mode: beam=5, best_of=5, patience=1.0, condition_on_prev=False")
             
             # Gate initial prompt behind explicit opt-in to preserve strict verbatim neutrality
             if initial_prompt and str(os.environ.get("TRANSCRIBE_ALLOW_PROMPT", "0")).lower() in ("1","true","yes"):
@@ -2716,7 +2794,28 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
                     use_vad = False  # Disable for this run
 
             # Call transcribe with optimized parameters
-            result = _compatible_transcribe_call(model, working_input_path, transcribe_kwargs)
+            print("\n" + "="*80)
+            print("🎬 STARTING MAIN TRANSCRIPTION")
+            print("="*80)
+            log_gpu_memory_status("before transcription call")
+            
+            try:
+                result = _compatible_transcribe_call(model, working_input_path, transcribe_kwargs)
+                log_gpu_memory_status("after transcription call")
+            except RuntimeError as rt_e:
+                if "CUDA out of memory" in str(rt_e) or "OOM" in str(rt_e):
+                    print(f"❌ CUDA OUT OF MEMORY during transcription: {rt_e}")
+                    print(f"💡 GPU ran out of memory mid-transcription")
+                    log_gpu_memory_status("after CUDA OOM")
+                    raise
+                else:
+                    print(f"❌ Runtime error during transcription: {rt_e}")
+                    raise
+            except Exception as trans_e:
+                print(f"❌ Transcription error: {trans_e}")
+                log_gpu_memory_status("after transcription error")
+                raise
+            
             transcription_result = _as_result_dict(result)
             try:
                 segs_dbg = transcription_result.get('segments') if isinstance(transcription_result, dict) else None
@@ -2919,12 +3018,12 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
                 seg_end = seg.get("end", 0)
 
                 suspicious = _is_suspicious_music_artifact(seg_text)
-                # Make artifact filtering MUCH more conservative - only remove if BOTH suspicious AND very low confidence
-                very_low_confidence = (isinstance(avg_logprob, (int, float)) and avg_logprob < -1.0) and \
-                                     (isinstance(no_speech_prob, (int, float)) and no_speech_prob > 0.8)
+                # ULTRA-CONSERVATIVE FILTERING for quality: only remove if HIGHLY suspicious AND extremely low confidence
+                extremely_low_confidence = (isinstance(avg_logprob, (int, float)) and avg_logprob < -1.5) and \
+                                          (isinstance(no_speech_prob, (int, float)) and no_speech_prob > 0.9)
 
-                # CONSERVATIVE FILTERING: Only remove if clearly suspicious AND very low confidence
-                should_keep = seg_text and not (suspicious and very_low_confidence)
+                # CONSERVATIVE: Keep almost everything unless clearly garbage
+                should_keep = seg_text and not (suspicious and extremely_low_confidence)
 
                 if should_keep:
                     cleaned_parts.append(seg_text)
@@ -2969,7 +3068,17 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
             if cleaned_segments:
                 first_time = cleaned_segments[0].get('start', 0)
                 last_time = cleaned_segments[-1].get('end', 0)
-                print(f"⏱️  Transcribed time range: {first_time:.1f}s to {last_time:.1f}s (duration: {last_time - first_time:.1f}s)")
+                actual_duration = last_time - first_time
+                print(f"⏱️  Transcribed time range: {first_time:.1f}s to {last_time:.1f}s (duration: {actual_duration:.1f}s)")
+                
+                # Warning if transcription seems incomplete compared to file duration
+                try:
+                    file_duration = get_media_duration(input_path)
+                    if file_duration and actual_duration < (file_duration * 0.8):
+                        print(f"⚠️  WARNING: Transcription may be incomplete!")
+                        print(f"   File duration: {file_duration:.1f}s, Transcribed: {actual_duration:.1f}s ({(actual_duration/file_duration)*100:.1f}%)")
+                except:
+                    pass
                 
             print(f"📊 Segment filtering: kept {kept_count}/{len(segments)} segments")
             print(f"📝 Full text length: {len(full_text)} characters ({len(full_text.split())} words)")
@@ -3049,6 +3158,10 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
     # Generate DOCX directly next to the source audio file
     docx_path = None
     elapsed = time.time() - start_time
+    
+    # Final GPU memory check after text processing
+    log_gpu_memory_status("after text processing complete")
+    
     try:
         from txt_to_docx import convert_txt_to_docx_from_text
         from pathlib import Path

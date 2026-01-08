@@ -468,30 +468,30 @@ def transcribe_file(input_path, model_name="large", preprocess=True, keep_temp=F
                 extract_segment(audio_path, s, e, seg_tmp.name, bitrate=bitrate)
                 seg_files.append(seg_tmp.name)
                 temp_files.append(seg_tmp.name)
-            # transcribe each segment with optimized settings
+            # transcribe each segment with balanced quality settings
             for seg in seg_files:
                 print(f"Transcribing segment {seg}")
-                # Optimized settings for best transcription quality
+                # Balanced settings for complete, quality transcription - FIXED
                 res = model.transcribe(seg, language="en", 
-                                     compression_ratio_threshold=float('inf'),  # Disable repetitive content detection
-                                     logprob_threshold=-1.0,                    # Disable low-confidence filtering
-                                     no_speech_threshold=0.1,                   # Lower threshold for "no speech"
-                                     condition_on_previous_text=False,          # Disable context dependency
-                                     temperature=0.0,                           # Use deterministic decoding
-                                     suppress_tokens="-1",                      # Disable token suppression for guardrail removal
+                                     compression_ratio_threshold=2.4,           # Stricter to catch repetition (was inf)
+                                     logprob_threshold=-1.0,                    # Standard confidence threshold
+                                     no_speech_threshold=0.5,                   # Balanced threshold (was 0.1)
+                                     condition_on_previous_text=False,          # CRITICAL: prevents loops
+                                     temperature=0.0,                           # Deterministic decoding
+                                     beam_size=5,                               # Standard beam search
                                      )
                 text = res.get("text", "").strip()
                 outputs.append(text)
             segment_files_used = seg_files
         else:
-            # Single file transcription with optimized settings
+            # Single file transcription with balanced quality settings - FIXED
             res = model.transcribe(audio_path, language="en",
-                                 compression_ratio_threshold=float('inf'),  # Disable repetitive content detection  
-                                 logprob_threshold=-1.0,                    # Disable low-confidence filtering
-                                 no_speech_threshold=0.1,                   # Lower threshold for "no speech"
-                                 condition_on_previous_text=False,          # Disable context dependency
-                                 temperature=0.0,                           # Use deterministic decoding
-                                 suppress_tokens="-1",                      # Disable token suppression for guardrail removal
+                                 compression_ratio_threshold=2.4,           # Stricter to catch repetition (was inf)
+                                 logprob_threshold=-1.0,                    # Standard confidence threshold
+                                 no_speech_threshold=0.5,                   # Balanced threshold (was 0.1)
+                                 condition_on_previous_text=False,          # CRITICAL: prevents loops
+                                 temperature=0.0,                           # Deterministic decoding
+                                 beam_size=5,                               # Standard beam search
                                  )
             outputs = [res.get("text", "").strip()]
 
@@ -821,14 +821,14 @@ def transcribe_file_no_vad(input_path, model_name="large", preprocess=True, keep
                 print(f"Model moved to: {next(model.parameters()).device}")
 
         print("Transcribing entire file (no VAD segmentation)...")
-        # Single file transcription with optimized settings
+        # Single file transcription with balanced quality settings - FIXED
         res = model.transcribe(audio_path, language="en",
-                             compression_ratio_threshold=float('inf'),  # Disable repetitive content detection  
-                             logprob_threshold=-1.0,                    # Disable low-confidence filtering
-                             no_speech_threshold=0.1,                   # Lower threshold for "no speech"
-                             condition_on_previous_text=False,          # Disable context dependency
-                             temperature=0.0,                           # Use deterministic decoding
-                             suppress_tokens="-1",                      # Disable token suppression for guardrail removal
+                             compression_ratio_threshold=2.4,           # Stricter to catch repetition (was inf)
+                             logprob_threshold=-1.0,                    # Standard confidence threshold
+                             no_speech_threshold=0.5,                   # Balanced threshold (was 0.1)
+                             condition_on_previous_text=False,          # CRITICAL: prevents loops
+                             temperature=0.0,                           # Deterministic decoding
+                             beam_size=5,                               # Standard beam search
                              )
         full_text = res.get("text", "").strip()
 
@@ -1166,14 +1166,14 @@ def transcribe_lecture(input_path, model_name="large", preprocess=True, keep_tem
 
         if len(segments) == 0:
             print("⚠️  No segments found with VAD, falling back to transcribing entire file...")
-            # Fallback to no-VAD if no segments found
+            # Fallback to no-VAD if no segments found - FIXED for complete output
             res = model.transcribe(audio_path, language="en",
-                                 compression_ratio_threshold=float('inf'),  # Disable repetitive content detection
-                                 logprob_threshold=-1.0,                    # Disable low-confidence filtering
-                                 no_speech_threshold=0.05,                  # Very low threshold for lectures
-                                 condition_on_previous_text=False,          # Disable context dependency
-                                 temperature=0.0,                           # Use deterministic decoding
-                                 suppress_tokens="-1",                      # Disable token suppression for guardrail removal
+                                 compression_ratio_threshold=2.4,           # Stricter to catch repetition (was inf)
+                                 logprob_threshold=-1.0,                    # Standard confidence threshold
+                                 no_speech_threshold=0.5,                   # Balanced threshold (was 0.05)
+                                 condition_on_previous_text=False,          # CRITICAL: prevents loops
+                                 temperature=0.0,                           # Deterministic decoding
+                                 beam_size=5,                               # Standard beam search
                                  )
             # Handle both dict and list return types from Whisper
             if isinstance(res, dict):
@@ -1195,16 +1195,15 @@ def transcribe_lecture(input_path, model_name="large", preprocess=True, keep_tem
             # Transcribe each segment with lecture-optimized settings
             for seg in seg_files:
                 print(f"Transcribing segment {seg}")
-                # Lecture-optimized Whisper settings
+                # Lecture-optimized Whisper settings - FIXED for complete output
                 res = model.transcribe(seg, language="en",
-                                     compression_ratio_threshold=float('inf'),  # Disable repetitive content detection
-                                     logprob_threshold=-2.0,                    # Even more permissive confidence threshold
-                                     no_speech_threshold=0.05,                  # Very low threshold for lectures
-                                     condition_on_previous_text=False,          # Disable context dependency
+                                     compression_ratio_threshold=2.4,           # Stricter to catch repetition (was inf)
+                                     logprob_threshold=-1.0,                    # Standard confidence threshold
+                                     no_speech_threshold=0.5,                   # Balanced threshold (was 0.05)
+                                     condition_on_previous_text=False,          # CRITICAL: prevents loops
                                      temperature=0.0,                           # Use deterministic decoding
-                                     beam_size=5,                              # Higher quality beam search
-                                     patience=2.0,                             # More thorough processing
-                                     suppress_tokens="-1",                      # Disable token suppression for guardrail removal
+                                     beam_size=5,                              # Standard beam search
+                                     patience=1.5,                             # Moderate patience (was 2.0)
                                      )
                 # Handle both dict and list return types from Whisper
                 if isinstance(res, dict):
