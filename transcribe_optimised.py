@@ -506,14 +506,16 @@ def load_awkward_terms(input_path: str) -> list:
         if s not in cleaned:
             cleaned.append(s)
 
-    # Cap length to keep prompt small and focused
-    return cleaned[:40]
+    # Cap length to keep prompt focused - increased for better domain coverage
+    # Whisper can handle up to 224 tokens (~500-600 chars) effectively
+    return cleaned[:100]  # Increased from 40 to 100 terms
 
 
-def build_initial_prompt(terms: list, max_chars: int = 400) -> Optional[str]:
+def build_initial_prompt(terms: list, max_chars: int = 600) -> Optional[str]:
     """Build a concise initial_prompt string to bias Whisper.
 
     Keeps capitalization as provided; trims to max_chars.
+    Increased from 400 to 600 chars for better domain term coverage.
     """
     if not terms:
         return None
@@ -1520,31 +1522,42 @@ def transcribe_with_dataset_optimization(input_path: str, output_dir=None, threa
         print(f"⚠️  Text formatting failed: {e}")
         formatted_text = full_text
 
-    # Save files to Temp folder
+    # Save files - DOCX only, next to source file
     base_name = os.path.splitext(os.path.basename(input_path))[0]
     
-    # Create Temp folder in the same directory as the source audio file
+    # Create Temp folder only for quality report
     source_dir = os.path.dirname(input_path)
     temp_folder = os.path.join(source_dir, "Temp")
     os.makedirs(temp_folder, exist_ok=True)
     
-    txt_path = os.path.join(temp_folder, f"{base_name}.txt")
+    # We no longer save TXT file
+    txt_path = None
 
+    # Generate DOCX directly next to the source audio file
+    docx_path = None
+    elapsed = time.time() - start_time
     try:
-        with open(txt_path, "w", encoding="utf-8") as f:
-            # Write full path header at the top
-            f.write(f"Source: {os.path.abspath(input_path)}\n")
-            f.write(f"Output: {os.path.abspath(txt_path)}\n\n")
-            f.write(formatted_text)
-        print(f"✅ Text file saved: {txt_path}")
-    except Exception as e:
-        print(f"❌ Failed to save text file: {e}")
-        txt_path = None
+        from txt_to_docx import convert_txt_to_docx_from_text
+        from pathlib import Path
+        source_path = Path(input_path)
+        
+        # Prepare metadata for DOCX footer
+        metadata = {
+            'model': 'Dataset-optimized large-v3',
+            'device': device_name,
+            'time_taken': format_duration(elapsed),
+            'preprocessing': "Vintage tape preset" if preprocessing_used else "None"
+        }
+        
+        docx_path = convert_txt_to_docx_from_text(formatted_text, source_path, metadata=metadata)
+        print(f"✅ DOCX file saved: {docx_path}")
+    except Exception as docx_err:
+        print(f"⚠️  Failed to generate DOCX: {docx_err}")
 
     # Final stats
-    elapsed = time.time() - start_time
     print("\n🎉 DATASET-OPTIMIZED TRANSCRIPTION COMPLETE!")
-    print(f"📄 Text file: {txt_path}")
+    if docx_path:
+        print(f"📄 DOCX file: {docx_path}")
     print(f"⏱️  Total time: {format_duration(elapsed)}")
 
     # Cleanup
@@ -1569,7 +1582,7 @@ def transcribe_with_dataset_optimization(input_path: str, output_dir=None, threa
     except Exception:
         pass
 
-    return txt_path
+    return str(docx_path) if docx_path else None
 
 
 def get_maximum_hardware_config(max_perf: bool = False):
@@ -2757,16 +2770,19 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
             if using_fw:
                 # Check if quality mode is enabled - if so, use high-quality beam search
                 if quality_mode:
-                    # MAXIMUM Quality mode: aggressive beam search for best accuracy
-                    transcribe_kwargs["beam_size"] = 10  # Maximum beam width
-                    transcribe_kwargs["best_of"] = 10    # Try many candidates
-                    transcribe_kwargs["patience"] = 2.0  # Wait longer for better results
-                    transcribe_kwargs["no_speech_threshold"] = 0.4  # Less aggressive silence detection
-                    transcribe_kwargs["compression_ratio_threshold"] = 2.4
-                    transcribe_kwargs["log_prob_threshold"] = -0.8  # Accept higher confidence only
-                    transcribe_kwargs["vad_filter"] = False
+                    # MAXIMUM Quality mode for vintage tape recordings: 
+                    # Optimized for challenging audio with room reverb and tape artifacts
+                    transcribe_kwargs["beam_size"] = 15  # Increased from 10 - explore more hypotheses
+                    transcribe_kwargs["best_of"] = 15    # Increased from 10 - evaluate more candidates
+                    transcribe_kwargs["patience"] = 3.0  # Increased from 2.0 - allow more time for convergence
+                    transcribe_kwargs["temperature"] = [0.0, 0.2, 0.4]  # Progressive fallback for difficult segments
+                    transcribe_kwargs["no_speech_threshold"] = 0.5  # More conservative - don't skip uncertain segments
+                    transcribe_kwargs["compression_ratio_threshold"] = 2.6  # Slightly stricter to avoid repetition
+                    transcribe_kwargs["log_prob_threshold"] = -1.0  # More lenient - accept lower confidence for difficult audio
+                    transcribe_kwargs["condition_on_previous_text"] = True  # Use context for better accuracy
+                    transcribe_kwargs["vad_filter"] = False  # Disable VAD - we already preprocessed
                     transcribe_kwargs["chunk_length"] = 30
-                    print("🎯 FW MAXIMUM QUALITY: beam_size=10, best_of=10, patience=2.0, log_prob=-0.8")
+                    print("🎯 FW MAXIMUM QUALITY (Vintage Tape): beam=15, best_of=15, patience=3.0, temp=[0.0,0.2,0.4]")
                 else:
                     # Greedy capture but still apply repetition guard by disabling conditioning
                     transcribe_kwargs["beam_size"] = 1

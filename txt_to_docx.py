@@ -7,6 +7,7 @@ from typing import Optional
 
 from docx import Document  # type: ignore
 from docx.enum.text import WD_ALIGN_PARAGRAPH  # type: ignore
+from docx.shared import RGBColor  # type: ignore
 
 
 def infer_year_from_parent(folder_name: str) -> int:
@@ -238,7 +239,7 @@ def convert_txt_to_docx_from_text(body_text: str, source_audio_path: Path, year:
         note = doc.add_paragraph("(This information can be deleted if not needed)")
         note.runs[0].font.size = 8 * 12700  # 8pt
         note.runs[0].font.italic = True
-        note.runs[0].font.color.rgb = (128, 128, 128)  # Gray color
+        note.runs[0].font.color.rgb = RGBColor(128, 128, 128)  # Gray color
 
     # Output path: same folder as source audio, .docx extension
     out_path = source_audio_path.with_suffix(".docx")

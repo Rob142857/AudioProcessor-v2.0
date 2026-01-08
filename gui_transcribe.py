@@ -860,13 +860,16 @@ def launch_gui(default_outdir: Optional[str] = None, *, default_threads: Optiona
                         pass
 
                     # Apply initial prompt for context hints
+                    # ALWAYS enable special_words.txt usage + optional GUI prompt overlay
                     try:
+                        # Enable special_words.txt domain terms by default
+                        os.environ["TRANSCRIBE_ALLOW_PROMPT"] = "1"
+                        
+                        # Add optional GUI context hint if provided
                         prompt = initial_prompt_var.get().strip()
                         if prompt:
-                            os.environ["TRANSCRIBE_ALLOW_PROMPT"] = "1"
                             os.environ["TRANSCRIBE_INITIAL_PROMPT"] = prompt
                         else:
-                            os.environ.pop("TRANSCRIBE_ALLOW_PROMPT", None)
                             os.environ.pop("TRANSCRIBE_INITIAL_PROMPT", None)
                     except Exception:
                         pass
