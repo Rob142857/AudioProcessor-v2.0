@@ -2419,12 +2419,32 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
             elif backend == "faster-whisper":
                 try:
                     from faster_whisper import WhisperModel  # type: ignore
+                    
+                    # Enable HuggingFace Hub access for model downloads if needed
+                    if "HF_HUB_OFFLINE" in os.environ:
+                        print("📡 Enabling online model downloads (HF_HUB_OFFLINE=0)")
+                        os.environ["HF_HUB_OFFLINE"] = "0"
+                    
                 except Exception as fw_imp_e:
                     print(f"⚠️  faster-whisper import failed ({fw_imp_e}); falling back to native backend")
                     backend = "native"
                     
             if backend == "faster-whisper":
-                pref_raw = os.environ.get("TRANSCRIBE_FW_COMPUTE_TYPES", "auto,int8,float16")
+                # Determine optimal compute type based on GPU architecture
+                try:
+                    capability = torch_api.cuda.get_device_capability(0)
+                    # Volta and newer (compute capability >= 7.0) support efficient FP16
+                    if capability[0] >= 7:
+                        # RTX 20xx/30xx/40xx, A100, etc. - use float16 for best performance
+                        pref_raw = os.environ.get("TRANSCRIBE_FW_COMPUTE_TYPES", "float16,int8,auto")
+                    else:
+                        # GTX 10xx (Pascal) or older - int8 is faster than float16
+                        pref_raw = os.environ.get("TRANSCRIBE_FW_COMPUTE_TYPES", "int8,auto")
+                        print(f"💡 Using int8 (optimal for Pascal/Maxwell GPUs)")
+                except:
+                    # Fallback for older systems
+                    pref_raw = os.environ.get("TRANSCRIBE_FW_COMPUTE_TYPES", "int8,auto,float16")
+                
                 compute_order = [c.strip() for c in pref_raw.split(',') if c.strip()]
                 load_success = False
                 
@@ -2459,13 +2479,27 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
                             if 'out of memory' in str(rte).lower():
                                 print(f"⚠️  FW CUDA OOM on compute_type={ctype}: {rte}")
                                 continue
+                            # Check for offline mode error
+                            if 'HF_HUB_OFFLINE' in str(rte) or 'outgoing traffic has been disabled' in str(rte):
+                                print(f"⚠️  FW offline mode error (compute_type={ctype})")
+                                print(f"💡 Model not cached locally. Falling back to native Whisper (already cached).")
+                                backend = "native"
+                                break
                             print(f"⚠️  FW load error (compute_type={ctype}): {rte}")
                             continue
                         except Exception as e_fw:
+                            err_msg = str(e_fw)
+                            # Check for offline/cache errors
+                            if 'HF_HUB_OFFLINE' in err_msg or 'cached snapshot' in err_msg or 'outgoing traffic' in err_msg:
+                                print(f"⚠️  FW model not cached locally (compute_type={ctype})")
+                                print(f"💡 Faster-whisper models need to be downloaded. Falling back to native Whisper.")
+                                backend = "native"
+                                break
                             print(f"⚠️  FW general error (compute_type={ctype}): {e_fw}")
                             continue
-                if not load_success:
-                    raise RuntimeError(f"All faster-whisper load attempts failed for '{selected_model_name}'")
+                if not load_success and backend == "faster-whisper":
+                    print(f"⚠️  All faster-whisper attempts failed. Falling back to native Whisper.")
+                    backend = "native"
             else:
                 force_fp16_env = os.environ.get("TRANSCRIBE_FORCE_FP16", "").lower() in ("1","true","yes")
                 attempts = [

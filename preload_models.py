@@ -78,16 +78,39 @@ def preload_faster_whisper():
         import torch
         
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        compute_type = "float16" if device == "cuda" else "int8"
         
-        print(f"Device: {device}, Compute type: {compute_type}\n")
+        # For CUDA, try compute types in order of compatibility
+        # int8 works on all CUDA GPUs (including older ones like GTX 1070 Ti)
+        # float16 requires Volta+ (RTX 20xx, 30xx, 40xx)
+        if device == "cuda":
+            # Check GPU compute capability
+            try:
+                capability = torch.cuda.get_device_capability(0)
+                # Volta and newer (compute capability >= 7.0) support efficient FP16
+                if capability[0] >= 7:
+                    compute_type = "float16"
+                    print(f"GPU: {torch.cuda.get_device_name(0)} (Compute {capability[0]}.{capability[1]})")
+                    print(f"Using float16 (efficient on this GPU)")
+                else:
+                    compute_type = "int8"
+                    print(f"GPU: {torch.cuda.get_device_name(0)} (Compute {capability[0]}.{capability[1]})")
+                    print(f"Using int8 (optimal for Pascal/Maxwell GPUs)")
+            except:
+                compute_type = "int8"  # Safe default for older GPUs
+                print(f"Using int8 compute type (safe default)")
+        else:
+            compute_type = "int8"
+            print(f"Device: CPU, using int8")
         
-        models_to_load = ["large-v3-turbo", "large-v3"]
+        print(f"\nDevice: {device}, Compute type: {compute_type}\n")
+        
+        models_to_load = ["large-v3"]  # Start with just large-v3
         success_count = 0
         
         for model_name in models_to_load:
             try:
                 print(f"  [{success_count + 1}/{len(models_to_load)}] Loading {model_name}...")
+                print(f"  📥 Downloading model (this may take a few minutes)...")
                 model = WhisperModel(model_name, device=device, compute_type=compute_type)
                 print(f"  ✓ Successfully cached: {model_name}")
                 del model
@@ -169,19 +192,19 @@ def show_system_info():
 
 
 def preload_all_models():
-    """Download and cache all Whisper model variants."""
+    """Download and cache Faster-Whisper large-v3 model only."""
     show_system_info()
     
     results = {}
     
-    # Native Whisper
-    results['native'] = preload_native_whisper()
+    # Native Whisper - COMMENTED OUT (not needed, using faster-whisper)
+    # results['native'] = preload_native_whisper()
     
-    # Faster-Whisper (optional)
+    # Faster-Whisper - PRIMARY MODEL
     results['faster'] = preload_faster_whisper()
     
-    # Distil-Whisper (optional)  
-    results['distil'] = preload_distil_whisper()
+    # Distil-Whisper - COMMENTED OUT (not needed for now)
+    # results['distil'] = preload_distil_whisper()
     
     # Summary
     print("\n" + "="*60)
@@ -191,12 +214,12 @@ def preload_all_models():
         status = "✓" if success else "❌"
         print(f"  {status} {backend}")
     
-    return results['native']  # At minimum native should work
+    return results.get('faster', False)  # Return faster-whisper status
 
 
 if __name__ == "__main__":
     success = preload_all_models()
     if not success:
-        print("\n❌ Failed to preload core models")
+        print("\n❌ Failed to preload faster-whisper model")
         sys.exit(1)
     print("\n✓ Model preloading complete!")
