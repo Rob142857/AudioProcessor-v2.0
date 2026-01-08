@@ -46,7 +46,7 @@
       "max_repeat_cap": 3
     },
     "C:/Users/RobertEvans/OneDrive - RME Solutions Technology/_PG Completed Recordings 84-97": {
-      "domain_terms_file": "c:\\Users\\RobertEvans\\Downloads\\AudioProcessorAlphaVersion\\awkward_words.txt",
+      "domain_terms_file": "C:/Users/RobertEvans/Downloads/AudioProcessorAlphaVersion/special_words.txt",
       "recursive": 1,
       "skip_existing": 0,
       "time_header": 1,
@@ -147,6 +147,9 @@
       "max_repeat_cap": 10,
       "whisper_model": "large-v3",
       "initial_prompt": ""
+    },
+    "C:/Users/RobertEvans/OneDrive - RME Solutions Technology": {
+      "domain_terms_file": "C:/Users/RobertEvans/Downloads/AudioProcessorAlphaVersion/special_words.txt"
     }
   }
 }
