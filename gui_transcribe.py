@@ -513,8 +513,6 @@ def launch_gui(default_outdir: Optional[str] = None, *, default_threads: Optiona
             ("large-v3", "Whisper large-v3 (best accuracy, slower)"),
             ("faster-whisper-large-v3", "Faster-Whisper large-v3 (4x faster, same accuracy)"),
             ("faster-whisper-large-v3-turbo", "Faster-Whisper turbo (fastest local)"),
-            ("distil-whisper-large-v3", "Distil-Whisper large-v3 (6x faster, English-only)"),
-            ("insanely-fast-whisper", "Insanely-Fast-Whisper (GPU optimized, batched)"),
         ]
         
         # Default to best-accuracy native Whisper model unless project overrides.
@@ -568,7 +566,7 @@ def launch_gui(default_outdir: Optional[str] = None, *, default_threads: Optiona
 
         # Row 13: Compact description
         desc = (
-            "Auto device (CUDA/DirectML/CPU) • Faster-Whisper/Distil-Whisper for speed\n"
+            "Auto device (CUDA/DirectML/CPU) • Faster-Whisper for speed\n"
             "Outputs saved next to source file(s)."
         )
         ttk.Label(combined_frame, text=desc, background='white', foreground='#374151', font=('Segoe UI', 9), wraplength=920, justify='left').grid(column=0, row=13, columnspan=4, sticky='w', padx=20, pady=(8, 16))
@@ -849,7 +847,7 @@ def launch_gui(default_outdir: Optional[str] = None, *, default_threads: Optiona
                         # This disables the low-VRAM auto-switch-to-faster-whisper heuristic.
                         is_native_selection = not (
                             selected_model.startswith("faster-whisper-")
-                            or selected_model.startswith("distil-whisper-")
+
                             or selected_model == "insanely-fast-whisper"
                         )
                         if is_native_selection:

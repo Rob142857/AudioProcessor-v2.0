@@ -1100,7 +1100,6 @@ def transcribe_with_dataset_optimization(input_path: str, output_dir=None, threa
     # Lazy imports
     import whisper
     from docx import Document
-    from deepmultilingualpunctuation import PunctuationModel
     from transcribe import (
         get_media_duration, split_into_paragraphs, format_duration, format_duration_minutes_only, format_duration_hms,
     )
@@ -1114,6 +1113,14 @@ def transcribe_with_dataset_optimization(input_path: str, output_dir=None, threa
     # Preprocess audio with silence padding to prevent missed words
     preprocessed_path = preprocess_audio_with_padding(input_path)
     preprocessing_used = preprocessed_path != input_path
+    
+    # Log audio duration for debugging early termination issues
+    try:
+        from transcribe import get_media_duration
+        audio_duration = get_media_duration(preprocessed_path)
+        print(f"🎵 Audio file duration: {audio_duration:.1f}s ({audio_duration/60:.1f} minutes)")
+    except Exception as dur_e:
+        print(f"⚠️  Could not determine audio duration: {dur_e}")
     
     if preprocessing_used:
         print(f"✅ Preprocessed with silence padding (prevents missed words)")
@@ -1480,13 +1487,6 @@ def transcribe_with_dataset_optimization(input_path: str, output_dir=None, threa
             full_text = _collapse_repetitions(full_text, max_repeats=3)
             full_text = _remove_prompt_artifacts(full_text)
             full_text, early_artifact_stats = _remove_extended_artifacts(full_text)
-            pm = PunctuationModel()
-            t0 = time.time()
-            full_text = pm.restore_punctuation(full_text)
-            t1 = time.time()
-            full_text = pm.restore_punctuation(full_text)
-            t2 = time.time()
-            print(f"✅ Punctuation restoration completed (passes: 2 | {t1 - t0:.1f}s + {t2 - t1:.1f}s)")
             full_text = _collapse_single_word_runs(full_text, max_repeats=2)
             # Break long sentences to avoid run-ons before further cleanup
             full_text = _split_long_sentences(full_text, max_chars=170)
@@ -2021,8 +2021,6 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
     transcription_result = None
     transcription_error = None
     using_fw = False
-    using_distil = False
-    using_insanely_fast = False
 
     _ensure_torch_available()
     torch_api = cast(Any, torch)
@@ -2204,14 +2202,6 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
         backend = "faster-whisper"
         actual_model_name = selected_model_name.replace("faster-whisper-", "")
         print(f"🚀 Backend: Faster-Whisper (CTranslate2) - 4x faster")
-    elif selected_model_name.startswith("distil-whisper-"):
-        backend = "distil-whisper"
-        actual_model_name = "distil-whisper/distil-large-v3"  # HuggingFace model ID
-        print(f"🚀 Backend: Distil-Whisper (HuggingFace) - 6x faster, English-only")
-    elif selected_model_name == "insanely-fast-whisper":
-        backend = "insanely-fast-whisper"
-        actual_model_name = "openai/whisper-large-v3"  # Uses HF pipeline with optimizations
-        print(f"🚀 Backend: Insanely-Fast-Whisper (Flash Attention + Batching)")
     else:
         print(f"🎯 Backend: Native OpenAI Whisper")
     
@@ -2353,83 +2343,9 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
                 print(f"   Benefits: 50% less VRAM usage, 4x faster inference, same quality")
             
             using_fw = False
-            using_distil = False
-            using_insanely_fast = False
-            
-            # === DISTIL-WHISPER BACKEND ===
-            if backend == "distil-whisper":
-                try:
-                    from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
-                    
-                    print(f"🔄 Loading Distil-Whisper model: {selected_model_name}")
-                    
-                    # Determine compute type
-                    torch_dtype = torch_api.float16 if torch_api.cuda.is_available() else torch_api.float32
-                    
-                    distil_model = AutoModelForSpeechSeq2Seq.from_pretrained(
-                        selected_model_name,
-                        torch_dtype=torch_dtype,
-                        low_cpu_mem_usage=True,
-                        use_safetensors=True
-                    )
-                    distil_model.to("cuda" if torch_api.cuda.is_available() else "cpu")
-                    
-                    distil_processor = AutoProcessor.from_pretrained(selected_model_name)
-                    
-                    # Create pipeline
-                    model = pipeline(
-                        "automatic-speech-recognition",
-                        model=distil_model,
-                        tokenizer=distil_processor.tokenizer,
-                        feature_extractor=distil_processor.feature_extractor,
-                        torch_dtype=torch_dtype,
-                        device="cuda" if torch_api.cuda.is_available() else "cpu",
-                    )
-                    using_distil = True
-                    print(f"✅ Distil-Whisper loaded successfully")
-                except Exception as distil_e:
-                    print(f"⚠️  Distil-Whisper load failed: {distil_e}")
-                    print("🔄 Falling back to native Whisper...")
-                    backend = "native"
-            
-            # === INSANELY-FAST-WHISPER BACKEND ===
-            elif backend == "insanely-fast-whisper":
-                try:
-                    from transformers import pipeline
-                    
-                    print(f"🔄 Loading Insanely-Fast-Whisper: {selected_model_name}")
-                    
-                    # Use Flash Attention 2 if available
-                    model_kwargs = {"use_flash_attention_2": True} if torch_api.cuda.is_available() else {}
-                    
-                    model = pipeline(
-                        "automatic-speech-recognition",
-                        model=selected_model_name,
-                        torch_dtype=torch_api.float16 if torch_api.cuda.is_available() else torch_api.float32,
-                        device="cuda" if torch_api.cuda.is_available() else "cpu",
-                        model_kwargs=model_kwargs,
-                    )
-                    using_insanely_fast = True
-                    print(f"✅ Insanely-Fast-Whisper loaded with Flash Attention")
-                except Exception as isf_e:
-                    print(f"⚠️  Insanely-Fast-Whisper load failed: {isf_e}")
-                    # Try without flash attention
-                    try:
-                        model = pipeline(
-                            "automatic-speech-recognition",
-                            model=selected_model_name,
-                            torch_dtype=torch_api.float16 if torch_api.cuda.is_available() else torch_api.float32,
-                            device="cuda" if torch_api.cuda.is_available() else "cpu",
-                        )
-                        using_insanely_fast = True
-                        print(f"✅ Insanely-Fast-Whisper loaded (without Flash Attention)")
-                    except Exception as isf_e2:
-                        print(f"⚠️  Insanely-Fast-Whisper fallback also failed: {isf_e2}")
-                        print("🔄 Falling back to native Whisper...")
-                        backend = "native"
             
             # === FASTER-WHISPER BACKEND ===
-            elif backend == "faster-whisper":
+            if backend == "faster-whisper":
                 try:
                     from faster_whisper import WhisperModel  # type: ignore
                     
@@ -2672,51 +2588,11 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
     transcription_error = None
 
     def _run_transcribe():
-        nonlocal transcription_complete, transcription_result, transcription_error, use_vad, using_fw, using_distil, using_insanely_fast
+        nonlocal transcription_complete, transcription_result, transcription_error, use_vad, using_fw
         try:
             print("🔄 Starting transcription process...")
             if model is None:
                 raise RuntimeError("Transcription model is not loaded")
-
-            # === DISTIL-WHISPER or INSANELY-FAST-WHISPER (HuggingFace Pipeline) ===
-            if using_distil or using_insanely_fast:
-                backend_name = "Distil-Whisper" if using_distil else "Insanely-Fast-Whisper"
-                print(f"🎯 Using {backend_name} pipeline for transcription...")
-                
-                # HuggingFace pipeline transcription
-                pipeline_kwargs = {
-                    "return_timestamps": True,
-                    "chunk_length_s": 30,
-                    "batch_size": 16 if using_insanely_fast else 8,  # Larger batches for insanely-fast
-                }
-                
-                # Add language hint
-                generate_kwargs = {"language": "en", "task": "transcribe"}
-                
-                result = model(working_input_path, generate_kwargs=generate_kwargs, **pipeline_kwargs)
-                
-                # Convert to standard format
-                if isinstance(result, dict):
-                    text = result.get("text", "")
-                    chunks = result.get("chunks", [])
-                    segments = []
-                    for chunk in chunks:
-                        if isinstance(chunk, dict):
-                            seg_text = chunk.get("text", "")
-                            timestamps = chunk.get("timestamp", (0, 0))
-                            if timestamps and len(timestamps) >= 2:
-                                segments.append({
-                                    "text": seg_text,
-                                    "start": timestamps[0] or 0,
-                                    "end": timestamps[1] or 0,
-                                })
-                    transcription_result = {"text": text, "segments": segments}
-                else:
-                    transcription_result = {"text": str(result), "segments": []}
-                
-                print(f"✅ {backend_name} transcription completed")
-                transcription_complete = True
-                return
 
             # === NATIVE WHISPER / FASTER-WHISPER ===
             # Apply VAD segmentation if enabled
@@ -3071,9 +2947,18 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
             # Additional debugging
             if cleaned_parts:
                 first_part = cleaned_parts[0][:100] if cleaned_parts[0] else "N/A"
+                last_part = cleaned_parts[-1][:100] if len(cleaned_parts) > 0 else "N/A"
                 print(f"🔍 First segment text: '{first_part}...'")
+                print(f"🔍 Last segment text: '...{last_part}'")
+                
+            # Show timestamp range to detect early termination
+            if cleaned_segments:
+                first_time = cleaned_segments[0].get('start', 0)
+                last_time = cleaned_segments[-1].get('end', 0)
+                print(f"⏱️  Transcribed time range: {first_time:.1f}s to {last_time:.1f}s (duration: {last_time - first_time:.1f}s)")
                 
             print(f"📊 Segment filtering: kept {kept_count}/{len(segments)} segments")
+            print(f"📝 Full text length: {len(full_text)} characters ({len(full_text.split())} words)")
 
             # Speaker identification removed as requested
         else:
@@ -3110,20 +2995,14 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
         if music_removed:
             print(f"🎵 Removed {music_removed} music/hallucination pattern(s)")
         
-        # Semantic paragraph segmentation - meaning-based breaks without altering sentences
-        try:
-            from paragraph_segmenter import create_paragraph_segmenter
-            print("📊 Applying semantic paragraph segmentation...")
-            para_segmenter = create_paragraph_segmenter(similarity_threshold=0.50)
-            formatted_text = para_segmenter.segment_paragraphs(full_text, verbose=False)
-            # Refine paragraph lengths for readability
-            formatted_text = para_segmenter.refine_paragraphs(formatted_text, min_paragraph_length=150, max_paragraph_length=800)
-            quality_stats = {"semantic_paragraphs": True, "music_hallucinations_removed": music_removed}
-        except Exception as para_e:
-            print(f"⚠️  Semantic paragraph segmentation unavailable: {para_e}")
-            # Fallback to segment-based paragraphs (silence gaps)
+        # Use segment-based paragraphs (silence gaps) - simpler and more reliable
+        formatted = split_into_paragraphs(full_text, max_length=500)
+        if isinstance(formatted, list):
+            formatted_text = "\n\n".join(formatted)
+        else:
             formatted_text = full_text
-            quality_stats = {"fallback_paragraphs": True, "music_hallucinations_removed": music_removed}
+        quality_stats = {"paragraphs": True, "music_hallucinations_removed": music_removed}
+        print("✅ Paragraph formatting completed")
     except Exception as e:
         print(f"⚠️  Text processing failed: {e}")
         formatted_text = full_text
@@ -3151,7 +3030,7 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
         source_path = Path(input_path)
         
         # Prepare metadata for DOCX footer
-        backend_name = "Faster-Whisper" if using_fw else "Distil-Whisper" if using_distil else "Insanely-Fast-Whisper" if using_insanely_fast else "Native Whisper"
+        backend_name = "Faster-Whisper" if using_fw else "Native Whisper"
         metadata = {
             'model': f"{backend_name} {selected_model_name}",
             'device': device_name,

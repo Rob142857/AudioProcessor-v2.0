@@ -12,7 +12,6 @@ import torch
 from docx import Document
 from moviepy import VideoFileClip, AudioFileClip
 import imageio_ffmpeg as iio_ffmpeg
-from deepmultilingualpunctuation import PunctuationModel
 try:
     import webrtcvad
     WEBRTCVAD_AVAILABLE = True
@@ -499,9 +498,9 @@ def transcribe_file(input_path, model_name="large", preprocess=True, keep_temp=F
         full_text = "\n\n".join(outputs)
 
         if punctuate:
-            print("Running punctuation model to restore punctuation...")
-            pm = PunctuationModel()
-            full_text = pm.restore_punctuation(full_text)
+            print("⚠️  Punctuation restoration disabled (dependency removed)")
+            # pm = PunctuationModel()
+            # full_text = pm.restore_punctuation(full_text)
 
         # clean fillers
         full_text = clean_fillers(full_text)
@@ -834,9 +833,9 @@ def transcribe_file_no_vad(input_path, model_name="large", preprocess=True, keep
         full_text = res.get("text", "").strip()
 
         if punctuate:
-            print("Running punctuation model to restore punctuation...")
-            pm = PunctuationModel()
-            full_text = pm.restore_punctuation(full_text)
+            print("⚠️  Punctuation restoration disabled (dependency removed)")
+            # pm = PunctuationModel()
+            # full_text = pm.restore_punctuation(full_text)
 
         # clean fillers
         full_text = clean_fillers(full_text)
@@ -1222,9 +1221,9 @@ def transcribe_lecture(input_path, model_name="large", preprocess=True, keep_tem
         full_text = "\n\n".join(outputs)
 
         if punctuate:
-            print("Running punctuation model to restore punctuation...")
-            pm = PunctuationModel()
-            full_text = pm.restore_punctuation(full_text)
+            print("⚠️  Punctuation restoration disabled (dependency removed)")
+            # pm = PunctuationModel()
+            # full_text = pm.restore_punctuation(full_text)
 
         # Clean fillers but be less optimised for lectures
         full_text = clean_fillers_lecture(full_text)

@@ -1,22 +1,12 @@
 # Core AI/ML dependencies
 openai-whisper==20250625
-deepmultilingualpunctuation==1.0.1
 
-# Advanced punctuation restoration (oliverguhr BERT model)
-# This model significantly improves sentence and paragraph boundary detection
-transformers>=4.40.0
-torch>=2.0.0
-
-# Semantic paragraph segmentation
-sentence-transformers>=2.2.0
 
 # Prosody analysis for intelligent sentence merging
 librosa>=0.10.0
 
 # Alternative Whisper backends (faster/more efficient)
 faster-whisper>=1.0.0
-transformers>=4.40.0
-accelerate>=0.25.0
 
 # Enhanced text processing libraries
 spacy>=3.7.0,<4.0.0

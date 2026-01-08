@@ -129,48 +129,6 @@ def preload_faster_whisper():
         return False
 
 
-def preload_distil_whisper():
-    """Download and cache Distil-Whisper model (HuggingFace)."""
-    print("\n" + "="*60)
-    print("DISTIL-WHISPER MODEL (HuggingFace)")
-    print("="*60)
-    
-    try:
-        from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
-        import torch
-        
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        torch_dtype = torch.float16 if device == "cuda" else torch.float32
-        
-        print(f"Device: {device}, Dtype: {torch_dtype}\n")
-        
-        model_id = "distil-whisper/distil-large-v3"
-        
-        try:
-            print(f"  Loading {model_id}...")
-            model = AutoModelForSpeechSeq2Seq.from_pretrained(
-                model_id,
-                torch_dtype=torch_dtype,
-                low_cpu_mem_usage=True,
-                use_safetensors=True
-            )
-            processor = AutoProcessor.from_pretrained(model_id)
-            print(f"  ✓ Successfully cached: {model_id}")
-            del model, processor
-            print(f"\n✓ Distil-Whisper: model cached")
-            return True
-        except Exception as e:
-            print(f"  ❌ Failed to preload {model_id}: {e}")
-            return False
-        
-    except ImportError:
-        print("⚠ transformers not installed (optional)")
-        return False
-    except Exception as e:
-        print(f"❌ Error: {e}")
-        return False
-
-
 def show_system_info():
     """Display system information."""
     print("="*60)
