@@ -51,7 +51,7 @@
       "skip_existing": 0,
       "time_header": 1,
       "quality_mode": 1,
-      "max_repeat_cap": 10,
+      "max_repeat_cap": 15,
       "whisper_model": "faster-whisper-large-v3",
       "initial_prompt": "",
       "replace_before_enabled": 1,

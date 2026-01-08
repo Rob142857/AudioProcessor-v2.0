@@ -9,6 +9,13 @@ from docx import Document  # type: ignore
 from docx.enum.text import WD_ALIGN_PARAGRAPH  # type: ignore
 from docx.shared import RGBColor  # type: ignore
 
+try:
+    from australian_spelling import normalize_text
+    AUSTRALIAN_SPELLING_AVAILABLE = True
+except ImportError:
+    AUSTRALIAN_SPELLING_AVAILABLE = False
+    def normalize_text(text, **kwargs): return text
+
 
 def infer_year_from_parent(folder_name: str) -> int:
     """Extract a year from a folder name, e.g. '1988 MW' -> 1988 or '84-97' -> 1984.
@@ -77,6 +84,36 @@ def make_title_from_filename(filename: str) -> str:
     m = re.match(r"\d{4}[_\- ]*(.*)", stem)
     title_part = m.group(1) if m and m.group(1) else stem
     return title_part.strip() or stem
+
+
+def extract_lecture_number(filename: str) -> Optional[int]:
+    """Extract lecture number from filename if present.
+    
+    Examples:
+        '0114 1992 Mythology.mp3' -> 114 (from MMDD)
+        'Lecture 05.mp3' -> 5
+        'L23 Topic.mp3' -> 23
+    
+    Returns None if no clear lecture number pattern is found.
+    """
+    stem = Path(filename).stem
+    
+    # Try explicit lecture number patterns first
+    m = re.search(r"(?:Lecture|L)\s*(\d+)", stem, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    
+    # For MMDD format files, use the day portion as lecture number if it seems reasonable
+    # (e.g., 0114 could be lecture 14)
+    m = re.match(r"(\d{2})(\d{2})", stem)
+    if m:
+        month = int(m.group(1))
+        day = int(m.group(2))
+        # Only use if month is valid (1-12) and day looks reasonable (1-31)
+        if 1 <= month <= 12 and 1 <= day <= 31:
+            return day
+    
+    return None
 
 
 def get_source_path_from_header(txt_path: Path) -> Optional[Path]:
@@ -179,7 +216,7 @@ def convert_txt_to_docx(txt_path: Path, year: Optional[int] = None) -> Path:
     return out_path
 
 
-def convert_txt_to_docx_from_text(body_text: str, source_audio_path: Path, year: Optional[int] = None, metadata: Optional[dict] = None) -> Path:
+def convert_txt_to_docx_from_text(body_text: str, source_audio_path: Path, year: Optional[int] = None, metadata: Optional[dict] = None, use_australian_spelling: bool = True) -> Path:
     """Convert transcript text directly to DOCX, saving next to the source audio file.
     
     Args:
@@ -187,27 +224,57 @@ def convert_txt_to_docx_from_text(body_text: str, source_audio_path: Path, year:
         source_audio_path: Path to the original audio/video file (DOCX will be saved next to it)
         year: Optional year override for date inference
         metadata: Optional dict with transcription metadata (model, device, time_taken, preprocessing)
+        use_australian_spelling: Whether to convert to Australian spelling (default: True)
     
     Returns:
         Path to the created DOCX file
     """
+    # Diagnostic: Check input text length
+    input_char_count = len(body_text)
+    input_word_count = len(body_text.split())
+    print(f"📊 Input text: {input_char_count} characters, {input_word_count} words")
+    
+    # Apply Australian spelling conversion and number formatting
+    if use_australian_spelling and AUSTRALIAN_SPELLING_AVAILABLE:
+        body_text = normalize_text(body_text, use_australian_spelling=True, fix_numbers=True)
+        print("✅ Applied Australian spelling and number formatting")
+        # Diagnostic: Check text length after normalization
+        norm_char_count = len(body_text)
+        norm_word_count = len(body_text.split())
+        print(f"📊 After normalization: {norm_char_count} characters, {norm_word_count} words")
+    
     # Infer year from the directory structure if not provided explicitly.
     if year is None:
         year = infer_year_from_ancestors(source_audio_path.parent)
 
     # Infer date from filename MMDD (using source audio filename)
     d = infer_date_from_filename(source_audio_path.name, year)
-    if d:
-        weekday = d.strftime("%A")
-        month_name = d.strftime("%B")
-        date_line = f"{weekday}, {d.day} {month_name} {d.year}"
-    else:
-        # Use YEAR- prefix when date cannot be determined
-        title_base = make_title_from_filename(source_audio_path.name)
-        date_line = f"YEAR-{title_base}"
-
+    
+    # Extract lecture number from filename
+    lecture_num = extract_lecture_number(source_audio_path.name)
+    
     # Build title from source audio filename
     title = make_title_from_filename(source_audio_path.name)
+    
+    # Build standardized subtitle with lecture number and date
+    if d and lecture_num:
+        # Full format: "Lecture XX given on DDth of Month YYYY by Dr Philip W Groves"
+        day_suffix = "th"
+        if d.day in [1, 21, 31]: day_suffix = "st"
+        elif d.day in [2, 22]: day_suffix = "nd"
+        elif d.day in [3, 23]: day_suffix = "rd"
+        subtitle = f"Lecture {lecture_num} given on {d.day}{day_suffix} of {d.strftime('%B')} {d.year} by Dr Philip W Groves"
+    elif d:
+        # Date only format
+        weekday = d.strftime("%A")
+        month_name = d.strftime("%B")
+        subtitle = f"{weekday}, {d.day} {month_name} {d.year}\nby Dr Philip W Groves"
+    elif lecture_num:
+        # Lecture number only
+        subtitle = f"Lecture {lecture_num} by Dr Philip W Groves"
+    else:
+        # Fallback: use YEAR- prefix or just author
+        subtitle = "by Dr Philip W Groves"
 
     # Create DOCX
     doc = Document()
@@ -216,13 +283,13 @@ def convert_txt_to_docx_from_text(body_text: str, source_audio_path: Path, year:
     heading = doc.add_heading(title, level=0)
     heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-    # Date line
-    p_date = doc.add_paragraph(date_line)
-    p_date.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-    # Author line
-    p_author = doc.add_paragraph("by Dr Philip Groves")
-    p_author.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    # Subtitle with lecture info
+    p_subtitle = doc.add_paragraph(subtitle)
+    p_subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    
+    # Add "Transcript:" line
+    p_transcript = doc.add_paragraph("Transcript:")
+    p_transcript.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
     # Blank line before body
     doc.add_paragraph("")

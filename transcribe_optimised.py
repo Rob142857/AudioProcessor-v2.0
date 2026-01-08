@@ -531,7 +531,7 @@ def build_initial_prompt(terms: list, max_chars: int = 600) -> Optional[str]:
         return None
 
 # --- Artifact mitigation: collapse excessive exact repetitions ----------------
-def _collapse_repetitions(text: str, max_repeats: int = 3) -> str:
+def _collapse_repetitions(text: str, max_repeats: int = 10) -> str:
     """Collapse excessive immediate repetitions of the same phrase.
 
     This targets simple loops like "to grow, to grow, to grow, ..." and reduces
@@ -542,28 +542,41 @@ def _collapse_repetitions(text: str, max_repeats: int = 3) -> str:
         env_max_repeats = os.environ.get("TRANSCRIBE_MAX_REPEAT_CAP", "").strip()
         if env_max_repeats:
             try:
-                max_repeats = max(1, min(10, int(env_max_repeats)))  # Cap between 1-10
+                max_repeats = max(1, min(20, int(env_max_repeats)))  # Cap between 1-20
             except Exception:
                 pass  # Use default if invalid
         
         # Normalize spaces around commas for matching
         t = re.sub(r"\s*,\s*", ", ", text)
-        # Build a regex that captures a short phrase (1-6 words) repeated many times
-        # Words may include apostrophes; keep phrases modest to avoid over-collapsing
-        pattern = r"\b((?:[A-Za-z']+\s+){0,5}[A-Za-z']+)\b(?:,\s*\1\b){" + str(max_repeats) + ",}"
+        
+        # First pass: Handle longer phrase repetitions (up to 20 words)
+        # This catches cases like "telekinesis is the ability to know..." repeated many times
+        for phrase_len in range(20, 0, -1):  # Start with longest phrases
+            pattern = r"\b((?:[A-Za-z']+\s+){" + str(phrase_len - 1) + r"}[A-Za-z']+)(?:\s+\1){" + str(max_repeats) + r",}"
+            
+            def repl(m):
+                phrase = m.group(1)
+                # Keep only max_repeats occurrences
+                return " ".join([phrase] * max_repeats)
+            
+            t = re.sub(pattern, repl, t, flags=re.IGNORECASE)
+        
+        # Second pass: Handle comma-separated repetitions
+        pattern = r"\b((?:[A-Za-z']+\s+){0,10}[A-Za-z']+)\b(?:,\s*\1\b){" + str(max_repeats) + ",}"
 
-        def repl(m):
+        def repl2(m):
             phrase = m.group(1)
             return ", ".join([phrase] * max_repeats)
 
         # Apply repeatedly a few times to catch nested patterns
-        for _ in range(2):
-            new_t = re.sub(pattern, repl, t)
+        for _ in range(3):
+            new_t = re.sub(pattern, repl2, t)
             if new_t == t:
                 break
             t = new_t
         return t
-    except Exception:
+    except Exception as e:
+        print(f"⚠️  Repetition collapse warning: {e}")
         return text
 
 
@@ -1260,8 +1273,9 @@ def transcribe_with_dataset_optimization(input_path: str, output_dir=None, threa
         compression_ratio_threshold=2.4,
         logprob_threshold=-1.0,
         no_speech_threshold=0.3,
-        # Disable conditioning to prevent repetition loops between segments
-        condition_on_previous_text=False,
+        # Enable conditioning for better punctuation and context awareness
+        # This helps prevent repetition loops and improves punctuation
+        condition_on_previous_text=True,
         temperature=0.0,
         verbose=False,  # Reduce verbosity for batch processing
         # Whisper's default punctuation handling is best - don't override
@@ -2990,7 +3004,9 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
     # - Skip all other aggressive text manipulation
     try:
         # Light cleanup: only remove obvious repetitions and music hallucinations
-        full_text = _collapse_repetitions(full_text, max_repeats=3)
+        # Use the max_repeat_cap from environment (set by GUI)
+        max_repeat_cap = int(os.environ.get("TRANSCRIBE_MAX_REPEAT_CAP", "10"))
+        full_text = _collapse_repetitions(full_text, max_repeats=max_repeat_cap)
         full_text, music_removed = _remove_music_hallucinations(full_text)
         if music_removed:
             print(f"🎵 Removed {music_removed} music/hallucination pattern(s)")
@@ -3018,8 +3034,17 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
     # Quality report goes to Temp folder
     quality_path = os.path.join(temp_folder, f"{base_name}_quality_report.json")
     
-    # We no longer save the TXT file - only DOCX output is needed
+    # Save intermediate TXT file next to source audio (for debugging and backup)
     txt_path = None
+    try:
+        from pathlib import Path
+        source_path = Path(input_path)
+        txt_path = source_path.with_suffix(".txt")
+        with open(txt_path, "w", encoding="utf-8") as txt_file:
+            txt_file.write(formatted_text)
+        print(f"📝 Intermediate TXT saved: {txt_path}")
+    except Exception as txt_err:
+        print(f"⚠️  Failed to save TXT file: {txt_err}")
 
     # Generate DOCX directly next to the source audio file
     docx_path = None
