@@ -11,47 +11,60 @@ from docx.shared import RGBColor  # type: ignore
 
 
 def infer_year_from_parent(folder_name: str) -> int:
-    """Extract a 4-digit year from a folder name, e.g. '1988 MW' -> 1988.
+    """Extract a year from a folder name, e.g. '1988 MW' -> 1988 or '84-97' -> 1984.
 
-    Raises ValueError if no 4-digit sequence is found.
+    First tries to find a 4-digit year (19xx or 20xx).
+    If not found, looks for 2-digit year patterns and assumes 19xx for years >= 50, 20xx for < 50.
+    Raises ValueError if no year pattern is found.
     """
+    # Try 4-digit year first
     m = re.search(r"(19\d{2}|20\d{2})", folder_name)
-    if not m:
-        raise ValueError(f"Could not find 4-digit year in folder name: {folder_name!r}")
-    return int(m.group(1))
+    if m:
+        return int(m.group(1))
+    
+    # Try 2-digit year patterns like "84-97", "Recordings 92", etc.
+    m = re.search(r"\b(\d{2})(?:-\d{2})?\b", folder_name)
+    if m:
+        two_digit = int(m.group(1))
+        # Assume 19xx for years >= 50, 20xx for years < 50
+        return 1900 + two_digit if two_digit >= 50 else 2000 + two_digit
+    
+    raise ValueError(f"Could not find year in folder name: {folder_name!r}")
 
 
-def infer_year_from_ancestors(start: Path) -> int:
-    """Walk up from a path until we find a folder name containing a 4-digit year.
+def infer_year_from_ancestors(start: Path) -> Optional[int]:
+    """Walk up from a path until we find a folder name containing a year.
 
-    This allows layouts like '.../1988 MW/Temp/0202 Fishes.txt' but will also
-    work if the year folder is higher up the tree. Raises ValueError if no
-    suitable folder is found.
+    This allows layouts like '.../1988 MW/Temp/0202 Fishes.txt' and also handles
+    2-digit year patterns like '84-97'. Returns None if no suitable folder is found.
     """
     for folder in [start] + list(start.parents):
         try:
             return infer_year_from_parent(folder.name)
         except ValueError:
             continue
-    raise ValueError(
-        f"Could not find 4-digit year in any parent folder names starting from {start!r}. "
-        "Pass --year explicitly when running this script."
-    )
+    return None
 
 
-def infer_date_from_filename(filename: str, year: int) -> date:
+def infer_date_from_filename(filename: str, year: Optional[int]) -> Optional[date]:
     """Infer a calendar date from a filename like '0202 Fishes.txt'.
 
     Assumes the first four digits are MMDD for the given year.
+    Returns None if year is None or if no MMDD pattern is found.
     """
+    if year is None:
+        return None
     stem = Path(filename).stem
     m = re.match(r"(\d{4})(?:\D|$)", stem)
     if not m:
-        raise ValueError(f"Could not find leading MMDD in filename: {filename!r}")
+        return None
     mmdd = m.group(1)
     month = int(mmdd[:2])
     day = int(mmdd[2:])
-    return date(year, month, day)
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
 
 
 def make_title_from_filename(filename: str) -> str:
@@ -126,9 +139,14 @@ def convert_txt_to_docx(txt_path: Path, year: Optional[int] = None) -> Path:
 
     # Infer date from filename MMDD
     d = infer_date_from_filename(txt_path.name, year)
-    weekday = d.strftime("%A")
-    month_name = d.strftime("%B")
-    date_line = f"{weekday}, {d.day} {month_name} {d.year}"
+    if d:
+        weekday = d.strftime("%A")
+        month_name = d.strftime("%B")
+        date_line = f"{weekday}, {d.day} {month_name} {d.year}"
+    else:
+        # Use YEAR- prefix when date cannot be determined
+        title_base = make_title_from_filename(txt_path.name)
+        date_line = f"YEAR-{title_base}"
 
     # Build title and body
     title = make_title_from_filename(txt_path.name)
@@ -179,9 +197,14 @@ def convert_txt_to_docx_from_text(body_text: str, source_audio_path: Path, year:
 
     # Infer date from filename MMDD (using source audio filename)
     d = infer_date_from_filename(source_audio_path.name, year)
-    weekday = d.strftime("%A")
-    month_name = d.strftime("%B")
-    date_line = f"{weekday}, {d.day} {month_name} {d.year}"
+    if d:
+        weekday = d.strftime("%A")
+        month_name = d.strftime("%B")
+        date_line = f"{weekday}, {d.day} {month_name} {d.year}"
+    else:
+        # Use YEAR- prefix when date cannot be determined
+        title_base = make_title_from_filename(source_audio_path.name)
+        date_line = f"YEAR-{title_base}"
 
     # Build title from source audio filename
     title = make_title_from_filename(source_audio_path.name)
