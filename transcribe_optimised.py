@@ -1380,16 +1380,15 @@ def transcribe_with_dataset_optimization(input_path: str, output_dir=None, threa
         # Large-v3: balanced settings
         seg_kwargs["compression_ratio_threshold"] = 2.4
     
-    # Apply quality mode if enabled - FIXED: Reasonable values
+    # Apply quality mode if enabled - optimized for vintage tape recordings
     quality_mode = os.environ.get("TRANSCRIBE_QUALITY_MODE", "").strip() in ("1", "true", "True")
     if quality_mode:
-        print("🎯 QUALITY mode enabled (balanced for complete output)")
-        # FIXED: beam_size=5 is industry standard for quality (was 10-15)
-        seg_kwargs["beam_size"] = 5
-        seg_kwargs["patience"] = 1.5      # Moderate patience (was 2.0-3.0)
-        seg_kwargs["best_of"] = 5         # Reasonable candidates (was 10-15)
-        seg_kwargs["temperature"] = 0.0   # Single temperature for consistency
-        print("   Settings: beam=5, best_of=5, patience=1.5")
+        print("🎯 QUALITY mode enabled (optimized for vintage tape)")
+        seg_kwargs["beam_size"] = 8       # Thorough beam search
+        seg_kwargs["patience"] = 1.7      # Moderate patience
+        seg_kwargs["best_of"] = 8         # Evaluate more candidates
+        seg_kwargs["temperature"] = 0.0   # Deterministic decoding
+        print("   Settings: beam=8, best_of=8, patience=1.7, temp=0.0")
     else:
         # Standard quality - still good
         seg_kwargs["beam_size"] = 5
@@ -2738,18 +2737,18 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
             # Tune settings based on backend (faster-whisper vs native)
             if using_fw:
                 if quality_mode:
-                    # HIGH QUALITY mode for Faster-Whisper (balanced for complete output)
+                    # HIGH QUALITY mode for Faster-Whisper (optimized for vintage tape recordings)
                     # CRITICAL: condition_on_previous_text=False prevents repetition loops and early termination
-                    transcribe_kwargs["beam_size"] = 5          # Standard beam search (was 15 - too extreme)
-                    transcribe_kwargs["best_of"] = 5            # Reasonable candidate count (was 15)
-                    transcribe_kwargs["patience"] = 1.5         # Moderate patience (was 3.0 - too slow)
-                    transcribe_kwargs["temperature"] = 0.0      # Deterministic decoding (single temperature)
+                    transcribe_kwargs["beam_size"] = 8          # Thorough beam search for quality
+                    transcribe_kwargs["best_of"] = 8            # Evaluate more candidates
+                    transcribe_kwargs["patience"] = 1.7         # Moderate patience - allows completion
+                    transcribe_kwargs["temperature"] = 0.0      # Deterministic decoding
                     transcribe_kwargs["no_speech_threshold"] = 0.5  # Balanced silence detection
-                    transcribe_kwargs["compression_ratio_threshold"] = 2.4  # Stricter to catch repetition
+                    transcribe_kwargs["compression_ratio_threshold"] = 2.4  # Catches repetition
                     transcribe_kwargs["log_prob_threshold"] = -1.0  # Accept lower confidence for difficult audio
                     transcribe_kwargs["condition_on_previous_text"] = False  # CRITICAL: prevents loops/early stop
                     transcribe_kwargs["vad_filter"] = False     # Disable VAD - we already preprocessed
-                    print("🎯 FW QUALITY mode: beam=5, best_of=5, patience=1.5, condition_on_prev=False")
+                    print("🎯 FW QUALITY mode: beam=8, best_of=8, patience=1.7, temp=0.1")
                 else:
                     # STANDARD mode for Faster-Whisper (fast and reliable)
                     transcribe_kwargs["beam_size"] = 5          # Good quality without slowdown
@@ -2757,11 +2756,11 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
                     transcribe_kwargs["patience"] = 1.0         # Standard patience
                     transcribe_kwargs["temperature"] = 0.0      # Deterministic
                     transcribe_kwargs["no_speech_threshold"] = 0.4  # Standard threshold
-                    transcribe_kwargs["compression_ratio_threshold"] = 2.4  # Stricter for clean output
+                    transcribe_kwargs["compression_ratio_threshold"] = 2.4  # Catches repetition
                     transcribe_kwargs["log_prob_threshold"] = -1.0  # Standard confidence threshold
                     transcribe_kwargs["condition_on_previous_text"] = False  # CRITICAL: prevents loops
                     transcribe_kwargs["vad_filter"] = False     # Disable VAD
-                    print("🎯 FW STANDARD mode: beam=5, best_of=5, patience=1.0, condition_on_prev=False")
+                    print("🎯 FW STANDARD mode: beam=5, best_of=5, patience=1.0, temp=0.0")
             
             # Gate initial prompt behind explicit opt-in to preserve strict verbatim neutrality
             if initial_prompt and str(os.environ.get("TRANSCRIBE_ALLOW_PROMPT", "0")).lower() in ("1","true","yes"):
