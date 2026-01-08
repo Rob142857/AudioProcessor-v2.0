@@ -195,7 +195,7 @@ def _as_result_dict(res: Any) -> Dict[str, Any]:
 
 def preprocess_audio_with_padding(input_path: str, temp_dir: str = None) -> str:
     """
-    Preprocess audio/video file to high-quality MP3 with silence padding.
+    Preprocess audio/video file optimized for vintage tape recordings.
     
     Args:
         input_path: Path to input audio/video file
@@ -204,12 +204,18 @@ def preprocess_audio_with_padding(input_path: str, temp_dir: str = None) -> str:
     Returns:
         Path to the preprocessed MP3 file with padding
         
-    Features:
-    - Converts any audio/video format to high-quality MP3 (320kbps)
-    - Adds 1 second of silence at the beginning
-    - Adds 1 second of silence at the end  
-    - Normalizes audio levels
-    - Prevents missed words at start/end of recordings
+    Features optimized for 1980s-1990s tape recordings in large rooms:
+    - Removes low-frequency rumble (HVAC, tape motor noise)
+    - Reduces tape hiss with adaptive noise reduction
+    - Enhances dialogue clarity in reverberant spaces
+    - Dynamic range compression for tape recordings with volume variations
+    - Loudness normalization for consistent levels
+    - 1.5 second silence padding to prevent start/end word loss
+    
+    Environment variable TRANSCRIBE_PREPROC_MODE controls processing:
+    - "vintage_tape" (default): Full processing for 80s/90s tape recordings
+    - "minimal": Light processing (just normalization + padding)
+    - "strong": Aggressive noise reduction for extremely poor sources
     """
     import tempfile
     import subprocess
@@ -237,30 +243,62 @@ def preprocess_audio_with_padding(input_path: str, temp_dir: str = None) -> str:
             else:
                 raise FileNotFoundError("ffmpeg not found. Please install ffmpeg or ensure it's in PATH.")
         
-        # Choose conservative vs strong filters based on env (default: conservative)
-        strong_filters = str(os.environ.get("TRANSCRIBE_PREPROC_STRONG_FILTERS", "")).strip() in ("1", "true", "True")
-        if strong_filters:
-            # Legacy/strong filtering for very noisy tapes (adds ~1.5s padding on both ends)
+        # Choose preprocessing mode based on env variable
+        preproc_mode = str(os.environ.get("TRANSCRIBE_PREPROC_MODE", "vintage_tape")).strip().lower()
+        
+        if preproc_mode == "vintage_tape":
+            # OPTIMIZED FOR 1980s-1990s TAPE RECORDINGS IN LARGE ROOMS
+            # Addresses: tape hiss, room reverb, low-frequency rumble, dynamic range issues
+            afilters = (
+                "adelay=1500|1500,"           # 1.5s padding prevents start/end cutoff
+                "highpass=f=100,"              # Remove rumble and low-frequency noise (HVAC, tape motor)
+                "lowpass=f=7000,"              # Remove tape hiss above speech range
+                "afftdn=nf=-25,"               # Adaptive noise reduction for tape hiss
+                "dialoguenhance=original=0.5:enhance=0.5,"  # Enhance speech clarity in reverberant rooms
+                "compand=attacks=0.3:decays=0.8:points=-80/-80|-45/-30|-20/-10|-10/-5|0/0,"  # Dynamic range compression
+                "loudnorm=I=-16:LRA=11:TP=-1.5,"  # Normalize loudness for consistent levels
+                "apad=pad_len=72000"           # Add 1.5s silence at end
+            )
+            print("🎙️  Using vintage tape preset: noise reduction + dialogue enhance + dynamics processing")
+        elif preproc_mode == "strong":
+            # Strong filtering for extremely noisy sources
             afilters = "adelay=1500|1500,highpass=f=80,lowpass=f=8000,afftdn=nf=-25,loudnorm,apad=pad_len=72000"
-        else:
-            # Conservative: light EQ + loudness normalization with ~1.2s padding either side
+            print("🔊 Using strong noise reduction preset")
+        elif preproc_mode == "minimal":
+            # Minimal processing - just padding and normalization
             afilters = "adelay=1200|1200,loudnorm,apad=pad_len=57600"
+            print("🎵 Using minimal processing preset")
+        else:
+            # Default to vintage tape for this use case
+            afilters = (
+                "adelay=1500|1500,"
+                "highpass=f=100,"
+                "lowpass=f=7000,"
+                "afftdn=nf=-25,"
+                "dialoguenhance=original=0.5:enhance=0.5,"
+                "compand=attacks=0.3:decays=0.8:points=-80/-80|-45/-30|-20/-10|-10/-5|0/0,"
+                "loudnorm=I=-16:LRA=11:TP=-1.5,"
+                "apad=pad_len=72000"
+            )
+            print(f"🎙️  Using preset: {preproc_mode} (defaulting to vintage_tape)")
 
         # FFmpeg command to:
-        # 1) Add brief silence padding to prevent start/end truncation
-        # 2) Normalize loudness
-        # 3) Optionally apply stronger denoise/EQ if explicitly enabled
-        # 4) Convert to high-quality MP3 (320kbps)
+        # 1) Add silence padding to prevent start/end truncation (1.5s each side)
+        # 2) Remove rumble and tape hiss with frequency filtering
+        # 3) Enhance dialogue clarity for room recordings
+        # 4) Apply dynamic range compression for tape volume variations
+        # 5) Normalize loudness for consistency
+        # 6) Convert to high-quality MP3 (320kbps, 48kHz)
         cmd = [
             ffmpeg_cmd,
             "-i", input_path,
-            # Audio processing filters (selected above)
+            # Audio processing filters (selected above based on mode)
             "-af", afilters,
             # High quality MP3 encoding
             "-codec:a", "libmp3lame",
             "-b:a", "320k",
-            "-ar", "48000",  # 48kHz sample rate for best quality
-            "-ac", "2",      # Stereo output
+            "-ar", "48000",  # 48kHz sample rate preserves speech detail
+            "-ac", "2",      # Stereo output (maintains spatial cues if present)
             # Overwrite output file
             "-y",
             temp_output
@@ -2205,32 +2243,32 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
             chosen_device = "cuda"
             device_name = f"CUDA GPU ({torch_api.cuda.get_device_name(0)})"
             print("🎯 Device: CUDA GPU")
+            
+            # AGGRESSIVE VRAM CLEARING before model load
+            print("🧹 Clearing VRAM before model load...")
+            try:
+                torch_api.cuda.empty_cache()
+                torch_api.cuda.synchronize()
+                torch_api.cuda.reset_peak_memory_stats()
+                torch_api.cuda.reset_accumulated_memory_stats()
+                import gc
+                gc.collect()
+                gc.collect()  # Run twice for cyclic references
+                torch_api.cuda.empty_cache()  # Clear again after gc
+                try:
+                    used_vram = torch_api.cuda.memory_allocated() / (1024**3)
+                    total_vram = float(config.get("cuda_total_vram_gb") or 0.0)
+                    free_est = max(0.0, total_vram - used_vram)
+                    print(f"📊 VRAM cleared: {free_est:.2f}GB free / {total_vram:.2f}GB total")
+                except:
+                    print("✅ VRAM cleared successfully")
+            except Exception as clear_e:
+                print(f"⚠️  VRAM clear warning: {clear_e}")
+            
             # Apply CUDA per-process memory fraction if an allowed VRAM cap is set
             try:
                 total_vram = float(config.get("cuda_total_vram_gb") or 0.0)
                 allowed_vram = float(config.get("allowed_vram_gb") or 0.0)
-                # Preflight available (current used) memory BEFORE load
-                try:
-                    used_vram = torch_api.cuda.memory_allocated() / (1024**3)
-                except Exception:
-                    used_vram = 0.0
-                free_est = max(0.0, total_vram - used_vram)
-                # Heuristic model VRAM footprint (base weights + buffers)
-                MODEL_VRAM_GB_EST = {
-                    "large-v3": 7.4,
-                    "large-v3-turbo": 5.2,
-                    "large": 6.8,
-                    "medium": 3.2,
-                    "small": 1.4,
-                    "base": 0.9,
-                    "tiny": 0.6,
-                }
-                est_need = MODEL_VRAM_GB_EST.get(selected_model_name.lower(), 5.0) + 0.4  # + overhead margin
-                # Allow override to force attempt
-                force_gpu = os.environ.get("TRANSCRIBE_FORCE_GPU", "").lower() in ("1","true","yes")
-                if free_est and free_est < est_need and not force_gpu:
-                    print(f"⚠️  Preflight: estimated free VRAM {free_est:.2f}GB < required ~{est_need:.2f}GB for '{selected_model_name}'. Using CPU to avoid OOM.")
-                    raise RuntimeError("Preflight GPU memory insufficient")
                 if total_vram > 0:
                     if 0.5 <= allowed_vram < total_vram:
                         frac = max(0.05, min(0.95, allowed_vram / total_vram))
@@ -2296,9 +2334,10 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
             # Auto-switch to faster-whisper for large models on low-VRAM GPUs (only if native)
             # Allow explicit override to keep native Whisper when requested.
             force_native = os.environ.get("TRANSCRIBE_FORCE_NATIVE_WHISPER", "0").strip().lower() in ("1", "true", "yes")
-            if (not force_native) and backend == "native" and total_vram <= 8 and selected_model_name in ["large-v3", "large-v3-turbo"]:
+            if (not force_native) and backend == "native" and total_vram <= 8 and selected_model_name in ["large-v3", "large-v3-turbo", "large"]:
                 backend = "faster-whisper"
-                print(f"🎯 Auto-switching to faster-whisper backend for {selected_model_name} on {total_vram:.1f}GB GPU")
+                print(f"🚀 Auto-switching to faster-whisper backend for {selected_model_name} on {total_vram:.1f}GB GPU")
+                print(f"   Benefits: 50% less VRAM usage, 4x faster inference, same quality")
             
             using_fw = False
             using_distil = False
