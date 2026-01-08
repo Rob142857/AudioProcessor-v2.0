@@ -77,7 +77,12 @@ def _save_project_settings(folder_path: str, proj_settings: dict) -> None:
     _save_settings(all_settings)
 
 def _repo_default_terms_file() -> Optional[str]:
-    for name in ("special_words.txt", "special_words.md"):
+    # Default to special_words.txt in repo root
+    default_path = os.path.join(REPO_ROOT, "special_words.txt")
+    if os.path.exists(default_path):
+        return default_path
+    # Fall back to special_words.md if .txt doesn't exist
+    for name in ("special_words.md",):
         p = os.path.join(REPO_ROOT, name)
         if os.path.exists(p):
             return p
@@ -379,7 +384,7 @@ def launch_gui(default_outdir: Optional[str] = None, *, default_threads: Optiona
                     time_var.set(proj_settings.get("replace_before_time", "00:00"))
                     time_header_var.set(proj_settings.get("time_header", 1))
                     quality_mode_var.set(proj_settings.get("quality_mode", 1))
-                    max_repeat_var.set(proj_settings.get("max_repeat_cap", 3))
+                    max_repeat_var.set(proj_settings.get("max_repeat_cap", 10))
                 except Exception:
                     status_label.config(text=f"Selected folder: {os.path.basename(d)}", foreground='#059669')
 
@@ -501,8 +506,8 @@ def launch_gui(default_outdir: Optional[str] = None, *, default_threads: Optiona
         tk.Checkbutton(combined_frame, text="Quality mode (Whisper beam search, better punctuation)", variable=quality_mode_var, bg='white', fg='#374151', selectcolor='white', activebackground='white').grid(column=0, row=10, columnspan=2, sticky='w', padx=20, pady=(0, 6))
 
         tk.Label(combined_frame, text="Max repeat cap:", bg='white', fg='#374151', font=('Segoe UI', 10)).grid(column=2, row=10, sticky='w', padx=(20, 6), pady=(0, 6))
-        max_repeat_var = tk.IntVar(value=proj_settings.get("max_repeat_cap", 3))
-        tk.Spinbox(combined_frame, from_=1, to=10, textvariable=max_repeat_var, width=5, bg='#f9fafb', fg='#111827', relief='flat').grid(column=3, row=10, sticky='w', padx=(6, 20), pady=(0, 6))
+        max_repeat_var = tk.IntVar(value=proj_settings.get("max_repeat_cap", 10))
+        tk.Spinbox(combined_frame, from_=1, to=20, textvariable=max_repeat_var, width=5, bg='#f9fafb', fg='#111827', relief='flat').grid(column=3, row=10, sticky='w', padx=(6, 20), pady=(0, 6))
 
         # Row 11: Model selection - expanded with multiple backends
         tk.Label(combined_frame, text="Transcription Model:", bg='white', fg='#374151', font=('Segoe UI', 10, 'bold')).grid(column=0, row=11, sticky='w', padx=20, pady=(8, 6))
@@ -515,8 +520,8 @@ def launch_gui(default_outdir: Optional[str] = None, *, default_threads: Optiona
             ("faster-whisper-large-v3-turbo", "Faster-Whisper turbo (fastest local)"),
         ]
         
-        # Default to best-accuracy native Whisper model unless project overrides.
-        model_choice_var = tk.StringVar(value=proj_settings.get("whisper_model", "large-v3"))
+        # Default to faster-whisper-large-v3 for best balance of speed and accuracy
+        model_choice_var = tk.StringVar(value=proj_settings.get("whisper_model", "faster-whisper-large-v3"))
         
         model_frame = tk.Frame(combined_frame, bg='white')
         model_frame.grid(column=1, row=10, columnspan=3, sticky='w', padx=(12, 20), pady=(8, 6))
