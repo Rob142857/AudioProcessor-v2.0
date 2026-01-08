@@ -160,13 +160,14 @@ def convert_txt_to_docx(txt_path: Path, year: Optional[int] = None) -> Path:
     return out_path
 
 
-def convert_txt_to_docx_from_text(body_text: str, source_audio_path: Path, year: Optional[int] = None) -> Path:
+def convert_txt_to_docx_from_text(body_text: str, source_audio_path: Path, year: Optional[int] = None, metadata: Optional[dict] = None) -> Path:
     """Convert transcript text directly to DOCX, saving next to the source audio file.
     
     Args:
         body_text: The formatted transcript text to include in the document
         source_audio_path: Path to the original audio/video file (DOCX will be saved next to it)
         year: Optional year override for date inference
+        metadata: Optional dict with transcription metadata (model, device, time_taken, preprocessing)
     
     Returns:
         Path to the created DOCX file
@@ -204,6 +205,40 @@ def convert_txt_to_docx_from_text(body_text: str, source_audio_path: Path, year:
 
     # Body paragraphs
     add_paragraphs_from_text(doc, body_text)
+    
+    # Add metadata footer if provided
+    if metadata:
+        # Add spacing before metadata
+        doc.add_paragraph("")
+        doc.add_paragraph("")
+        
+        # Add horizontal line separator
+        separator = doc.add_paragraph("_" * 80)
+        separator.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        
+        # Add metadata section
+        meta_header = doc.add_paragraph("Transcription Information")
+        meta_header.runs[0].bold = True
+        meta_header.runs[0].font.size = 10 * 12700  # 10pt in EMUs
+        
+        # Add metadata details
+        details = [
+            f"Model: {metadata.get('model', 'Unknown')}",
+            f"Device: {metadata.get('device', 'Unknown')}",
+            f"Processing Time: {metadata.get('time_taken', 'Unknown')}",
+            f"Audio Preprocessing: {metadata.get('preprocessing', 'None')}"
+        ]
+        
+        for detail in details:
+            p = doc.add_paragraph(detail)
+            p.runs[0].font.size = 9 * 12700  # 9pt
+            p.runs[0].font.italic = True
+        
+        # Add note about removal
+        note = doc.add_paragraph("(This information can be deleted if not needed)")
+        note.runs[0].font.size = 8 * 12700  # 8pt
+        note.runs[0].font.italic = True
+        note.runs[0].font.color.rgb = (128, 128, 128)  # Gray color
 
     # Output path: same folder as source audio, .docx extension
     out_path = source_audio_path.with_suffix(".docx")

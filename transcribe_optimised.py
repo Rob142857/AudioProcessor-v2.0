@@ -3128,17 +3128,27 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
 
     # Generate DOCX directly next to the source audio file
     docx_path = None
+    elapsed = time.time() - start_time
     try:
         from txt_to_docx import convert_txt_to_docx_from_text
         from pathlib import Path
         source_path = Path(input_path)
-        docx_path = convert_txt_to_docx_from_text(formatted_text, source_path)
+        
+        # Prepare metadata for DOCX footer
+        backend_name = "Faster-Whisper" if using_fw else "Distil-Whisper" if using_distil else "Insanely-Fast-Whisper" if using_insanely_fast else "Native Whisper"
+        metadata = {
+            'model': f"{backend_name} {selected_model_name}",
+            'device': device_name,
+            'time_taken': format_duration(elapsed),
+            'preprocessing': "Vintage tape preset" if preprocessing_used else "None"
+        }
+        
+        docx_path = convert_txt_to_docx_from_text(formatted_text, source_path, metadata=metadata)
         print(f"✅ DOCX file saved: {docx_path}")
     except Exception as docx_err:
         print(f"⚠️  Failed to generate DOCX: {docx_err}")
 
     # Final stats
-    elapsed = time.time() - start_time
     print("\n🎉 TRANSCRIPTION COMPLETE!")
     if docx_path:
         print(f"📄 DOCX file: {docx_path}")
