@@ -2346,12 +2346,21 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
     awkward_terms = load_awkward_terms(input_path)
     initial_prompt = build_initial_prompt(awkward_terms)
     
-    # PUNCTUATION PRIMING: Add a properly punctuated sample sentence to prime Whisper's style
-    # This teaches the model to produce proper sentence boundaries and punctuation
+    # PUNCTUATION PRIMING: Add a properly punctuated sample to prime Whisper's style
+    # Whisper uses initial_prompt as "previous context" - it mimics the punctuation style it sees
+    # This is NOT an instruction prompt - it's a SAMPLE of well-punctuated text
     quality_mode_for_prompt = os.environ.get("TRANSCRIBE_QUALITY_MODE", "").strip() in ("1", "true", "True")
     if quality_mode_for_prompt:
-        # Prime with proper lecture-style punctuation - Whisper mimics this style
-        punctuation_primer = "Hello, and welcome to today's lecture. We'll be discussing some important concepts. Now, let's begin with the first topic."
+        # Prime with authentic lecture-style text - Whisper mimics this punctuation pattern
+        punctuation_primer = (
+            "Now, as you know, we're looking at the biological basis, or the biological manifestation, "
+            "of spiritual things. Spiritual things are invisible to our senses, to our sight. "
+            "We cannot see them in any way at all, although there are times when spiritual vision "
+            "opens up a little and we have a perception of something. But in order to render "
+            "spiritual things understandable, the world is organised so that all the infinite things "
+            "of Higher Life are symbolically manifested in all the patterns and shapes that we see "
+            "in the natural world."
+        )
         if initial_prompt:
             initial_prompt = f"{punctuation_primer} {initial_prompt}"
         else:
