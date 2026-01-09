@@ -40,13 +40,27 @@ class SemanticParagraphSegmenter:
         self._initialize_model()
 
     def _initialize_model(self):
-        """Load the sentence transformer model."""
+        """Load the sentence transformer model with offline fallback."""
         try:
             from sentence_transformers import SentenceTransformer
             
             print(f"🔧 Loading semantic paragraph model: {self.model_name}")
-            self.model = SentenceTransformer(self.model_name)
-            print("✅ Semantic paragraph segmenter ready")
+            
+            # Try offline mode first if model is cached
+            try:
+                import os
+                os.environ.setdefault("HF_HUB_OFFLINE", "1")
+                os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+                self.model = SentenceTransformer(self.model_name)
+                print("✅ Semantic paragraph segmenter ready (from cache)")
+            except Exception:
+                # Fallback to online mode
+                if "HF_HUB_OFFLINE" in os.environ:
+                    del os.environ["HF_HUB_OFFLINE"]
+                if "TRANSFORMERS_OFFLINE" in os.environ:
+                    del os.environ["TRANSFORMERS_OFFLINE"]
+                self.model = SentenceTransformer(self.model_name)
+                print("✅ Semantic paragraph segmenter ready (downloaded)")
             
         except ImportError:
             print("⚠️  sentence-transformers not installed. Installing...")
@@ -67,6 +81,26 @@ class SemanticParagraphSegmenter:
         except Exception as e:
             print(f"❌ Failed to load semantic model: {e}")
             self.model = None
+
+    def release(self):
+        """Explicitly release model from memory (important for batch processing)."""
+        try:
+            if self.model is not None:
+                del self.model
+                self.model = None
+            
+            import gc
+            gc.collect()
+            
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    print("🧹 Paragraph model released from GPU memory")
+            except ImportError:
+                pass
+        except Exception as e:
+            print(f"⚠️  Error releasing paragraph model: {e}")
 
     def _split_into_sentences(self, text: str) -> List[str]:
         """
@@ -193,14 +227,17 @@ class SemanticParagraphSegmenter:
 
     def refine_paragraphs(self, text: str, 
                          min_paragraph_length: int = 100,
-                         max_paragraph_length: int = 800) -> str:
+                         max_paragraph_length: int = 800,
+                         min_sentences: int = 2) -> str:
         """
         Post-process paragraphs to ensure reasonable lengths.
+        Uses sentence count as primary metric to avoid losing semantic breaks.
 
         Args:
             text: Text with paragraph breaks
-            min_paragraph_length: Merge paragraphs shorter than this (chars)
+            min_paragraph_length: Merge paragraphs shorter than this (chars) - secondary check
             max_paragraph_length: Split paragraphs longer than this (chars)
+            min_sentences: Minimum sentences per paragraph (default: 2)
 
         Returns:
             Text with refined paragraph lengths
@@ -211,13 +248,28 @@ class SemanticParagraphSegmenter:
         for para in paragraphs:
             if not para.strip():
                 continue
-                
-            # If too short, try to merge with previous
-            if len(para) < min_paragraph_length and refined:
+            
+            sentences = self._split_into_sentences(para)
+            sentence_count = len(sentences)
+            char_count = len(para)
+            
+            # TRANSITIONAL SENTENCES: If a paragraph is a single sentence that
+            # starts with a transition word, merge it with the PREVIOUS paragraph
+            # (it signals a topic shift but belongs with what came before)
+            transition_starters = ('Now,', 'Now ', 'So,', 'So ', 'Well,', 'Anyway,',
+                                   'Now let', 'Let us', "Let's", 'Moving on', 
+                                   'Turning to', 'Next,', 'Finally,')
+            is_transitional = (sentence_count == 1 and 
+                              any(para.startswith(t) for t in transition_starters))
+            
+            if is_transitional and refined:
+                # Merge transitional sentence with PREVIOUS paragraph
+                refined[-1] = refined[-1] + ' ' + para
+            # If very short (1 sentence AND < min chars), merge with previous
+            elif sentence_count < min_sentences and char_count < min_paragraph_length and refined:
                 refined[-1] = refined[-1] + ' ' + para
             # If too long, split at sentence boundaries
-            elif len(para) > max_paragraph_length:
-                sentences = self._split_into_sentences(para)
+            elif char_count > max_paragraph_length:
                 temp_para = []
                 current_length = 0
                 
@@ -238,12 +290,13 @@ class SemanticParagraphSegmenter:
         return '\n\n'.join(refined)
 
 
-def create_paragraph_segmenter(similarity_threshold: float = 0.50) -> SemanticParagraphSegmenter:
+def create_paragraph_segmenter(similarity_threshold: float = 0.45) -> SemanticParagraphSegmenter:
     """
     Factory function to create a semantic paragraph segmenter.
 
     Args:
-        similarity_threshold: Lower = more breaks (0.45-0.55 recommended for lectures)
+        similarity_threshold: Lower = more breaks (0.40-0.50 recommended for lectures)
+                             0.45 is tuned for natural topic shifts in spoken content
 
     Returns:
         Configured SemanticParagraphSegmenter instance

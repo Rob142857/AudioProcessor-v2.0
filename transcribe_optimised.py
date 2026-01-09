@@ -958,6 +958,68 @@ def _fix_whisper_artifacts(text: str) -> str:
         return text
 
 
+def _fix_missing_sentence_boundaries(text: str) -> str:
+    """Fix obvious missing sentence boundaries using pattern matching.
+    
+    This catches common cases where Whisper fails to insert periods:
+    - Lowercase word followed by discourse marker (so, now, but, etc.)
+    - Run-on patterns like "word it's the" that should have periods
+    
+    CONSERVATIVE: Only fixes high-confidence patterns to avoid introducing errors.
+    """
+    try:
+        fixes_made = 0
+        
+        # Pattern 1: discourse markers that almost always start sentences
+        # "bound so its" -> "bound. So its"
+        # "power now the" -> "power. Now the"
+        discourse_starters = [
+            'so', 'now', 'but', 'however', 'therefore', 'thus', 'hence',
+            'well', 'anyway', 'actually', 'basically', 'essentially',
+            'remember', 'notice', 'consider', 'imagine', 'suppose',
+        ]
+        
+        for starter in discourse_starters:
+            # Match: lowercase letter + space + starter + space + word
+            pattern = rf'([a-z])(\s+)({starter})(\s+\w)'
+            
+            def make_replace(s):
+                def replace_fn(m):
+                    nonlocal fixes_made
+                    fixes_made += 1
+                    # Capitalize the starter word
+                    cap_starter = m.group(3)[0].upper() + m.group(3)[1:]
+                    return f'{m.group(1)}. {cap_starter}{m.group(4)}'
+                return replace_fn
+            
+            text = re.sub(pattern, make_replace(starter), text, flags=re.IGNORECASE)
+        
+        # Pattern 2: "word it's the" / "word that's the" (run-on with article)
+        # "wake up that's the beginning" -> "wake up. That's the beginning"
+        pattern = r"([a-z])\s+(that's|that is|it's|it is|this is|there is|there are)(\s+the\s+)"
+        def replace_thats(m):
+            nonlocal fixes_made
+            fixes_made += 1
+            word = m.group(2)
+            word_cap = word[0].upper() + word[1:]
+            return f'{m.group(1)}. {word_cap}{m.group(3)}'
+        text = re.sub(pattern, replace_thats, text, flags=re.IGNORECASE)
+        
+        # Pattern 3: "god so/now/but" -> "God. So/Now/But"
+        # Specific to religious content where 'god' should be capitalized
+        text = re.sub(r'\bgod\s+(so|now|but|and)\b', 
+                     lambda m: f'God. {m.group(1).capitalize()}', text, flags=re.IGNORECASE)
+        
+        if fixes_made > 0:
+            print(f"📝 Fixed {fixes_made} missing sentence boundary/boundaries")
+        
+        return text
+        
+    except Exception as e:
+        print(f"⚠️  Sentence boundary fixing failed: {e}")
+        return text
+
+
 def _clean_repetitions_in_segment(text: str, max_phrase_repeats: int = 2) -> str:
     """Light, in-transcription de-repetition applied per segment.
 
@@ -1384,11 +1446,11 @@ def transcribe_with_dataset_optimization(input_path: str, output_dir=None, threa
     quality_mode = os.environ.get("TRANSCRIBE_QUALITY_MODE", "").strip() in ("1", "true", "True")
     if quality_mode:
         print("🎯 QUALITY mode enabled (optimized for vintage tape)")
-        seg_kwargs["beam_size"] = 8       # Thorough beam search
+        seg_kwargs["beam_size"] = 10      # Maximum beam search for best quality
         seg_kwargs["patience"] = 1.7      # Moderate patience
-        seg_kwargs["best_of"] = 8         # Evaluate more candidates
+        seg_kwargs["best_of"] = 10        # Evaluate maximum candidates
         seg_kwargs["temperature"] = 0.0   # Deterministic decoding
-        print("   Settings: beam=8, best_of=8, patience=1.7, temp=0.0")
+        print("   Settings: beam=10, best_of=10, patience=1.7, temp=0.0")
     else:
         # Standard quality - still good
         seg_kwargs["beam_size"] = 5
@@ -1598,6 +1660,11 @@ def transcribe_with_dataset_optimization(input_path: str, output_dir=None, threa
             full_text, global_freq_stats = _limit_global_sentence_frequency(full_text)
             full_text, loop_stats = _detect_and_break_loops(full_text)
             full_text, late_artifact_stats = _remove_extended_artifacts(full_text)
+            
+            # FIX MISSING SENTENCE BOUNDARIES
+            # Light pattern-based fix for obvious missing periods (no external models)
+            full_text = _fix_missing_sentence_boundaries(full_text)
+            
             quality_stats = {
                 "early_artifacts": early_artifact_stats,
                 "global_frequency": global_freq_stats,
@@ -1614,11 +1681,11 @@ def transcribe_with_dataset_optimization(input_path: str, output_dir=None, threa
             formatted_text = full_text
             print("✅ Verbatim formatting: preserved original model text")
         else:
+            # SIMPLE CHARACTER-BASED PARAGRAPHING
+            # Semantic paragraph model disabled - using simple approach for reliability
+            print("📝 Applying simple paragraph formatting...")
             formatted = split_into_paragraphs(full_text, max_length=500)
-            if isinstance(formatted, list):
-                formatted_text = "\n\n".join(formatted)
-            else:
-                formatted_text = full_text
+            formatted_text = "\n\n".join(formatted) if isinstance(formatted, list) else full_text
             print("✅ Text formatting completed")
     except Exception as e:
         print(f"⚠️  Text formatting failed: {e}")
@@ -2279,6 +2346,18 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
     awkward_terms = load_awkward_terms(input_path)
     initial_prompt = build_initial_prompt(awkward_terms)
     
+    # PUNCTUATION PRIMING: Add a properly punctuated sample sentence to prime Whisper's style
+    # This teaches the model to produce proper sentence boundaries and punctuation
+    quality_mode_for_prompt = os.environ.get("TRANSCRIBE_QUALITY_MODE", "").strip() in ("1", "true", "True")
+    if quality_mode_for_prompt:
+        # Prime with proper lecture-style punctuation - Whisper mimics this style
+        punctuation_primer = "Hello, and welcome to today's lecture. We'll be discussing some important concepts. Now, let's begin with the first topic."
+        if initial_prompt:
+            initial_prompt = f"{punctuation_primer} {initial_prompt}"
+        else:
+            initial_prompt = punctuation_primer
+        print("🎯 Punctuation priming enabled for quality mode")
+    
     # Combine with GUI-provided context hint if available
     gui_prompt = os.environ.get("TRANSCRIBE_INITIAL_PROMPT", "").strip()
     if gui_prompt:
@@ -2738,17 +2817,20 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
             if using_fw:
                 if quality_mode:
                     # HIGH QUALITY mode for Faster-Whisper (optimized for vintage tape recordings)
-                    # CRITICAL: condition_on_previous_text=False prevents repetition loops and early termination
-                    transcribe_kwargs["beam_size"] = 8          # Thorough beam search for quality
-                    transcribe_kwargs["best_of"] = 8            # Evaluate more candidates
+                    transcribe_kwargs["beam_size"] = 10         # Maximum beam search for best quality
+                    transcribe_kwargs["best_of"] = 10           # Evaluate maximum candidates
                     transcribe_kwargs["patience"] = 1.7         # Moderate patience - allows completion
                     transcribe_kwargs["temperature"] = 0.0      # Deterministic decoding
                     transcribe_kwargs["no_speech_threshold"] = 0.5  # Balanced silence detection
-                    transcribe_kwargs["compression_ratio_threshold"] = 2.4  # Catches repetition
+                    transcribe_kwargs["compression_ratio_threshold"] = 2.0  # Stricter - catches loops
                     transcribe_kwargs["log_prob_threshold"] = -1.0  # Accept lower confidence for difficult audio
-                    transcribe_kwargs["condition_on_previous_text"] = False  # CRITICAL: prevents loops/early stop
+                    # EXPERIMENT: Try condition_on_previous_text=True for better punctuation consistency
+                    # The stricter compression_ratio_threshold (2.0) should catch any loops
+                    transcribe_kwargs["condition_on_previous_text"] = True  # Maintains punctuation style across chunks
                     transcribe_kwargs["vad_filter"] = False     # Disable VAD - we already preprocessed
-                    print("🎯 FW QUALITY mode: beam=8, best_of=8, patience=1.7, temp=0.1")
+                    # Add word timestamps for better timing info
+                    transcribe_kwargs["word_timestamps"] = True
+                    print("🎯 FW QUALITY mode: beam=10, best_of=10, patience=1.7, condition_on_previous=True")
                 else:
                     # STANDARD mode for Faster-Whisper (fast and reliable)
                     transcribe_kwargs["beam_size"] = 5          # Good quality without slowdown
@@ -3106,25 +3188,19 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
     # Prosody analysis disabled - pure Whisper output is best
     # All attempts to modify sentence boundaries have introduced more errors than they fixed
 
-    # STREAMLINED POST-PROCESSING:
-    # - Keep Whisper's natural punctuation (no sentence splitting)
-    # - Apply ONLY semantic paragraph segmentation for meaning-based breaks
-    # - Skip all other aggressive text manipulation
+    # MINIMAL POST-PROCESSING - Pure Whisper output
+    # All text manipulation removed - only light cleanup and paragraphing
     try:
-        # Light cleanup: only remove obvious repetitions and music hallucinations
-        # Use the max_repeat_cap from environment (set by GUI)
-        max_repeat_cap = int(os.environ.get("TRANSCRIBE_MAX_REPEAT_CAP", "10"))
-        full_text = _collapse_repetitions(full_text, max_repeats=max_repeat_cap)
+        # ONLY remove obvious music hallucinations (watermarks, etc.)
         full_text, music_removed = _remove_music_hallucinations(full_text)
         if music_removed:
             print(f"🎵 Removed {music_removed} music/hallucination pattern(s)")
         
-        # Use segment-based paragraphs (silence gaps) - simpler and more reliable
+        # SIMPLE CHARACTER-BASED PARAGRAPHING - no text modification
+        print("📝 Applying simple paragraph formatting...")
         formatted = split_into_paragraphs(full_text, max_length=500)
-        if isinstance(formatted, list):
-            formatted_text = "\n\n".join(formatted)
-        else:
-            formatted_text = full_text
+        formatted_text = "\n\n".join(formatted) if isinstance(formatted, list) else full_text
+        
         quality_stats = {"paragraphs": True, "music_hallucinations_removed": music_removed}
         print("✅ Paragraph formatting completed")
     except Exception as e:

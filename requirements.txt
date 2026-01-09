@@ -1,6 +1,11 @@
 # Core AI/ML dependencies
 openai-whisper==20250625
 
+# Punctuation restoration (BERT-based, token classification - only adds punctuation, never changes words)
+deepmultilingualpunctuation>=1.0.1
+
+# Semantic paragraph segmentation (detects topic shifts for intelligent paragraph breaks)
+sentence-transformers>=2.2.0
 
 # Prosody analysis for intelligent sentence merging
 librosa>=0.10.0

@@ -104,12 +104,19 @@ def preload_faster_whisper():
         
         print(f"\nDevice: {device}, Compute type: {compute_type}\n")
         
-        models_to_load = ["large-v3"]  # Start with just large-v3
+        # Models available in GUI - download all for offline use
+        models_to_load = [
+            "large-v3",           # Best accuracy
+            "large-v2",           # Alternative if v3 punctuation is poor
+            "distil-large-v3",    # 6x faster, English-optimized
+            "distil-large-v2",    # Fast English alternative
+            "large-v3-turbo",     # Fastest
+        ]
         success_count = 0
         
-        for model_name in models_to_load:
+        for idx, model_name in enumerate(models_to_load, start=1):
             try:
-                print(f"  [{success_count + 1}/{len(models_to_load)}] Loading {model_name}...")
+                print(f"  [{idx}/{len(models_to_load)}] Loading {model_name}...")
                 print(f"  📥 Downloading model (this may take a few minutes)...")
                 model = WhisperModel(model_name, device=device, compute_type=compute_type)
                 print(f"  ✓ Successfully cached: {model_name}")
@@ -149,8 +156,92 @@ def show_system_info():
     print()
 
 
+def preload_punctuation_model():
+    """Download and cache the punctuation restoration BERT model."""
+    print("\n" + "="*60)
+    print("PUNCTUATION RESTORATION MODEL")
+    print("="*60)
+    
+    model_name = "oliverguhr/fullstop-punctuation-multilang-large"
+    
+    try:
+        from transformers import AutoTokenizer, AutoModelForTokenClassification
+        
+        print(f"Model: {model_name}")
+        print(f"📥 Downloading punctuation model (~2.4GB)...")
+        
+        # Download tokenizer and model (will cache in ~/.cache/huggingface/hub/)
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForTokenClassification.from_pretrained(model_name)
+        
+        print(f"✓ Model cached successfully")
+        print(f"  Labels: {list(model.config.id2label.values())}")
+        
+        # Quick test
+        import torch
+        text = "hello world this is a test"
+        inputs = tokenizer(text, return_tensors="pt")
+        with torch.no_grad():
+            outputs = model(**inputs)
+        print(f"  Quick test: ✓ Model inference working")
+        
+        del model, tokenizer
+        return True
+        
+    except ImportError:
+        print("⚠ transformers not installed, trying deepmultilingualpunctuation...")
+        try:
+            from deepmultilingualpunctuation import PunctuationModel
+            print(f"📥 Downloading via deepmultilingualpunctuation...")
+            model = PunctuationModel(model=model_name)
+            print(f"✓ Model cached successfully")
+            del model
+            return True
+        except Exception as e:
+            print(f"❌ Failed: {e}")
+            return False
+    except Exception as e:
+        print(f"❌ Failed to preload punctuation model: {e}")
+        return False
+
+
+def preload_paragraph_model():
+    """Download and cache the semantic paragraph segmentation model."""
+    print("\n" + "="*60)
+    print("SEMANTIC PARAGRAPH MODEL")
+    print("="*60)
+    
+    model_name = "all-MiniLM-L6-v2"
+    
+    try:
+        from sentence_transformers import SentenceTransformer
+        
+        print(f"Model: {model_name}")
+        print(f"📥 Downloading semantic model (~80MB)...")
+        
+        model = SentenceTransformer(model_name)
+        
+        print(f"✓ Model cached successfully")
+        
+        # Quick test
+        test_sentences = ["Hello world.", "This is a test."]
+        embeddings = model.encode(test_sentences)
+        print(f"  Quick test: ✓ Generated {len(embeddings)} embeddings")
+        
+        del model
+        return True
+        
+    except ImportError:
+        print("⚠ sentence-transformers not installed")
+        print("  Install with: pip install sentence-transformers")
+        return False
+    except Exception as e:
+        print(f"❌ Failed to preload paragraph model: {e}")
+        return False
+
+
 def preload_all_models():
-    """Download and cache Faster-Whisper large-v3 model only."""
+    """Download and cache Faster-Whisper large-v3 model and punctuation model."""
     show_system_info()
     
     results = {}
@@ -160,6 +251,12 @@ def preload_all_models():
     
     # Faster-Whisper - PRIMARY MODEL
     results['faster'] = preload_faster_whisper()
+    
+    # Punctuation Restoration - BERT model for fixing run-on sentences
+    results['punctuation'] = preload_punctuation_model()
+    
+    # Semantic Paragraph Segmentation - sentence-transformers model
+    results['paragraphs'] = preload_paragraph_model()
     
     # Distil-Whisper - COMMENTED OUT (not needed for now)
     # results['distil'] = preload_distil_whisper()
@@ -172,7 +269,8 @@ def preload_all_models():
         status = "✓" if success else "❌"
         print(f"  {status} {backend}")
     
-    return results.get('faster', False)  # Return faster-whisper status
+    all_success = all(results.values())
+    return all_success
 
 
 if __name__ == "__main__":

@@ -23,14 +23,18 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 class PunctuationRestorer:
     """
     Restores punctuation in transcribed text using specialized BERT model.
+    
+    Uses token classification - only adds punctuation markers, NEVER changes words.
+    This is safe to use as post-processing for Whisper output.
     """
 
-    def __init__(self, model_name: str = "kredor/punctuate-all"):
+    def __init__(self, model_name: str = "oliverguhr/fullstop-punctuation-multilang-large"):
         """
         Initialize the punctuation restoration model.
 
         Args:
-            model_name: HuggingFace model name (default: kredor/punctuate-all)
+            model_name: HuggingFace model name 
+                       (default: oliverguhr/fullstop-punctuation-multilang-large - best accuracy)
         """
         self.model_name = model_name
         self.model = None
@@ -38,45 +42,110 @@ class PunctuationRestorer:
         self.model_type = None
         self._initialize_model()
 
+    def release(self):
+        """Explicitly release model from memory (important for batch processing)."""
+        try:
+            if self.model is not None:
+                del self.model
+                self.model = None
+            if self.tokenizer is not None:
+                del self.tokenizer
+                self.tokenizer = None
+            
+            import gc
+            gc.collect()
+            
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    print("🧹 Punctuation model released from GPU memory")
+            except ImportError:
+                pass
+        except Exception as e:
+            print(f"⚠️  Error releasing punctuation model: {e}")
+
+    def _get_local_cache_path(self, model_name: str) -> Optional[str]:
+        """Find model in HuggingFace cache if available."""
+        try:
+            # Convert model name to cache directory format
+            cache_name = model_name.replace("/", "--")
+            cache_dir = os.path.expanduser(f"~/.cache/huggingface/hub/models--{cache_name}/snapshots")
+            
+            if os.path.exists(cache_dir):
+                # Get the first (and usually only) snapshot
+                snapshots = [d for d in os.listdir(cache_dir) if os.path.isdir(os.path.join(cache_dir, d))]
+                if snapshots:
+                    path = os.path.join(cache_dir, snapshots[0])
+                    # Verify it has the needed files
+                    if os.path.exists(os.path.join(path, "config.json")):
+                        return path
+        except Exception:
+            pass
+        return None
+
     def _initialize_model(self):
         """Load the punctuation restoration model."""
+        # First try the deepmultilingualpunctuation library (preferred)
         try:
-            # Try kredor model first (token classification approach)
-            if "kredor" in self.model_name:
-                from transformers import AutoTokenizer, AutoModelForTokenClassification
-                import torch
-                
-                print(f"🔧 Loading punctuation model: {self.model_name}")
-                self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-                self.model = AutoModelForTokenClassification.from_pretrained(self.model_name)
-                self.model_type = "kredor"
-                print("✅ Punctuation restoration model loaded")
-            else:
-                # Fallback to oliverguhr model
+            if "oliverguhr" in self.model_name or "fullstop" in self.model_name:
                 from deepmultilingualpunctuation import PunctuationModel
                 
                 print(f"🔧 Loading punctuation model: {self.model_name}")
                 self.model = PunctuationModel(model=self.model_name)
                 self.model_type = "oliverguhr"
-                print("✅ Punctuation restoration model loaded")
-            
-        except ImportError:
-            print("⚠️  deepmultilingualpunctuation not installed. Installing...")
-            try:
-                import subprocess
-                import sys
-                subprocess.check_call([sys.executable, "-m", "pip", "install", 
-                                     "deepmultilingualpunctuation", "--quiet"])
-                from deepmultilingualpunctuation import PunctuationModel
-                self.model = PunctuationModel(model=self.model_name)
-                print("✅ Punctuation restoration model installed and loaded")
-            except Exception as e:
-                print(f"❌ Failed to install/load punctuation model: {e}")
-                self.model = None
+                print("✅ Punctuation restoration model loaded (oliverguhr - 0.6B params)")
+                return
                 
         except Exception as e:
-            print(f"❌ Failed to load punctuation model: {e}")
-            self.model = None
+            # Network/SSL error - try local cache fallback
+            if "SSL" in str(e) or "offline" in str(e).lower() or "reach" in str(e).lower():
+                print(f"⚠️  Network unavailable, trying local cache...")
+                local_path = self._get_local_cache_path(self.model_name)
+                if local_path:
+                    try:
+                        self._load_from_local_path(local_path)
+                        return
+                    except Exception as local_err:
+                        print(f"❌ Local cache load failed: {local_err}")
+            else:
+                print(f"❌ Failed to load punctuation model: {e}")
+        
+        # Try kredor model as fallback
+        if "kredor" in self.model_name:
+            try:
+                from transformers import AutoTokenizer, AutoModelForTokenClassification
+                
+                print(f"🔧 Loading kredor punctuation model: {self.model_name}")
+                self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+                self.model = AutoModelForTokenClassification.from_pretrained(self.model_name)
+                self.model_type = "kredor"
+                print("✅ Punctuation restoration model loaded (kredor)")
+                return
+            except Exception as e:
+                print(f"❌ Failed to load kredor model: {e}")
+        
+        # Final fallback - try local cache for oliverguhr model
+        if self.model is None:
+            local_path = self._get_local_cache_path("oliverguhr/fullstop-punctuation-multilang-large")
+            if local_path:
+                try:
+                    self._load_from_local_path(local_path)
+                    return
+                except Exception as e:
+                    print(f"❌ Local cache fallback failed: {e}")
+        
+        self.model = None
+
+    def _load_from_local_path(self, local_path: str):
+        """Load model directly from local cache path using transformers."""
+        from transformers import AutoTokenizer, AutoModelForTokenClassification
+        
+        print(f"🔧 Loading punctuation model from cache: {local_path}")
+        self.tokenizer = AutoTokenizer.from_pretrained(local_path)
+        self.model = AutoModelForTokenClassification.from_pretrained(local_path)
+        self.model_type = "transformers_local"
+        print("✅ Punctuation restoration model loaded from local cache")
 
     def restore_punctuation(self, text: str, preserve_whisper_hints: bool = True) -> str:
         """
@@ -346,6 +415,62 @@ class PunctuationRestorer:
                 fixed.append(part)
         
         return ''.join(fixed)
+
+    def _fix_discourse_markers(self, text: str) -> str:
+        """
+        Fix common discourse markers that should start new sentences.
+        
+        In spoken language, words like "now", "so", "well" often introduce new thoughts
+        but BERT may attach them to the previous sentence. This fixes patterns like:
+        - "generated now. This is" -> "generated. Now, this is"
+        - "happened so. The next" -> "happened. So, the next"
+        """
+        # Discourse markers that typically start new sentences when followed by certain patterns
+        # Pattern: word + " now/so/well" + "." + "This/That/The/We/I/It/He/She/They"
+        # Should become: word + "." + " Now/So/Well," + " this/that/the/we/i/it/he/she/they"
+        
+        # Fix "X now. This/That/The/It/We" -> "X. Now, this/that/the/it/we"
+        text = re.sub(
+            r'(\w+)\s+now\.\s+(This|That|The|It|We|I|He|She|They|What|There)\s+',
+            lambda m: f"{m.group(1)}. Now, {m.group(2).lower()} ",
+            text,
+            flags=re.IGNORECASE
+        )
+        
+        # Fix "X so. The/This/That/It/We" -> "X. So, the/this/that/it/we"
+        text = re.sub(
+            r'(\w+)\s+so\.\s+(The|This|That|It|We|I|He|She|They|What|There)\s+',
+            lambda m: f"{m.group(1)}. So, {m.group(2).lower()} ",
+            text,
+            flags=re.IGNORECASE
+        )
+        
+        # Fix "X well. The/This/That/It/We" -> "X. Well, the/this/that/it/we"  
+        text = re.sub(
+            r'(\w+)\s+well\.\s+(The|This|That|It|We|I|He|She|They|What|There)\s+',
+            lambda m: f"{m.group(1)}. Well, {m.group(2).lower()} ",
+            text,
+            flags=re.IGNORECASE
+        )
+        
+        # Also fix cases where there's no period yet but should be:
+        # "X now this is" -> "X. Now, this is" (when "now" is clearly a discourse marker)
+        text = re.sub(
+            r'(\w+)\s+now\s+(this is|that is|the question|the point|the thing|what we|we have|we need|we see|I want|I think)',
+            lambda m: f"{m.group(1)}. Now, {m.group(2)}",
+            text,
+            flags=re.IGNORECASE
+        )
+        
+        # "X so the" at sentence boundaries often means "So, the..."
+        text = re.sub(
+            r'(\w+)\s+so\s+(the next|the first|the second|the question|this is|that is|what we|we have|we need)',
+            lambda m: f"{m.group(1)}. So, {m.group(2)}",
+            text,
+            flags=re.IGNORECASE
+        )
+        
+        return text
     
     def refine_transcription(self, transcription: str, aggressive: bool = False, chunk_size: int = 300) -> str:
         """
@@ -374,6 +499,9 @@ class PunctuationRestorer:
             
             # Fix BERT's over-capitalization
             result = self._fix_capitalization(result)
+            
+            # Fix discourse markers (now, so, well) that should start new sentences
+            result = self._fix_discourse_markers(result)
         else:
             result = self.restore_punctuation(transcription, preserve_whisper_hints=True)
         

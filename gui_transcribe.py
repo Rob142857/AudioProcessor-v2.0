@@ -145,6 +145,13 @@ def run_transcription(input_file: str, outdir: Optional[str], output_queue: queu
 
         # Get model name from environment variable (set by GUI)
         model_name = os.environ.get("TRANSCRIBE_MODEL_NAME", "large-v3")
+        
+        # Log current settings for debugging batch issues
+        punct_setting = os.environ.get("TRANSCRIBE_RESTORE_PUNCTUATION", "not set")
+        print(f"📋 Settings for this file:")
+        print(f"   Model: {model_name}")
+        print(f"   Punctuation restoration: {punct_setting}")
+        print(f"   Quality mode: {os.environ.get('TRANSCRIBE_QUALITY_MODE', 'not set')}")
 
         out_txt = transcribe_file_simple_auto(
             input_file,
@@ -503,28 +510,28 @@ def launch_gui(default_outdir: Optional[str] = None, *, default_threads: Optiona
 
         # Row 10: Quality options
         quality_mode_var = tk.IntVar(value=proj_settings.get("quality_mode", 1))  # Default to ON
-        tk.Checkbutton(combined_frame, text="Quality mode (Whisper beam search, better punctuation)", variable=quality_mode_var, bg='white', fg='#374151', selectcolor='white', activebackground='white').grid(column=0, row=10, columnspan=2, sticky='w', padx=20, pady=(0, 6))
-
-        tk.Label(combined_frame, text="Max repeat cap:", bg='white', fg='#374151', font=('Segoe UI', 10)).grid(column=2, row=10, sticky='w', padx=(20, 6), pady=(0, 6))
-        max_repeat_var = tk.IntVar(value=proj_settings.get("max_repeat_cap", 10))
-        tk.Spinbox(combined_frame, from_=1, to=20, textvariable=max_repeat_var, width=5, bg='#f9fafb', fg='#111827', relief='flat').grid(column=3, row=10, sticky='w', padx=(6, 20), pady=(0, 6))
+        tk.Checkbutton(combined_frame, text="Quality mode (beam=10, better punctuation, slower)", variable=quality_mode_var, bg='white', fg='#374151', selectcolor='white', activebackground='white').grid(column=0, row=10, columnspan=4, sticky='w', padx=20, pady=(0, 6))
 
         # Row 11: Model selection - expanded with multiple backends
         tk.Label(combined_frame, text="Transcription Model:", bg='white', fg='#374151', font=('Segoe UI', 10, 'bold')).grid(column=0, row=11, sticky='w', padx=20, pady=(8, 6))
         
         # Available models with descriptions
+        # All "faster-whisper-" prefixed models use CTranslate2 backend (GPU accelerated)
         MODEL_OPTIONS = [
-            ("large-v3-turbo", "Whisper large-v3-turbo (fast, good accuracy)"),
-            ("large-v3", "Whisper large-v3 (best accuracy, slower)"),
-            ("faster-whisper-large-v3", "Faster-Whisper large-v3 (4x faster, same accuracy)"),
-            ("faster-whisper-large-v3-turbo", "Faster-Whisper turbo (fastest local)"),
+            ("faster-whisper-large-v3", "Faster-Whisper large-v3 (GPU, best accuracy)"),
+            ("faster-whisper-large-v2", "Faster-Whisper large-v2 (GPU, try if v3 punctuation poor)"),
+            ("faster-whisper-distil-large-v3", "Faster-Whisper distil-v3 (GPU, 6x faster, English)"),
+            ("faster-whisper-distil-large-v2", "Faster-Whisper distil-v2 (GPU, fast, English)"),
+            ("faster-whisper-large-v3-turbo", "Faster-Whisper turbo (GPU, fastest)"),
+            ("large-v3", "Native Whisper large-v3 (may use CPU)"),
+            ("large-v2", "Native Whisper large-v2 (may use CPU)"),
         ]
         
         # Default to faster-whisper-large-v3 for best balance of speed and accuracy
         model_choice_var = tk.StringVar(value=proj_settings.get("whisper_model", "faster-whisper-large-v3"))
         
         model_frame = tk.Frame(combined_frame, bg='white')
-        model_frame.grid(column=1, row=10, columnspan=3, sticky='w', padx=(12, 20), pady=(8, 6))
+        model_frame.grid(column=1, row=11, columnspan=3, sticky='w', padx=(12, 20), pady=(8, 6))
         
         # Create dropdown/combobox for model selection
         model_values = [opt[1] for opt in MODEL_OPTIONS]
@@ -559,22 +566,22 @@ def launch_gui(default_outdir: Optional[str] = None, *, default_threads: Optiona
         
         model_combo.bind('<<ComboboxSelected>>', on_model_change)
 
-        # Row 11: Initial prompt for context (helps with specialized vocabulary)
-        tk.Label(combined_frame, text="Context hint (optional):", bg='white', fg='#374151', font=('Segoe UI', 10)).grid(column=0, row=11, sticky='w', padx=20, pady=(8, 6))
+        # Row 13: Initial prompt for context (helps with specialized vocabulary)
+        tk.Label(combined_frame, text="Context hint (optional):", bg='white', fg='#374151', font=('Segoe UI', 10)).grid(column=0, row=13, sticky='w', padx=20, pady=(8, 6))
         initial_prompt_var = tk.StringVar(value=proj_settings.get("initial_prompt", ""))
         initial_prompt_entry = tk.Entry(combined_frame, textvariable=initial_prompt_var, font=('Segoe UI', 9), width=70, bg='#f9fafb', fg='#111827', relief='flat')
-        initial_prompt_entry.grid(column=1, row=11, columnspan=3, sticky='w', padx=(12, 20), pady=(8, 6))
+        initial_prompt_entry.grid(column=1, row=13, columnspan=3, sticky='w', padx=(12, 20), pady=(8, 6))
         
         # Tooltip/hint for initial prompt
         prompt_hint = tk.Label(combined_frame, text="💡 E.g. 'Lecture on esoteric philosophy, Gurdjieff Work, Fourth Way teachings'", bg='white', fg='#6b7280', font=('Segoe UI', 8))
-        prompt_hint.grid(column=1, row=12, columnspan=3, sticky='w', padx=(12, 20), pady=(0, 6))
+        prompt_hint.grid(column=1, row=14, columnspan=3, sticky='w', padx=(12, 20), pady=(0, 6))
 
-        # Row 13: Compact description
+        # Row 15: Compact description
         desc = (
             "Auto device (CUDA/DirectML/CPU) • Faster-Whisper for speed\n"
             "Outputs saved next to source file(s)."
         )
-        ttk.Label(combined_frame, text=desc, background='white', foreground='#374151', font=('Segoe UI', 9), wraplength=920, justify='left').grid(column=0, row=13, columnspan=4, sticky='w', padx=20, pady=(8, 16))
+        ttk.Label(combined_frame, text=desc, background='white', foreground='#374151', font=('Segoe UI', 9), wraplength=920, justify='left').grid(column=0, row=15, columnspan=4, sticky='w', padx=20, pady=(8, 16))
 
         # Handlers attached to the buttons above
 
@@ -816,7 +823,6 @@ def launch_gui(default_outdir: Optional[str] = None, *, default_threads: Optiona
                         proj_settings["replace_before_time"] = time_var.get()
                         proj_settings["time_header"] = time_header_var.get()
                         proj_settings["quality_mode"] = quality_mode_var.get()
-                        proj_settings["max_repeat_cap"] = max_repeat_var.get()
                         proj_settings["whisper_model"] = model_choice_var.get()
                         proj_settings["initial_prompt"] = initial_prompt_var.get()
                         _save_project_settings(current_folder, proj_settings)
@@ -833,13 +839,12 @@ def launch_gui(default_outdir: Optional[str] = None, *, default_threads: Optiona
                     except Exception:
                         pass
 
-                    # Apply quality mode and max repeat cap
+                    # Apply quality mode
                     try:
                         if quality_mode_var.get() == 1:
                             os.environ["TRANSCRIBE_QUALITY_MODE"] = "1"
                         else:
                             os.environ.pop("TRANSCRIBE_QUALITY_MODE", None)
-                        os.environ["TRANSCRIBE_MAX_REPEAT_CAP"] = str(max_repeat_var.get())
                     except Exception:
                         pass
 

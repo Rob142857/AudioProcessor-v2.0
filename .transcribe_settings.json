@@ -51,12 +51,13 @@
       "skip_existing": 0,
       "time_header": 1,
       "quality_mode": 1,
-      "max_repeat_cap": 15,
+      "max_repeat_cap": 6,
       "whisper_model": "faster-whisper-large-v3",
       "initial_prompt": "",
       "replace_before_enabled": 1,
-      "replace_before_date": "2025-12-07",
-      "replace_before_time": "00:00"
+      "replace_before_date": "2026-01-10",
+      "replace_before_time": "00:00",
+      "restore_punctuation": 1
     },
     "C:/Users/RobertEvans/OneDrive - RME Solutions Technology/_PG Completed Recordings 84-97/1988 MW": {
       "domain_terms_file": "C:\\Users\\RobertEvans\\Downloads\\AudioProcessorAlphaVersion\\special_words.txt",
@@ -65,11 +66,12 @@
       "time_header": 1,
       "quality_mode": 1,
       "max_repeat_cap": 10,
-      "whisper_model": "faster-whisper-large-v3",
+      "whisper_model": "faster-whisper-distil-large-v3",
       "initial_prompt": "",
-      "replace_before_enabled": 0,
-      "replace_before_date": "2026-01-09",
-      "replace_before_time": "00:00"
+      "replace_before_enabled": 1,
+      "replace_before_date": "2026-01-10",
+      "replace_before_time": "00:00",
+      "restore_punctuation": 1
     },
     "C:/Users/RobertEvans/OneDrive - RME Solutions Technology/_PG Completed Recordings 84-97/1996 MW": {
       "domain_terms_file": "c:\\Users\\RobertEvans\\Downloads\\AudioProcessorAlphaVersion\\awkward_words.txt",
