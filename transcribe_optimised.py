@@ -1383,6 +1383,53 @@ def transcribe_with_dataset_optimization(input_path: str, output_dir=None, threa
     # Build optional initial_prompt from special terms
     awkward_terms = load_awkward_terms(input_path)
     initial_prompt = build_initial_prompt(awkward_terms)
+    
+    # Log loaded domain terms for debugging
+    if awkward_terms:
+        print(f"📚 Loaded {len(awkward_terms)} domain terms from special_words.txt")
+        print(f"   Terms: {', '.join(awkward_terms[:10])}{'...' if len(awkward_terms) > 10 else ''}")
+    
+    # PUNCTUATION PRIMING: Add a properly punctuated sample to prime Whisper's style
+    # Whisper uses initial_prompt as "previous context" - it mimics the punctuation style it sees
+    # This is NOT an instruction prompt - it's a SAMPLE of well-punctuated text
+    quality_mode_for_prompt = os.environ.get("TRANSCRIBE_QUALITY_MODE", "").strip() in ("1", "true", "True")
+    if quality_mode_for_prompt:
+        # Prime with authentic lecture-style text using LONGER sentences to encourage longer output
+        # Whisper mimics this punctuation pattern - longer samples = longer sentence output
+        # NOTE: Keep this concise - Whisper's initial_prompt is limited to ~224 tokens (~500-600 chars)
+        punctuation_primer = (
+            "Now, as you know, we're looking at the biological basis or the biological manifestation "
+            "of spiritual things, and this is something that requires careful attention because we need "
+            "to understand how the invisible world of spirit connects with the visible world of matter. "
+        )
+        # PUNCTUATION PRIMER FIRST - it's most important for sentence quality
+        # Domain terms come after to help with vocabulary recognition
+        if initial_prompt:
+            initial_prompt = f"{punctuation_primer} {initial_prompt}"
+        else:
+            initial_prompt = punctuation_primer
+        print("🎯 Punctuation priming enabled for quality mode")
+    
+    # Combine with GUI-provided context hint if available (prepended for visibility)
+    gui_prompt = os.environ.get("TRANSCRIBE_INITIAL_PROMPT", "").strip()
+    if gui_prompt:
+        if initial_prompt:
+            initial_prompt = f"{gui_prompt}. {initial_prompt}"
+        else:
+            initial_prompt = gui_prompt
+        print(f"🎯 Context hint: '{gui_prompt}'")
+    elif initial_prompt:
+        preview = initial_prompt[:100]
+        print(f"🧩 Using domain terms bias (initial_prompt): '{preview}...'")
+    
+    # CRITICAL: Truncate to Whisper's effective limit (~600 chars / 224 tokens)
+    # The punctuation primer at the START is most important, domain terms can be truncated
+    if initial_prompt and len(initial_prompt) > 600:
+        initial_prompt = initial_prompt[:597].rstrip() + "..."
+        print(f"⚠️  Initial prompt truncated to 600 chars (Whisper token limit)")
+    
+    if initial_prompt:
+        print(f"📝 Final initial_prompt ({len(initial_prompt)} chars): {initial_prompt[:150]}...")
 
     # Create dataset and dataloader for efficient processing
     try:
@@ -2346,28 +2393,33 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
     awkward_terms = load_awkward_terms(input_path)
     initial_prompt = build_initial_prompt(awkward_terms)
     
+    # Log loaded domain terms for debugging
+    if awkward_terms:
+        print(f"📚 Loaded {len(awkward_terms)} domain terms from special_words.txt")
+        print(f"   Terms: {', '.join(awkward_terms[:10])}{'...' if len(awkward_terms) > 10 else ''}")
+    
     # PUNCTUATION PRIMING: Add a properly punctuated sample to prime Whisper's style
     # Whisper uses initial_prompt as "previous context" - it mimics the punctuation style it sees
     # This is NOT an instruction prompt - it's a SAMPLE of well-punctuated text
     quality_mode_for_prompt = os.environ.get("TRANSCRIBE_QUALITY_MODE", "").strip() in ("1", "true", "True")
     if quality_mode_for_prompt:
-        # Prime with authentic lecture-style text - Whisper mimics this punctuation pattern
+        # Prime with authentic lecture-style text using LONGER sentences to encourage longer output
+        # Whisper mimics this punctuation pattern - longer samples = longer sentence output
+        # NOTE: Keep this concise - Whisper's initial_prompt is limited to ~224 tokens (~500-600 chars)
         punctuation_primer = (
-            "Now, as you know, we're looking at the biological basis, or the biological manifestation, "
-            "of spiritual things. Spiritual things are invisible to our senses, to our sight. "
-            "We cannot see them in any way at all, although there are times when spiritual vision "
-            "opens up a little and we have a perception of something. But in order to render "
-            "spiritual things understandable, the world is organised so that all the infinite things "
-            "of Higher Life are symbolically manifested in all the patterns and shapes that we see "
-            "in the natural world."
+            "Now, as you know, we're looking at the biological basis or the biological manifestation "
+            "of spiritual things, and this is something that requires careful attention because we need "
+            "to understand how the invisible world of spirit connects with the visible world of matter. "
         )
+        # PUNCTUATION PRIMER FIRST - it's most important for sentence quality
+        # Domain terms come after to help with vocabulary recognition
         if initial_prompt:
             initial_prompt = f"{punctuation_primer} {initial_prompt}"
         else:
             initial_prompt = punctuation_primer
         print("🎯 Punctuation priming enabled for quality mode")
     
-    # Combine with GUI-provided context hint if available
+    # Combine with GUI-provided context hint if available (prepended for visibility)
     gui_prompt = os.environ.get("TRANSCRIBE_INITIAL_PROMPT", "").strip()
     if gui_prompt:
         if initial_prompt:
@@ -2378,6 +2430,15 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
     elif initial_prompt:
         preview = initial_prompt[:100]
         print(f"🧩 Using domain terms bias (initial_prompt): '{preview}...'")
+    
+    # CRITICAL: Truncate to Whisper's effective limit (~600 chars / 224 tokens)
+    # The punctuation primer at the START is most important, domain terms can be truncated
+    if initial_prompt and len(initial_prompt) > 600:
+        initial_prompt = initial_prompt[:597].rstrip() + "..."
+        print(f"⚠️  Initial prompt truncated to 600 chars (Whisper token limit)")
+    
+    if initial_prompt:
+        print(f"📝 Final initial_prompt ({len(initial_prompt)} chars): {initial_prompt[:150]}...")
 
     # Pre-run cleanup
     force_gpu_memory_cleanup()
@@ -2854,8 +2915,15 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
                     print("🎯 FW STANDARD mode: beam=5, best_of=5, patience=1.0, temp=0.0")
             
             # Gate initial prompt behind explicit opt-in to preserve strict verbatim neutrality
-            if initial_prompt and str(os.environ.get("TRANSCRIBE_ALLOW_PROMPT", "0")).lower() in ("1","true","yes"):
+            allow_prompt = str(os.environ.get("TRANSCRIBE_ALLOW_PROMPT", "0")).lower() in ("1","true","yes")
+            if initial_prompt and allow_prompt:
                 transcribe_kwargs["initial_prompt"] = initial_prompt
+                print(f"✅ Initial prompt APPLIED to transcription ({len(initial_prompt)} chars)")
+                print(f"   Preview: {initial_prompt[:100]}...")
+            elif initial_prompt:
+                print(f"⚠️  Initial prompt NOT applied (TRANSCRIBE_ALLOW_PROMPT={os.environ.get('TRANSCRIBE_ALLOW_PROMPT', 'not set')})")
+            else:
+                print(f"ℹ️  No initial prompt configured")
 
             if use_vad:
                 try:

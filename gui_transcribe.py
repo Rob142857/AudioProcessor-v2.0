@@ -510,7 +510,13 @@ def launch_gui(default_outdir: Optional[str] = None, *, default_threads: Optiona
 
         # Row 10: Quality options
         quality_mode_var = tk.IntVar(value=proj_settings.get("quality_mode", 1))  # Default to ON
-        tk.Checkbutton(combined_frame, text="Quality mode (beam=10, better punctuation, slower)", variable=quality_mode_var, bg='white', fg='#374151', selectcolor='white', activebackground='white').grid(column=0, row=10, columnspan=4, sticky='w', padx=20, pady=(0, 6))
+        tk.Checkbutton(combined_frame, text="Quality mode (beam=10, better punctuation, slower)", variable=quality_mode_var, bg='white', fg='#374151', selectcolor='white', activebackground='white').grid(column=0, row=10, columnspan=2, sticky='w', padx=20, pady=(0, 6))
+
+        # Row 10 (right side): Processing path toggle
+        # 0 = Simple path (default, lets Whisper handle segmentation internally)
+        # 1 = Dataset path (pre-segments audio, better GPU pipeline but can affect quality)
+        use_dataset_var = tk.IntVar(value=proj_settings.get("use_dataset_path", 0))  # Default to Simple
+        tk.Checkbutton(combined_frame, text="Use dataset pipeline (experimental, pre-segments audio)", variable=use_dataset_var, bg='white', fg='#374151', selectcolor='white', activebackground='white').grid(column=2, row=10, columnspan=2, sticky='w', padx=20, pady=(0, 6))
 
         # Row 11: Model selection - expanded with multiple backends
         tk.Label(combined_frame, text="Transcription Model:", bg='white', fg='#374151', font=('Segoe UI', 10, 'bold')).grid(column=0, row=11, sticky='w', padx=20, pady=(8, 6))
@@ -823,6 +829,7 @@ def launch_gui(default_outdir: Optional[str] = None, *, default_threads: Optiona
                         proj_settings["replace_before_time"] = time_var.get()
                         proj_settings["time_header"] = time_header_var.get()
                         proj_settings["quality_mode"] = quality_mode_var.get()
+                        proj_settings["use_dataset_path"] = use_dataset_var.get()
                         proj_settings["whisper_model"] = model_choice_var.get()
                         proj_settings["initial_prompt"] = initial_prompt_var.get()
                         _save_project_settings(current_folder, proj_settings)
@@ -864,6 +871,15 @@ def launch_gui(default_outdir: Optional[str] = None, *, default_threads: Optiona
                             os.environ["TRANSCRIBE_FORCE_NATIVE_WHISPER"] = "1"
                         else:
                             os.environ.pop("TRANSCRIBE_FORCE_NATIVE_WHISPER", None)
+                    except Exception:
+                        pass
+
+                    # Apply processing path selection
+                    try:
+                        if use_dataset_var.get() == 1:
+                            os.environ["TRANSCRIBE_USE_DATASET"] = "1"
+                        else:
+                            os.environ.pop("TRANSCRIBE_USE_DATASET", None)
                     except Exception:
                         pass
 
