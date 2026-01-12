@@ -29,10 +29,10 @@ except Exception:
 
 
 def format_duration(seconds):
-    """Convert seconds to a readable time format (HH:MM:SS or MM:SS).
+    """Convert seconds to a readable time format (e.g., 1h 30m 45.26s or 10m 48.26s).
 
     Robust against tensors / numpy scalars that lack __round__ and against
-    obviously invalid huge values (returns 00:00:00 for > 1 year).
+    obviously invalid huge values (returns 0m 0.00s for > 1 year).
     """
     if seconds is None:
         return None
@@ -44,18 +44,18 @@ def format_duration(seconds):
         if seconds < 0:
             seconds = 0.0
         if seconds > 31536000:  # > 1 year -> treat as invalid
-            return "00:00:00"
+            return "0m 0.00s"
         seconds = round(seconds, 2)
     except Exception:
-        return "00:00:00"
+        return "0m 0.00s"
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
     secs = seconds % 60
     
     if hours > 0:
-        return f"{hours:02d}:{minutes:02d}:{secs:05.2f}"
+        return f"{hours}h {minutes}m {secs:.2f}s"
     else:
-        return f"{minutes:02d}:{secs:05.2f}"
+        return f"{minutes}m {secs:.2f}s"
 
 
 def format_duration_minutes_only(seconds):
