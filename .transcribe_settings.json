@@ -57,7 +57,8 @@
       "replace_before_enabled": 1,
       "replace_before_date": "2026-01-09",
       "replace_before_time": "00:00",
-      "restore_punctuation": 1
+      "restore_punctuation": 1,
+      "use_dataset_path": 0
     },
     "C:/Users/RobertEvans/OneDrive - RME Solutions Technology/_PG Completed Recordings 84-97/1988 MW": {
       "domain_terms_file": "C:\\Users\\RobertEvans\\Downloads\\AudioProcessorAlphaVersion\\special_words.txt",

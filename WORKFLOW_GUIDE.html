@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Audio Transcription Workflow Guide</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+            min-height: 100vh;
+            padding: 40px 20px;
+            color: #fff;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        
+        h1 {
+            text-align: center;
+            font-size: 2.5rem;
+            margin-bottom: 10px;
+            background: linear-gradient(90deg, #00d4ff, #7c3aed, #f472b6);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        .subtitle {
+            text-align: center;
+            color: #94a3b8;
+            font-size: 1.1rem;
+            margin-bottom: 50px;
+        }
+        
+        .workflow {
+            display: flex;
+            flex-direction: column;
+            gap: 30px;
+        }
+        
+        .step {
+            display: flex;
+            align-items: stretch;
+            gap: 30px;
+        }
+        
+        .step-number {
+            flex-shrink: 0;
+            width: 80px;
+            height: 80px;
+            background: linear-gradient(135deg, #7c3aed, #2563eb);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 2rem;
+            font-weight: bold;
+            box-shadow: 0 10px 40px rgba(124, 58, 237, 0.4);
+        }
+        
+        .step-content {
+            flex: 1;
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 30px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            transition: transform 0.3s, box-shadow 0.3s;
+        }
+        
+        .step-content:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+        }
+        
+        .step-title {
+            font-size: 1.5rem;
+            margin-bottom: 15px;
+            color: #00d4ff;
+        }
+        
+        .step-description {
+            color: #cbd5e1;
+            line-height: 1.8;
+            margin-bottom: 20px;
+        }
+        
+        .features {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        
+        .feature {
+            background: rgba(124, 58, 237, 0.2);
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 0.9rem;
+            border: 1px solid rgba(124, 58, 237, 0.3);
+        }
+        
+        .arrow {
+            display: flex;
+            justify-content: center;
+            padding: 10px 0;
+        }
+        
+        .arrow svg {
+            width: 40px;
+            height: 40px;
+            fill: #7c3aed;
+            animation: bounce 2s infinite;
+        }
+        
+        @keyframes bounce {
+            0%, 100% { transform: translateY(0); }
+            50% { transform: translateY(10px); }
+        }
+        
+        .input-output {
+            display: flex;
+            align-items: center;
+            gap: 20px;
+            margin-top: 20px;
+            padding: 15px;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 12px;
+        }
+        
+        .io-icon {
+            font-size: 2.5rem;
+        }
+        
+        .io-details {
+            flex: 1;
+        }
+        
+        .io-label {
+            font-size: 0.8rem;
+            color: #94a3b8;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+        
+        .io-value {
+            font-size: 1.1rem;
+            color: #f1f5f9;
+        }
+        
+        .checklist {
+            list-style: none;
+            margin-top: 15px;
+        }
+        
+        .checklist li {
+            padding: 8px 0;
+            padding-left: 30px;
+            position: relative;
+            color: #cbd5e1;
+        }
+        
+        .checklist li::before {
+            content: "✓";
+            position: absolute;
+            left: 0;
+            color: #10b981;
+            font-weight: bold;
+        }
+        
+        .quality-badge {
+            display: inline-block;
+            background: linear-gradient(90deg, #10b981, #059669);
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            margin-top: 15px;
+        }
+        
+        .final-output {
+            background: linear-gradient(135deg, rgba(16, 185, 129, 0.2), rgba(5, 150, 105, 0.1));
+            border: 2px solid rgba(16, 185, 129, 0.3);
+        }
+        
+        .summary {
+            margin-top: 50px;
+            text-align: center;
+            padding: 40px;
+            background: rgba(255, 255, 255, 0.03);
+            border-radius: 20px;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+        
+        .summary h2 {
+            color: #f472b6;
+            margin-bottom: 20px;
+        }
+        
+        .summary p {
+            color: #94a3b8;
+            max-width: 700px;
+            margin: 0 auto;
+            line-height: 1.8;
+        }
+        
+        .tech-stack {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            margin-top: 30px;
+            flex-wrap: wrap;
+        }
+        
+        .tech {
+            background: rgba(255, 255, 255, 0.05);
+            padding: 10px 20px;
+            border-radius: 10px;
+            font-size: 0.9rem;
+            color: #cbd5e1;
+        }
+
+        @media print {
+            body {
+                background: white;
+                color: black;
+                padding: 20px;
+            }
+            
+            h1 {
+                background: none;
+                -webkit-text-fill-color: #1a1a2e;
+                color: #1a1a2e;
+            }
+            
+            .step-content {
+                background: #f8fafc;
+                border: 2px solid #e2e8f0;
+            }
+            
+            .step-title {
+                color: #1e40af;
+            }
+            
+            .step-description, .checklist li, .io-value {
+                color: #334155;
+            }
+            
+            .feature, .tech {
+                background: #e2e8f0;
+                color: #334155;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎙️ Audio Transcription Workflow</h1>
+        <p class="subtitle">From Raw Audio to Archive-Ready Document</p>
+        
+        <div class="workflow">
+            <!-- Step 1 -->
+            <div class="step">
+                <div class="step-number">1</div>
+                <div class="step-content">
+                    <h2 class="step-title">🎵 Automated Transcription</h2>
+                    <p class="step-description">
+                        Run your audio or video file through the Speech-to-Text Transcription Tool. 
+                        The AI-powered Whisper model processes the audio and generates a word-for-word 
+                        verbatim transcription with intelligent punctuation.
+                    </p>
+                    
+                    <div class="input-output">
+                        <div class="io-icon">📁</div>
+                        <div class="io-details">
+                            <div class="io-label">Input</div>
+                            <div class="io-value">Audio/Video File (.mp3, .wav, .mp4, .m4a, etc.)</div>
+                        </div>
+                    </div>
+                    
+                    <div class="features">
+                        <span class="feature">🎯 Quality Mode</span>
+                        <span class="feature">🧠 Whisper AI</span>
+                        <span class="feature">📝 Auto-Punctuation</span>
+                        <span class="feature">🔤 Special Words Recognition</span>
+                        <span class="feature">⚡ GPU Accelerated</span>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="arrow">
+                <svg viewBox="0 0 24 24"><path d="M12 4l-1.41 1.41L16.17 11H4v2h12.17l-5.58 5.59L12 20l8-8z" transform="rotate(90 12 12)"/></svg>
+            </div>
+            
+            <!-- Step 2 -->
+            <div class="step">
+                <div class="step-number">2</div>
+                <div class="step-content">
+                    <h2 class="step-title">👁️ Human Review & Enhancement</h2>
+                    <p class="step-description">
+                        The human editor listens to the original audio while reviewing the DOCX output. 
+                        This critical step ensures accuracy and transforms the raw transcription into 
+                        a polished, publication-ready document.
+                    </p>
+                    
+                    <div class="input-output">
+                        <div class="io-icon">📄</div>
+                        <div class="io-details">
+                            <div class="io-label">Working With</div>
+                            <div class="io-value">Generated DOCX Transcript + Original Audio</div>
+                        </div>
+                    </div>
+                    
+                    <ul class="checklist">
+                        <li>Listen to audio and verify word-for-word accuracy</li>
+                        <li>Correct any AI transcription errors or mishearings</li>
+                        <li>Refine punctuation for natural reading flow</li>
+                        <li>Add question marks (?) to identify when questions are asked</li>
+                        <li>Insert images, pictures, and diagrams where appropriate</li>
+                        <li>Format paragraphs and add section headings</li>
+                        <li>Verify proper nouns and technical terminology</li>
+                        <li>Add speaker identification if multiple speakers</li>
+                    </ul>
+                    
+                    <div class="features">
+                        <span class="feature">🎧 Audio Comparison</span>
+                        <span class="feature">✏️ Error Correction</span>
+                        <span class="feature">❓ Question Marking</span>
+                        <span class="feature">🖼️ Image Insertion</span>
+                        <span class="feature">📐 Formatting</span>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="arrow">
+                <svg viewBox="0 0 24 24"><path d="M12 4l-1.41 1.41L16.17 11H4v2h12.17l-5.58 5.59L12 20l8-8z" transform="rotate(90 12 12)"/></svg>
+            </div>
+            
+            <!-- Step 3 -->
+            <div class="step">
+                <div class="step-number">3</div>
+                <div class="step-content final-output">
+                    <h2 class="step-title">📚 Archive-Ready Document</h2>
+                    <p class="step-description">
+                        The final polished document is now publication-ready and suitable for archiving. 
+                        It preserves the exact spoken words while presenting them in a professional, 
+                        readable format that can be easily searched, referenced, and distributed.
+                    </p>
+                    
+                    <div class="input-output">
+                        <div class="io-icon">✨</div>
+                        <div class="io-details">
+                            <div class="io-label">Final Output</div>
+                            <div class="io-value">Polished DOCX / PDF / eBook (Calibre-compatible)</div>
+                        </div>
+                    </div>
+                    
+                    <ul class="checklist">
+                        <li>Verbatim word-for-word accuracy verified by human</li>
+                        <li>Professional punctuation and formatting</li>
+                        <li>Questions clearly marked for easy identification</li>
+                        <li>Images and visual aids integrated</li>
+                        <li>Ready for Calibre eBook conversion</li>
+                        <li>Suitable for long-term archival storage</li>
+                        <li>Searchable and indexable text</li>
+                    </ul>
+                    
+                    <span class="quality-badge">✓ Publication Ready</span>
+                </div>
+            </div>
+        </div>
+        
+        <div class="summary">
+            <h2>🎯 Quality Assurance Philosophy</h2>
+            <p>
+                This workflow combines the speed and consistency of AI transcription with the 
+                irreplaceable accuracy of human verification. The AI handles the heavy lifting 
+                of initial transcription, while human expertise ensures every word is correct, 
+                every question is marked, and the final document meets archival standards.
+            </p>
+            
+            <div class="tech-stack">
+                <span class="tech">OpenAI Whisper</span>
+                <span class="tech">Faster-Whisper</span>
+                <span class="tech">CUDA GPU</span>
+                <span class="tech">Python</span>
+                <span class="tech">DOCX Export</span>
+                <span class="tech">Calibre Compatible</span>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
