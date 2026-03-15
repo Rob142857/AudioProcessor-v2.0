@@ -1,6 +1,7 @@
 """Reusable GUI components for the transcription tool."""
 import os
 import datetime
+import threading
 import tkinter as tk
 from tkinter import ttk, filedialog
 
@@ -233,3 +234,152 @@ class LogPanel(tk.Frame):
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
         self.text.configure(state="disabled")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Model preload dialog
+# ─────────────────────────────────────────────────────────────────────
+# Available models that can be preloaded for offline use.
+PRELOAD_MODELS = [
+    ("fw-large-v3",       "Faster-Whisper Large-v3",       "large-v3",       "faster-whisper", True),
+    ("fw-large-v3-turbo", "Faster-Whisper Large-v3-turbo", "large-v3-turbo", "faster-whisper", True),
+    ("native-large-v3",   "Native Whisper Large-v3",       "large-v3",       "native",         False),
+]
+# Columns: (key, display_name, model_id, backend, default_checked)
+
+
+class ModelPreloadDialog(tk.Toplevel):
+    """Modal dialog to download / cache selected Whisper models."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Download Models")
+        self.geometry("520x420")
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        tk.Label(self, text="Model Manager", bg=BG, fg="#1a365d",
+                 font=("Segoe UI", 14, "bold")).pack(anchor="w", padx=20, pady=(16, 4))
+        tk.Label(self, text="Select models to download for offline use.",
+                 bg=BG, fg=FG_DIM, font=FONT_SM).pack(anchor="w", padx=20, pady=(0, 12))
+
+        # Model checkboxes with status
+        self._vars: dict[str, tk.IntVar] = {}
+        self._status_labels: dict[str, tk.Label] = {}
+        card = tk.Frame(self, bg=CARD_BG, relief="flat", bd=1)
+        card.pack(fill="x", padx=20, pady=(0, 12))
+
+        for key, display, model_id, backend, default in PRELOAD_MODELS:
+            row = tk.Frame(card, bg=CARD_BG)
+            row.pack(fill="x", padx=12, pady=4)
+
+            var = tk.IntVar(value=1 if default else 0)
+            self._vars[key] = var
+            tk.Checkbutton(row, text=display, variable=var,
+                           bg=CARD_BG, fg=FG, selectcolor=CARD_BG,
+                           activebackground=CARD_BG, font=FONT).pack(side="left")
+
+            status = tk.Label(row, text="", bg=CARD_BG, fg=FG_DIM, font=FONT_SM)
+            status.pack(side="right", padx=(0, 4))
+            self._status_labels[key] = status
+
+            # Check if already cached
+            self._check_cached(key, model_id, backend, status)
+
+        # Progress log
+        self._log = tk.Text(self, wrap=tk.WORD, height=8, font=FONT_SM,
+                            bg=CARD_BG, fg="#2c3e50", bd=0, highlightthickness=0)
+        self._log.pack(fill="both", expand=True, padx=20, pady=(0, 8))
+        self._log.configure(state="disabled")
+
+        # Buttons
+        btn_frame = tk.Frame(self, bg=BG)
+        btn_frame.pack(fill="x", padx=20, pady=(0, 16))
+        self._dl_btn = _styled_btn(btn_frame, "Download Selected", self._start_download,
+                                   bg=GREEN, font=("Segoe UI", 11, "bold"))
+        self._dl_btn.pack(side="left", padx=(0, 8))
+        _styled_btn(btn_frame, "Close", self.destroy, bg="#6b7280",
+                    font=("Segoe UI", 11)).pack(side="right")
+
+    # ── helpers ──────────────────────────────────────────────────────
+    def _log_msg(self, msg: str):
+        self._log.configure(state="normal")
+        self._log.insert("end", msg + "\n")
+        self._log.see("end")
+        self._log.configure(state="disabled")
+
+    @staticmethod
+    def _check_cached(key, model_id, backend, label):
+        """Set label text to 'cached' or 'not downloaded'."""
+        try:
+            if backend == "faster-whisper":
+                from huggingface_hub import try_to_load_from_cache
+                # Faster-whisper models are stored under Systran/ or mobiuslabsgmbh/
+                for prefix in (f"Systran/faster-whisper-{model_id}",
+                               f"mobiuslabsgmbh/faster-whisper-{model_id}"):
+                    if try_to_load_from_cache(prefix, "model.bin") is not None:
+                        label.config(text="cached", fg=GREEN)
+                        return
+                label.config(text="not downloaded", fg=AMBER)
+            else:
+                import torch
+                cache = os.path.join(torch.hub.get_dir(), "checkpoints")
+                if any(model_id in f for f in os.listdir(cache) if f.endswith(".pt")):
+                    label.config(text="cached", fg=GREEN)
+                    return
+                label.config(text="not downloaded", fg=AMBER)
+        except Exception:
+            label.config(text="unknown", fg=FG_DIM)
+
+    def _start_download(self):
+        selected = [(k, m) for k, _d, m, b, _df in PRELOAD_MODELS
+                    if self._vars.get(k, tk.IntVar()).get() == 1
+                    for m, b in [(m, b)]]
+        # Rebuild properly
+        selected = []
+        for key, display, model_id, backend, _default in PRELOAD_MODELS:
+            if self._vars.get(key, tk.IntVar()).get() == 1:
+                selected.append((key, display, model_id, backend))
+
+        if not selected:
+            self._log_msg("No models selected.")
+            return
+
+        self._dl_btn.configure(state="disabled")
+        self._log_msg(f"Downloading {len(selected)} model(s)...\n")
+
+        def worker():
+            for key, display, model_id, backend in selected:
+                self._log_msg(f"Loading {display}...")
+                lbl = self._status_labels[key]
+                try:
+                    if backend == "faster-whisper":
+                        os.environ.pop("HF_HUB_OFFLINE", None)
+                        from faster_whisper import WhisperModel
+                        import torch
+                        device = "cuda" if torch.cuda.is_available() else "cpu"
+                        ctype = "int8"
+                        if device == "cuda":
+                            try:
+                                cap = torch.cuda.get_device_capability(0)
+                                if cap[0] >= 7:
+                                    ctype = "float16"
+                            except Exception:
+                                pass
+                        m = WhisperModel(model_id, device=device, compute_type=ctype)
+                        del m
+                    else:
+                        import whisper
+                        whisper.load_model(model_id)
+                    self._log_msg(f"  OK: {display}")
+                    self.after(0, lambda l=lbl: l.config(text="cached", fg=GREEN))
+                except Exception as e:
+                    self._log_msg(f"  FAILED: {e}")
+                    self.after(0, lambda l=lbl: l.config(text="failed", fg=RED))
+
+            self._log_msg("\nDone.")
+            self.after(0, lambda: self._dl_btn.configure(state="normal"))
+
+        threading.Thread(target=worker, daemon=True).start()

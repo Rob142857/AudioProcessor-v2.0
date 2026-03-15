@@ -20,10 +20,21 @@ Converts audio/video files into professionally formatted DOCX transcripts. Autom
 
 ## Quick Start
 
+### One-Liner Install (GeForce GPU)
+
+Open PowerShell and paste:
+
 ```powershell
-# Clone and set up
-git clone https://github.com/Rob142857/AudioProcessorAlphaVersion.git
-cd AudioProcessorAlphaVersion
+irm https://raw.githubusercontent.com/Rob142857/AudioProcessor-v2.0/main/install_geforce.ps1 | iex
+```
+
+This installs Python, Git, FFmpeg (via winget), clones the repo, sets up a venv, installs PyTorch CUDA 12.4, downloads models, and launches the GUI.
+
+### Manual Setup
+
+```powershell
+git clone https://github.com/Rob142857/AudioProcessor-v2.0.git
+cd AudioProcessor-v2.0
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt

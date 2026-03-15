@@ -23,7 +23,7 @@ from tkinter import ttk, messagebox
 from gui_components import (
     BG, CARD_BG, FG, ACCENT, GREEN, RED, AMBER,
     FONT, FONT_LG, FONT_TTL, SUPPORTED_EXTS,
-    InputPanel, SettingsPanel, LogPanel, _styled_btn,
+    InputPanel, SettingsPanel, LogPanel, ModelPreloadDialog, _styled_btn,
 )
 
 # ── Paths & constants ────────────────────────────────────────────────
@@ -302,7 +302,9 @@ def launch_gui():
     stop_btn.pack(side="left", padx=(0, 8))
     stop_btn.configure(state="disabled")
     _styled_btn(btn_bar, "Clear Cache", clear_cache,
-                font=FONT_LG, bg=AMBER).pack(side="left")
+                font=FONT_LG, bg=AMBER).pack(side="left", padx=(0, 8))
+    _styled_btn(btn_bar, "Download Models", lambda: ModelPreloadDialog(root),
+                font=FONT_LG, bg="#6366f1").pack(side="left")
 
     # ── Log panel ────────────────────────────────────────────────────
     log = LogPanel(outer)
