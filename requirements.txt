@@ -1,56 +1,18 @@
-# Core AI/ML dependencies
-openai-whisper==20250625
+# ── Core transcription ──────────────────────────────────────────────
+openai-whisper>=20250625
+faster-whisper>=1.2.1
 
-# Punctuation restoration (BERT-based, token classification - only adds punctuation, never changes words)
-deepmultilingualpunctuation>=1.0.1
+# ── Output ──────────────────────────────────────────────────────────
+python-docx>=1.2.0                      # DOCX output generation
 
-# Semantic paragraph segmentation (detects topic shifts for intelligent paragraph breaks)
-sentence-transformers>=2.2.0
+# ── System / progress ──────────────────────────────────────────────
+psutil>=7.2.0
+tqdm>=4.67.0
 
-# Prosody analysis for intelligent sentence merging
-librosa>=0.10.0
-
-# Alternative Whisper backends (faster/more efficient)
-faster-whisper>=1.0.0
-
-# Enhanced text processing libraries
-spacy>=3.7.0,<4.0.0
-nltk>=3.8.0,<4.0.0
-textstat>=0.7.0,<1.0.0
-
-# Document generation
-python-docx>=1.2.0,<2.0.0
-
-# System monitoring and performance optimization
-psutil>=7.0.0,<8.0.0
-tqdm>=4.60.0,<5.0.0
-
-# Optional advanced NLP (install separately if needed for transformer models)
-# transformers>=4.40.0,<5.0.0
-# torch-audio>=2.0.0,<3.0.0
-
-# Legacy dependencies REMOVED (no longer needed by current GUI):
-# - webrtcvad (only used in old transcribe.py, not transcribe_optimised.py)
-# - moviepy (only used in older transcription modules)  
-# - imageio-ffmpeg (only used in older transcription modules)
-
-# GUI dependencies (tkinter is built-in with Python)
-# No additional GUI packages needed - using standard tkinter
-
-# PyTorch: Install separately for optimal GPU/CUDA compatibility
-# Choose the appropriate build for your system:
+# ── PyTorch: install separately for your GPU ───────────────────────
+# Your GTX 1070 Ti has CUDA 12.4 support via the installed torch 2.6.0+cu124.
+# To reinstall / upgrade:
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 #
-# CPU-only (smaller, universal):
+# CPU-only:
 #   pip install torch --index-url https://download.pytorch.org/whl/cpu
-#
-# CUDA 11.8 (for most NVIDIA GPUs like GTX 1070 Ti):
-#   pip install torch --index-url https://download.pytorch.org/whl/cu118
-#
-# CUDA 12.1+ (for newer NVIDIA GPUs):
-#   pip install torch --index-url https://download.pytorch.org/whl/cu121
-#
-# DirectML (Windows AMD/Intel GPUs):
-#   pip install torch-directml
-#
-# We intentionally avoid pinning torch here to let users choose the optimal build
-# for their hardware configuration.

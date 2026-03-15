@@ -67,10 +67,10 @@
       "time_header": 1,
       "quality_mode": 1,
       "max_repeat_cap": 10,
-      "whisper_model": "faster-whisper-distil-large-v3",
+      "whisper_model": "large-v3",
       "initial_prompt": "",
       "replace_before_enabled": 1,
-      "replace_before_date": "2026-01-08",
+      "replace_before_date": "2026-02-10",
       "replace_before_time": "00:00",
       "restore_punctuation": 1,
       "use_dataset_path": 0

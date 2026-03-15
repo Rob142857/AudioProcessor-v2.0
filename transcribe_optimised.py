@@ -2244,12 +2244,6 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
     # Lazy imports (after torch is imported) to avoid docstring errors
     import whisper  # type: ignore
     from docx import Document  # type: ignore
-    try:
-        from text_processor_enhanced import create_enhanced_processor
-        _enhanced_processor_available = True
-    except ImportError:
-        _enhanced_processor_available = False
-        create_enhanced_processor = None  # Define it to avoid unbound variable error
     from transcribe import (
         get_media_duration, split_into_paragraphs, format_duration, format_duration_minutes_only, format_duration_hms,
     )

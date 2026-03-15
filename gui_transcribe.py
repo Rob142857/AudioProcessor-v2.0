@@ -521,16 +521,10 @@ def launch_gui(default_outdir: Optional[str] = None, *, default_threads: Optiona
         # Row 11: Model selection - expanded with multiple backends
         tk.Label(combined_frame, text="Transcription Model:", bg='white', fg='#374151', font=('Segoe UI', 10, 'bold')).grid(column=0, row=11, sticky='w', padx=20, pady=(8, 6))
         
-        # Available models with descriptions
-        # All "faster-whisper-" prefixed models use CTranslate2 backend (GPU accelerated)
+        # Available models — Faster-Whisper (CTranslate2 GPU) and Native Whisper
         MODEL_OPTIONS = [
-            ("faster-whisper-large-v3", "Faster-Whisper large-v3 (GPU, best accuracy)"),
-            ("faster-whisper-large-v2", "Faster-Whisper large-v2 (GPU, try if v3 punctuation poor)"),
-            ("faster-whisper-distil-large-v3", "Faster-Whisper distil-v3 (GPU, 6x faster, English)"),
-            ("faster-whisper-distil-large-v2", "Faster-Whisper distil-v2 (GPU, fast, English)"),
-            ("faster-whisper-large-v3-turbo", "Faster-Whisper turbo (GPU, fastest)"),
-            ("large-v3", "Native Whisper large-v3 (may use CPU)"),
-            ("large-v2", "Native Whisper large-v2 (may use CPU)"),
+            ("faster-whisper-large-v3", "Faster-Whisper Large-v3 (GPU, recommended)"),
+            ("large-v3", "Native Whisper Large-v3 (GPU/CPU fallback)"),
         ]
         
         # Default to faster-whisper-large-v3 for best balance of speed and accuracy
