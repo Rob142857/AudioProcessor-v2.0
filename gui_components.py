@@ -93,8 +93,9 @@ class SettingsPanel(tk.Frame):
     """All transcription settings in a compact card."""
 
     MODEL_OPTIONS = [
-        ("faster-whisper-large-v3", "Faster-Whisper Large-v3  (GPU, recommended)"),
-        ("large-v3",                "Native Whisper Large-v3  (GPU / CPU fallback)"),
+        ("faster-whisper-large-v3",       "Faster-Whisper Large-v3  (GPU, best quality)"),
+        ("faster-whisper-large-v3-turbo", "Faster-Whisper Large-v3-turbo  (GPU, 2x faster)"),
+        ("large-v3",                      "Native Whisper Large-v3  (GPU / CPU fallback)"),
     ]
 
     def __init__(self, parent, proj_settings: dict | None = None):

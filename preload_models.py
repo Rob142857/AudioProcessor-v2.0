@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 Preload Whisper models to avoid first-run download delays.
-This script downloads and caches models for all supported backends:
-- Native OpenAI Whisper (large-v3, large-v3-turbo)
-- Faster-Whisper (CTranslate2)
-- Distil-Whisper (HuggingFace)
+
+Downloads and caches the two models offered in the GUI:
+  1. Faster-Whisper large-v3 (CTranslate2, GPU int8) — recommended
+  2. Native OpenAI Whisper large-v3 — fallback
 """
 
 import os
@@ -32,10 +32,8 @@ def preload_native_whisper():
         cache_dir = torch.hub.get_dir()
         print(f"Cache directory: {cache_dir}\n")
         
-        # Models to preload (in priority order)
+        # Only preload the model offered in the GUI dropdown
         models_to_load = []
-        if "large-v3-turbo" in avail:
-            models_to_load.append("large-v3-turbo")
         if "large-v3" in avail:
             models_to_load.append("large-v3")
         
@@ -104,13 +102,10 @@ def preload_faster_whisper():
         
         print(f"\nDevice: {device}, Compute type: {compute_type}\n")
         
-        # Models available in GUI - download all for offline use
+        # Preload models offered in the GUI dropdown
         models_to_load = [
             "large-v3",           # Best accuracy
-            "large-v2",           # Alternative if v3 punctuation is poor
-            "distil-large-v3",    # 6x faster, English-optimized
-            "distil-large-v2",    # Fast English alternative
-            "large-v3-turbo",     # Fastest
+            "large-v3-turbo",     # 2x faster, half the VRAM
         ]
         success_count = 0
         
@@ -241,25 +236,16 @@ def preload_paragraph_model():
 
 
 def preload_all_models():
-    """Download and cache Faster-Whisper large-v3 model and punctuation model."""
+    """Download and cache the two models offered in the GUI."""
     show_system_info()
     
     results = {}
     
-    # Native Whisper - COMMENTED OUT (not needed, using faster-whisper)
-    # results['native'] = preload_native_whisper()
+    # Faster-Whisper large-v3 — PRIMARY (GPU, recommended)
+    results['faster-whisper'] = preload_faster_whisper()
     
-    # Faster-Whisper - PRIMARY MODEL
-    results['faster'] = preload_faster_whisper()
-    
-    # Punctuation Restoration - BERT model for fixing run-on sentences
-    results['punctuation'] = preload_punctuation_model()
-    
-    # Semantic Paragraph Segmentation - sentence-transformers model
-    results['paragraphs'] = preload_paragraph_model()
-    
-    # Distil-Whisper - COMMENTED OUT (not needed for now)
-    # results['distil'] = preload_distil_whisper()
+    # Native Whisper large-v3 — FALLBACK
+    results['native-whisper'] = preload_native_whisper()
     
     # Summary
     print("\n" + "="*60)

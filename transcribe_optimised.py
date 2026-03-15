@@ -11,7 +11,8 @@ warnings.filterwarnings("ignore", category=UserWarning, module="webrtcvad")
 # Suppress verbose tqdm progress bars from transformers/huggingface
 import os
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "0")  # Keep minimal progress
-os.environ.setdefault("HF_HUB_OFFLINE", "1")  # Use cached models only, no network checks
+# NOTE: Do NOT set HF_HUB_OFFLINE=1 — it blocks faster-whisper from downloading
+# CTranslate2 models on first use, causing silent fallback to CPU.
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")  # Transformers also use cached models only
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "warning")  # Reduce transformer logs
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")  # Avoid tokenizer warnings
@@ -277,9 +278,9 @@ def preprocess_audio_with_padding(input_path: str, temp_dir: str = None) -> str:
     if temp_dir is None:
         temp_dir = tempfile.gettempdir()
     
-    # Generate unique temp filename
+    # Generate unique temp filename — WAV avoids lossy encode/decode overhead
     base_name = os.path.splitext(os.path.basename(input_path))[0]
-    temp_output = os.path.join(temp_dir, f"preprocessed_{base_name}_{int(time.time())}.mp3")
+    temp_output = os.path.join(temp_dir, f"preprocessed_{base_name}_{int(time.time())}.wav")
     
     print(f"🔄 Preprocessing audio with silence padding...")
     print(f"📁 Input: {os.path.basename(input_path)}")
@@ -301,57 +302,57 @@ def preprocess_audio_with_padding(input_path: str, temp_dir: str = None) -> str:
         
         if preproc_mode == "vintage_tape":
             # OPTIMIZED FOR 1980s-1990s TAPE RECORDINGS IN LARGE ROOMS
-            # Addresses: tape hiss, room reverb, low-frequency rumble, dynamic range issues
+            # Filters run at source sample-rate for quality; output is 16 kHz mono for Whisper.
+            # lowpass=8000 preserves sibilants (s/t/f/th) that Whisper needs for accuracy.
+            # dialoguenhance removed — unavailable in many ffmpeg builds, marginal benefit.
+            # afftdn already handles tape hiss so we don't need an aggressive lowpass.
+            # apad=pad_dur=1.5 is sample-rate-independent (replaces pad_len=72000@48 kHz).
             afilters = (
                 "adelay=1500|1500,"           # 1.5s padding prevents start/end cutoff
-                "highpass=f=100,"              # Remove rumble and low-frequency noise (HVAC, tape motor)
-                "lowpass=f=7000,"              # Remove tape hiss above speech range
+                "highpass=f=100,"              # Remove rumble (HVAC, tape motor)
+                "lowpass=f=8000,"              # Remove hiss above speech range — keep consonant detail
                 "afftdn=nf=-25,"               # Adaptive noise reduction for tape hiss
-                "dialoguenhance=original=0.5:enhance=0.5,"  # Enhance speech clarity in reverberant rooms
                 "compand=attacks=0.3:decays=0.8:points=-80/-80|-45/-30|-20/-10|-10/-5|0/0,"  # Dynamic range compression
-                "loudnorm=I=-16:LRA=11:TP=-1.5,"  # Normalize loudness for consistent levels
-                "apad=pad_len=72000"           # Add 1.5s silence at end
+                "loudnorm=I=-16:LRA=11:TP=-1.5,"  # EBU R128 loudness normalization
+                "apad=pad_dur=1.5"             # 1.5s silence at end (sample-rate independent)
             )
-            print("🎙️  Using vintage tape preset: noise reduction + dialogue enhance + dynamics processing")
+            print("🎙️  Using vintage tape preset: noise reduction + dynamics processing")
         elif preproc_mode == "strong":
             # Strong filtering for extremely noisy sources
-            afilters = "adelay=1500|1500,highpass=f=80,lowpass=f=8000,afftdn=nf=-25,loudnorm,apad=pad_len=72000"
+            afilters = "adelay=1500|1500,highpass=f=80,lowpass=f=8000,afftdn=nf=-25,loudnorm,apad=pad_dur=1.5"
             print("🔊 Using strong noise reduction preset")
         elif preproc_mode == "minimal":
             # Minimal processing - just padding and normalization
-            afilters = "adelay=1200|1200,loudnorm,apad=pad_len=57600"
+            afilters = "adelay=1200|1200,loudnorm,apad=pad_dur=1.2"
             print("🎵 Using minimal processing preset")
         else:
             # Default to vintage tape for this use case
             afilters = (
                 "adelay=1500|1500,"
                 "highpass=f=100,"
-                "lowpass=f=7000,"
+                "lowpass=f=8000,"
                 "afftdn=nf=-25,"
-                "dialoguenhance=original=0.5:enhance=0.5,"
                 "compand=attacks=0.3:decays=0.8:points=-80/-80|-45/-30|-20/-10|-10/-5|0/0,"
                 "loudnorm=I=-16:LRA=11:TP=-1.5,"
-                "apad=pad_len=72000"
+                "apad=pad_dur=1.5"
             )
             print(f"🎙️  Using preset: {preproc_mode} (defaulting to vintage_tape)")
 
         # FFmpeg command to:
         # 1) Add silence padding to prevent start/end truncation (1.5s each side)
         # 2) Remove rumble and tape hiss with frequency filtering
-        # 3) Enhance dialogue clarity for room recordings
-        # 4) Apply dynamic range compression for tape volume variations
-        # 5) Normalize loudness for consistency
-        # 6) Convert to high-quality MP3 (320kbps, 48kHz)
+        # 3) Apply dynamic range compression for tape volume variations
+        # 4) Normalize loudness for consistency
+        # 5) Output 16 kHz mono WAV — exactly what Whisper expects, avoiding
+        #    redundant resample/decode inside the model's own ffmpeg call.
         cmd = [
             ffmpeg_cmd,
             "-i", input_path,
-            # Audio processing filters (selected above based on mode)
             "-af", afilters,
-            # High quality MP3 encoding
-            "-codec:a", "libmp3lame",
-            "-b:a", "320k",
-            "-ar", "48000",  # 48kHz sample rate preserves speech detail
-            "-ac", "2",      # Stereo output (maintains spatial cues if present)
+            # 16 kHz mono PCM — Whisper's native format (no lossy encode/decode)
+            "-ar", "16000",
+            "-ac", "1",
+            "-c:a", "pcm_s16le",
             # Overwrite output file
             "-y",
             temp_output
@@ -661,20 +662,31 @@ def _remove_prompt_artifacts(text: str) -> str:
     """Remove prompt text artifacts that sometimes appear in transcriptions.
     
     Whisper can accidentally transcribe the initial_prompt as actual speech,
-    especially phrases like "Maintain capitalization" which appear in our prompts.
-    This function aggressively removes these artifacts.
+    especially the punctuation primer or instruction phrases.
     """
     try:
-        # Phrases to completely remove (case-insensitive)
+        # 1) Remove the punctuation primer passage (or substrings of it)
+        _PRIMER_FRAGMENTS = [
+            # Full primer (may appear verbatim at start or end)
+            r"Now,?\s*as you know,?\s*we'?re looking at the biological basis or the biological "
+            r"manifestation of spiritual things,?\s*and this is something that requires careful "
+            r"attention because we need to understand how the invisible world of spirit connects "
+            r"with the visible world of matter\.?\s*",
+            # Shorter tail fragments that can leak at segment boundaries
+            r"the invisible world of spirit connects with the visible world of matter\.?\s*",
+            r"we'?re looking at the biological basis or the biological manifestation of spiritual things[,\.\s]*",
+        ]
+        for frag in _PRIMER_FRAGMENTS:
+            text = re.sub(frag, '', text, flags=re.IGNORECASE)
+
+        # 2) Remove old-style instruction prompt phrases
         artifact_phrases = [
             r'Maintain capitalization[,\s]*',
             r'maintain capitalization[,\s]*',
             r'Maintain capitalization or overuse these terms[,\.\s]*',
-            r'Do not force, repeat, or overuse these terms[,\.\s]*',
+            r'Do not force,?\s*repeat,?\s*or overuse these terms[,\.\s]*',
             r'otherwise ignore them[,\.\s]*',
         ]
-        
-        # Remove each artifact phrase globally
         for phrase_pattern in artifact_phrases:
             text = re.sub(phrase_pattern, '', text, flags=re.IGNORECASE)
         
@@ -2601,10 +2613,8 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
                 try:
                     from faster_whisper import WhisperModel  # type: ignore
                     
-                    # Enable HuggingFace Hub access for model downloads if needed
-                    if "HF_HUB_OFFLINE" in os.environ:
-                        print("📡 Enabling online model downloads (HF_HUB_OFFLINE=0)")
-                        os.environ["HF_HUB_OFFLINE"] = "0"
+                    # Ensure HF Hub is online so CTranslate2 models can be downloaded
+                    os.environ.pop("HF_HUB_OFFLINE", None)
                     
                 except Exception as fw_imp_e:
                     print(f"⚠️  faster-whisper import failed ({fw_imp_e}); falling back to native backend")
@@ -2679,8 +2689,29 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
                             print(f"⚠️  FW general error (compute_type={ctype}): {e_fw}")
                             continue
                 if not load_success and backend == "faster-whisper":
-                    print(f"⚠️  All faster-whisper attempts failed. Falling back to native Whisper.")
-                    backend = "native"
+                    print(f"⚠️  All faster-whisper GPU attempts failed. Retrying on CPU before giving up...")
+                    # Try FW on CPU rather than silently switching backend
+                    try:
+                        for ctype in compute_order:
+                            try:
+                                print(f"🔁 FW CPU attempt: compute_type={ctype}")
+                                fw_model = WhisperModel(selected_model_name, device="cpu", compute_type=ctype)
+                                model = fw_model
+                                using_fw = True
+                                load_success = True
+                                chosen_device = "cpu"
+                                device_name = f"CPU ({multiprocessing.cpu_count()} cores) [FW]"
+                                cache_key = f"faster-whisper:{selected_model_name}:cpu:{ctype}"
+                                _set_cached_model(cache_key, fw_model)
+                                print(f"⚠️  faster-whisper loaded on CPU (compute_type={ctype}) — GPU load failed")
+                                break
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
+                    if not load_success:
+                        print(f"⚠️  All faster-whisper attempts failed. Falling back to native Whisper.")
+                        backend = "native"
             else:
                 force_fp16_env = os.environ.get("TRANSCRIBE_FORCE_FP16", "").lower() in ("1","true","yes")
                 attempts = [
@@ -2754,10 +2785,22 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
                 print(f"⚠️  DirectML unavailable, falling back to CPU: {e}")
                 model = None
         if model is None:
-            chosen_device = "cpu"
-            device_name = f"CPU ({multiprocessing.cpu_count()} cores)"
-            print(f"🎯 Device: {device_name}")
-            model = whisper.load_model(selected_model_name, device="cpu")
+            # GPU paths exhausted — try native whisper on CUDA before giving up to CPU
+            if torch_api.cuda.is_available():
+                try:
+                    print("⚠️  All preferred loaders failed. Trying native Whisper on CUDA...")
+                    model = whisper.load_model(selected_model_name, device="cuda")
+                    chosen_device = "cuda"
+                    device_name = f"CUDA GPU ({torch_api.cuda.get_device_name(0)}) [native fallback]"
+                    print(f"🎯 Device: {device_name}")
+                except Exception as cuda_fb_e:
+                    print(f"⚠️  Native Whisper CUDA failed: {cuda_fb_e}")
+                    model = None
+            if model is None:
+                chosen_device = "cpu"
+                device_name = f"CPU ({multiprocessing.cpu_count()} cores)"
+                print(f"⚠️  ALL GPU ATTEMPTS FAILED — running on {device_name}")
+                model = whisper.load_model(selected_model_name, device="cpu")
     except Exception as load_e:
         print(f"❌ Model load failed on preferred device: {load_e}")
         print("🔄 Falling back to CPU...")
@@ -2767,7 +2810,6 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
             import whisper  # type: ignore
             model = whisper.load_model(selected_model_name, device="cpu")
         except Exception:
-            # Last resort
             model = whisper.load_model("large", device="cpu")
 
     # Apply explicit threads override if provided
@@ -2881,20 +2923,22 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
             if using_fw:
                 if quality_mode:
                     # HIGH QUALITY mode for Faster-Whisper (optimized for vintage tape recordings)
-                    transcribe_kwargs["beam_size"] = 10         # Maximum beam search for best quality
-                    transcribe_kwargs["best_of"] = 10           # Evaluate maximum candidates
-                    transcribe_kwargs["patience"] = 1.7         # Moderate patience - allows completion
+                    # beam=5 is Whisper's sweet spot — research shows diminishing returns above 5
+                    # and higher beams can favour shorter, less natural sequences.
+                    transcribe_kwargs["beam_size"] = 5
+                    transcribe_kwargs["best_of"] = 5
+                    transcribe_kwargs["patience"] = 1.2         # Generous without wasting time
                     transcribe_kwargs["temperature"] = 0.0      # Deterministic decoding
-                    transcribe_kwargs["no_speech_threshold"] = 0.5  # Balanced silence detection
-                    transcribe_kwargs["compression_ratio_threshold"] = 2.0  # Stricter - catches loops
+                    transcribe_kwargs["no_speech_threshold"] = 0.5
+                    transcribe_kwargs["compression_ratio_threshold"] = 2.0  # Stricter — catches loops
                     transcribe_kwargs["log_prob_threshold"] = -1.0  # Accept lower confidence for difficult audio
-                    # EXPERIMENT: Try condition_on_previous_text=True for better punctuation consistency
-                    # The stricter compression_ratio_threshold (2.0) should catch any loops
-                    transcribe_kwargs["condition_on_previous_text"] = True  # Maintains punctuation style across chunks
-                    transcribe_kwargs["vad_filter"] = False     # Disable VAD - we already preprocessed
-                    # Add word timestamps for better timing info
-                    transcribe_kwargs["word_timestamps"] = True
-                    print("🎯 FW QUALITY mode: beam=10, best_of=10, patience=1.7, condition_on_previous=True")
+                    # condition_on_previous_text=False prevents repetition feedback loops.
+                    # The initial_prompt punctuation primer already handles punctuation style.
+                    transcribe_kwargs["condition_on_previous_text"] = False
+                    transcribe_kwargs["vad_filter"] = False     # Already preprocessed
+                    transcribe_kwargs["word_timestamps"] = True # Better segment boundaries
+                    transcribe_kwargs["repetition_penalty"] = 1.1  # Subtle anti-loop guard
+                    print("🎯 FW QUALITY mode: beam=5, patience=1.2, repetition_penalty=1.1")
                 else:
                     # STANDARD mode for Faster-Whisper (fast and reliable)
                     transcribe_kwargs["beam_size"] = 5          # Good quality without slowdown
@@ -3259,19 +3303,32 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
     # Prosody analysis disabled - pure Whisper output is best
     # All attempts to modify sentence boundaries have introduced more errors than they fixed
 
-    # MINIMAL POST-PROCESSING - Pure Whisper output
-    # All text manipulation removed - only light cleanup and paragraphing
+    # MINIMAL POST-PROCESSING — Pure Whisper output
+    # Only light cleanup; paragraphing already done by _segments_to_paragraphs when segments exist.
     try:
-        # ONLY remove obvious music hallucinations (watermarks, etc.)
+        # Strip leaked initial-prompt / punctuation-primer text from output.
+        # Whisper sometimes echoes the prompt at segment boundaries or at the end.
+        full_text = _remove_prompt_artifacts(full_text)
+
+        # Remove obvious music hallucinations (watermarks, etc.)
         full_text, music_removed = _remove_music_hallucinations(full_text)
         if music_removed:
             print(f"🎵 Removed {music_removed} music/hallucination pattern(s)")
-        
-        # SIMPLE CHARACTER-BASED PARAGRAPHING - no text modification
-        print("📝 Applying simple paragraph formatting...")
-        formatted = split_into_paragraphs(full_text, max_length=500)
-        formatted_text = "\n\n".join(formatted) if isinstance(formatted, list) else full_text
-        
+
+        # Paragraph formatting:
+        # If _segments_to_paragraphs already ran (timestamp-based), the text already
+        # contains \n\n paragraph breaks. Calling split_into_paragraphs again would
+        # merge/re-split those boundaries using heuristic rules, losing timing info.
+        # Only fall back to the text-based splitter when we have no segment data.
+        has_timestamp_paragraphs = "\n\n" in full_text
+        if has_timestamp_paragraphs:
+            formatted_text = full_text
+            print("📝 Using timestamp-based paragraph formatting (from segment gaps)")
+        else:
+            print("📝 Applying text-based paragraph formatting (no segment data)...")
+            formatted = split_into_paragraphs(full_text, max_length=500)
+            formatted_text = "\n\n".join(formatted) if isinstance(formatted, list) else full_text
+
         quality_stats = {"paragraphs": True, "music_hallucinations_removed": music_removed}
         print("✅ Paragraph formatting completed")
     except Exception as e:

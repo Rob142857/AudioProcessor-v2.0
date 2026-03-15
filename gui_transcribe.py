@@ -1,4 +1,4 @@
-"""Speech-to-Text Transcription Tool
+"""AudioProcessor v2.0 — Speech-to-Text Transcription Tool
 
 Clean GUI for converting audio/video to text using Whisper AI.
   - Faster-Whisper large-v3 (GPU, CTranslate2 int8) -- recommended
@@ -162,7 +162,7 @@ class _QueueWriter:
 # ═══════════════════════════════════════════════════════════════════
 def launch_gui():
     root = tk.Tk()
-    root.title("Speech-to-Text Transcription")
+    root.title("AudioProcessor v2.0 — Speech-to-Text")
     root.geometry("1060x760")
     root.minsize(900, 640)
     root.configure(bg=BG)
