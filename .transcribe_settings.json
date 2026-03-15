@@ -154,6 +154,14 @@
     },
     "C:/Users/RobertEvans/OneDrive - RME Solutions Technology": {
       "domain_terms_file": "C:/Users/RobertEvans/Downloads/AudioProcessorAlphaVersion/special_words.txt"
+    },
+    "C:/Users/RobertEvans/Downloads/wednesdaygroup/1985 MW": {
+      "whisper_model": "faster-whisper-large-v3",
+      "recursive": 0,
+      "quality_mode": 1,
+      "replace_mode": "all",
+      "replace_before_date": "2026-03-15"
     }
-  }
+  },
+  "last_folder": "C:/Users/RobertEvans/Downloads/wednesdaygroup/1985 MW"
 }
