@@ -358,11 +358,12 @@ def main():
     def runner():
         p = args.input
         if os.path.isdir(p):
-            files = [
-                os.path.join(p, n) for n in sorted(os.listdir(p))
-                if os.path.isfile(os.path.join(p, n))
-                and os.path.splitext(n)[1].lower() in SUPPORTED_EXTS
-            ]
+            files = sorted(
+                os.path.join(root, f)
+                for root, _dirs, fnames in os.walk(p)
+                for f in fnames
+                if os.path.splitext(f)[1].lower() in SUPPORTED_EXTS
+            )
             if files:
                 _run_batch(files, q, threads=args.threads)
             else:

@@ -506,20 +506,9 @@ def transcribe_file(input_path, model_name="large", preprocess=True, keep_temp=F
         full_text = clean_fillers(full_text)
 
         # Determine output directory and base filename  
-        if output_dir:
-            # Use the specified output directory
-            output_base = os.path.join(output_dir, os.path.splitext(os.path.basename(input_path))[0])
-        else:
-            # Use Downloads folder as default
-            downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
-            output_base = os.path.join(downloads_dir, os.path.splitext(os.path.basename(input_path))[0])
-
-        # Save transcription as text file
-        out_txt_path = output_base + "_transcription.txt"
-        with open(out_txt_path, "w", encoding="utf-8") as f:
-            f.write(full_text)
-        print(f"Transcription saved to {out_txt_path}")
-        log_outputs.append(os.path.abspath(out_txt_path))
+        if not output_dir:
+            output_dir = os.path.dirname(os.path.abspath(input_path))
+        output_base = os.path.join(output_dir, os.path.splitext(os.path.basename(input_path))[0])
 
         doc = Document()
         doc.add_heading("Transcription", 0)
@@ -541,7 +530,7 @@ def transcribe_file(input_path, model_name="large", preprocess=True, keep_temp=F
         orig_base = os.path.splitext(os.path.basename(input_path))[0]
         log_name = f"{orig_base}_transcription_log.txt"
         # prefer writing next to project folder or same dir as output
-        log_dir = os.path.dirname(os.path.abspath(out_txt_path)) if out_txt_path else os.path.dirname(os.path.abspath(input_path))
+        log_dir = os.path.dirname(os.path.abspath(out_docx))
         log_path = os.path.join(log_dir, log_name)
         
         # Convert paths to forward slashes for readability
@@ -841,20 +830,9 @@ def transcribe_file_no_vad(input_path, model_name="large", preprocess=True, keep
         full_text = clean_fillers(full_text)
 
         # Determine output directory and base filename  
-        if output_dir:
-            # Use the specified output directory
-            output_base = os.path.join(output_dir, os.path.splitext(os.path.basename(input_path))[0])
-        else:
-            # Use Downloads folder as default
-            downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
-            output_base = os.path.join(downloads_dir, os.path.splitext(os.path.basename(input_path))[0])
-
-        # Save transcription as text file
-        out_txt_path = output_base + "_no_vad_transcription.txt"
-        with open(out_txt_path, "w", encoding="utf-8") as f:
-            f.write(full_text)
-        print(f"Transcription saved to {out_txt_path}")
-        log_outputs.append(os.path.abspath(out_txt_path))
+        if not output_dir:
+            output_dir = os.path.dirname(os.path.abspath(input_path))
+        output_base = os.path.join(output_dir, os.path.splitext(os.path.basename(input_path))[0])
 
         doc = Document()
         doc.add_heading("Transcription (No VAD)", 0)
@@ -871,7 +849,7 @@ def transcribe_file_no_vad(input_path, model_name="large", preprocess=True, keep
         # write log file next to the output txt
         orig_base = os.path.splitext(os.path.basename(input_path))[0]
         log_name = f"{orig_base}_no_vad_transcription_log.txt"
-        log_dir = os.path.dirname(os.path.abspath(out_txt_path))
+        log_dir = os.path.dirname(os.path.abspath(out_docx))
         log_path = os.path.join(log_dir, log_name)
         
         # Convert paths to forward slashes for readability
@@ -1228,20 +1206,9 @@ def transcribe_lecture(input_path, model_name="large", preprocess=True, keep_tem
         full_text = clean_fillers_lecture(full_text)
 
         # Determine output directory and base filename
-        if output_dir:
-            # Use the specified output directory
-            output_base = os.path.join(output_dir, os.path.splitext(os.path.basename(input_path))[0])
-        else:
-            # Use Downloads folder as default
-            downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
-            output_base = os.path.join(downloads_dir, os.path.splitext(os.path.basename(input_path))[0])
-
-        # Save transcription as text file
-        out_txt_path = output_base + "_lecture_transcription.txt"
-        with open(out_txt_path, "w", encoding="utf-8") as f:
-            f.write(full_text)
-        print(f"Lecture transcription saved to {out_txt_path}")
-        log_outputs.append(os.path.abspath(out_txt_path))
+        if not output_dir:
+            output_dir = os.path.dirname(os.path.abspath(input_path))
+        output_base = os.path.join(output_dir, os.path.splitext(os.path.basename(input_path))[0])
 
         doc = Document()
         doc.add_heading("Lecture Transcription", 0)
@@ -1269,7 +1236,7 @@ def transcribe_lecture(input_path, model_name="large", preprocess=True, keep_tem
         # Write log file
         orig_base = os.path.splitext(os.path.basename(input_path))[0]
         log_name = f"{orig_base}_lecture_transcription_log.txt"
-        log_dir = os.path.dirname(os.path.abspath(out_txt_path)) if out_txt_path else os.path.dirname(os.path.abspath(input_path))
+        log_dir = os.path.dirname(os.path.abspath(out_docx))
         log_path = os.path.join(log_dir, log_name)
 
         # Convert paths to forward slashes for readability

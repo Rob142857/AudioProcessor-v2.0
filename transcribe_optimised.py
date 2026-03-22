@@ -1298,7 +1298,7 @@ def transcribe_with_dataset_optimization(input_path: str, output_dir=None, threa
     config = get_maximum_hardware_config(max_perf=max_perf)
 
     if not output_dir:
-        output_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+        output_dir = os.path.dirname(os.path.abspath(input_path))
 
     duration = get_media_duration(working_input_path)
     if duration:
@@ -3346,18 +3346,6 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
     # Quality report goes to Temp folder
     quality_path = os.path.join(temp_folder, f"{base_name}_quality_report.json")
     
-    # Save intermediate TXT file next to source audio (for debugging and backup)
-    txt_path = None
-    try:
-        from pathlib import Path
-        source_path = Path(input_path)
-        txt_path = source_path.with_suffix(".txt")
-        with open(txt_path, "w", encoding="utf-8") as txt_file:
-            txt_file.write(formatted_text)
-        print(f"📝 Intermediate TXT saved: {txt_path}")
-    except Exception as txt_err:
-        print(f"⚠️  Failed to save TXT file: {txt_err}")
-
     # Generate DOCX directly next to the source audio file
     docx_path = None
     elapsed = time.time() - start_time
