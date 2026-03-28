@@ -94,8 +94,10 @@ class SettingsPanel(tk.Frame):
     """All transcription settings in a compact card."""
 
     MODEL_OPTIONS = [
-        ("faster-whisper-large-v3",       "Faster-Whisper Large-v3  (GPU, best quality)"),
-        ("faster-whisper-large-v3-turbo", "Faster-Whisper Large-v3-turbo  (GPU, 2x faster)"),
+        ("faster-whisper-large-v3",       "Faster-Whisper Large-v3  (GPU 4GB+, best quality)"),
+        ("faster-whisper-large-v3-turbo", "Faster-Whisper Large-v3-turbo  (GPU 4GB+, 2x faster)"),
+        ("faster-whisper-medium",         "Faster-Whisper Medium  (GPU 2GB+, good quality)"),
+        ("faster-whisper-small",          "Faster-Whisper Small  (GPU 1GB+, fast)"),
         ("large-v3",                      "Native Whisper Large-v3  (GPU / CPU fallback)"),
     ]
 

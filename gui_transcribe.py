@@ -287,10 +287,18 @@ def launch_gui():
 
     def clear_cache():
         gc.collect()
+        gc.collect()  # second pass for cyclic references
         try:
             import torch
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                torch.cuda.reset_peak_memory_stats()
+                try:
+                    torch.cuda.ipc_collect()
+                except Exception:
+                    pass
+                torch.cuda.empty_cache()  # reclaim after ipc_collect
         except Exception:
             pass
         log.append("Cache cleared.\n")

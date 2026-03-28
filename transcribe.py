@@ -560,11 +560,21 @@ def transcribe_file(input_path, model_name="large", preprocess=True, keep_temp=F
 
         # Memory cleanup between files to prevent accumulation
         print("🧹 Cleaning up memory and GPU cache...")
+        import gc
+        gc.collect()
+        gc.collect()  # second pass for cyclic references
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
-        import gc
-        gc.collect()
+            try:
+                torch.cuda.reset_peak_memory_stats()
+            except Exception:
+                pass
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+            torch.cuda.empty_cache()  # reclaim after ipc_collect
         
         # Monitor memory after cleanup
         import psutil
@@ -572,7 +582,8 @@ def transcribe_file(input_path, model_name="large", preprocess=True, keep_temp=F
         if torch.cuda.is_available():
             try:
                 gpu_memory_after = torch.cuda.memory_allocated() / (1024**3)
-                print(f"📊 Memory after cleanup: RAM {memory_after.available / (1024**3):.1f}GB available, GPU {gpu_memory_after:.1f}GB used")
+                gpu_reserved = torch.cuda.memory_reserved() / (1024**3)
+                print(f"📊 Memory after cleanup: RAM {memory_after.available / (1024**3):.1f}GB available, GPU {gpu_memory_after:.1f}GB allocated / {gpu_reserved:.1f}GB reserved")
             except:
                 print(f"📊 Memory after cleanup: RAM {memory_after.available / (1024**3):.1f}GB available")
         else:
@@ -879,11 +890,21 @@ def transcribe_file_no_vad(input_path, model_name="large", preprocess=True, keep
 
         # Memory cleanup between files to prevent accumulation
         print("🧹 Cleaning up memory and GPU cache...")
+        import gc
+        gc.collect()
+        gc.collect()  # second pass for cyclic references
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
-        import gc
-        gc.collect()
+            try:
+                torch.cuda.reset_peak_memory_stats()
+            except Exception:
+                pass
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+            torch.cuda.empty_cache()  # reclaim after ipc_collect
         
         # Monitor memory after cleanup
         import psutil
@@ -891,7 +912,8 @@ def transcribe_file_no_vad(input_path, model_name="large", preprocess=True, keep
         if torch.cuda.is_available():
             try:
                 gpu_memory_after = torch.cuda.memory_allocated() / (1024**3)
-                print(f"📊 Memory after cleanup: RAM {memory_after.available / (1024**3):.1f}GB available, GPU {gpu_memory_after:.1f}GB used")
+                gpu_reserved = torch.cuda.memory_reserved() / (1024**3)
+                print(f"📊 Memory after cleanup: RAM {memory_after.available / (1024**3):.1f}GB available, GPU {gpu_memory_after:.1f}GB allocated / {gpu_reserved:.1f}GB reserved")
             except:
                 print(f"📊 Memory after cleanup: RAM {memory_after.available / (1024**3):.1f}GB available")
         else:
@@ -1268,11 +1290,21 @@ def transcribe_lecture(input_path, model_name="large", preprocess=True, keep_tem
 
         # Memory cleanup between files to prevent accumulation
         print("🧹 Cleaning up memory and GPU cache...")
+        import gc
+        gc.collect()
+        gc.collect()  # second pass for cyclic references
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
-        import gc
-        gc.collect()
+            try:
+                torch.cuda.reset_peak_memory_stats()
+            except Exception:
+                pass
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+            torch.cuda.empty_cache()  # reclaim after ipc_collect
         
         # Monitor memory after cleanup
         import psutil
@@ -1280,7 +1312,8 @@ def transcribe_lecture(input_path, model_name="large", preprocess=True, keep_tem
         if torch.cuda.is_available():
             try:
                 gpu_memory_after = torch.cuda.memory_allocated() / (1024**3)
-                print(f"📊 Memory after cleanup: RAM {memory_after.available / (1024**3):.1f}GB available, GPU {gpu_memory_after:.1f}GB used")
+                gpu_reserved = torch.cuda.memory_reserved() / (1024**3)
+                print(f"📊 Memory after cleanup: RAM {memory_after.available / (1024**3):.1f}GB available, GPU {gpu_memory_after:.1f}GB allocated / {gpu_reserved:.1f}GB reserved")
             except:
                 print(f"📊 Memory after cleanup: RAM {memory_after.available / (1024**3):.1f}GB available")
         else:

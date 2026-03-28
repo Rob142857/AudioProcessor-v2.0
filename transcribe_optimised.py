@@ -45,13 +45,25 @@ def _set_cached_model(cache_key: str, model: Any) -> None:
 def _clear_model_cache() -> None:
     """Clear all cached models (call on shutdown or model change)."""
     with _MODEL_CACHE_LOCK:
+        for key in list(_MODEL_CACHE.keys()):
+            try:
+                del _MODEL_CACHE[key]
+            except Exception:
+                pass
         _MODEL_CACHE.clear()
     gc.collect()
+    gc.collect()  # second pass for cyclic references
     try:
         import torch
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    except:
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+    except Exception:
         pass
 
 def log_gpu_memory_status(context=""):
@@ -1936,6 +1948,10 @@ def adjust_workers_for_model(config, model_name):
 
 def force_gpu_memory_cleanup():
     """Clear GPU caches and model-related module caches without touching torch modules."""
+    # First pass: Python-level cleanup to release model references
+    gc.collect()
+    gc.collect()  # second pass for cyclic references
+
     try:
         _ensure_torch_available()
         torch_api = cast(Any, torch)
@@ -1945,13 +1961,23 @@ def force_gpu_memory_cleanup():
                 torch_api.cuda.synchronize()
             except Exception:
                 pass
+            try:
+                torch_api.cuda.reset_peak_memory_stats()
+            except Exception:
+                pass
+            try:
+                torch_api.cuda.ipc_collect()
+            except Exception:
+                pass
+            # Second empty_cache after ipc_collect can reclaim additional memory
+            torch_api.cuda.empty_cache()
     except Exception as e:
         print(f"⚠️  GPU cache clear warning: {e}")
 
-    # Clear whisper/transformers modules only (keeps torch intact)
+    # Clear whisper/transformers/ctranslate2 modules only (keeps torch intact)
     to_clear = [
         name for name in list(sys.modules.keys())
-        if name.startswith(("whisper", "transformers"))
+        if name.startswith(("whisper", "transformers", "ctranslate2"))
     ]
     for name in to_clear:
         try:
@@ -2514,20 +2540,38 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
             # AGGRESSIVE VRAM CLEARING before model load
             print("🧹 Clearing VRAM before model load...")
             try:
+                # 1. Clear any previously cached models first
+                _clear_model_cache()
+
+                # 2. Release PyTorch CUDA caches
                 torch_api.cuda.empty_cache()
                 torch_api.cuda.synchronize()
                 torch_api.cuda.reset_peak_memory_stats()
                 torch_api.cuda.reset_accumulated_memory_stats()
+
+                # 3. Release IPC memory (shared-memory tensors from other processes)
+                try:
+                    torch_api.cuda.ipc_collect()
+                except Exception:
+                    pass
+
+                # 4. Python GC to drop dangling model/tensor references
                 import gc
                 gc.collect()
-                gc.collect()  # Run twice for cyclic references
-                torch_api.cuda.empty_cache()  # Clear again after gc
+                gc.collect()  # second pass for cyclic references
+
+                # 5. Final empty_cache after GC released references
+                torch_api.cuda.empty_cache()
+                torch_api.cuda.synchronize()
+
                 try:
                     used_vram = torch_api.cuda.memory_allocated() / (1024**3)
+                    reserved_vram = torch_api.cuda.memory_reserved() / (1024**3)
                     total_vram = float(config.get("cuda_total_vram_gb") or 0.0)
-                    free_est = max(0.0, total_vram - used_vram)
+                    free_est = max(0.0, total_vram - reserved_vram)
                     print(f"📊 VRAM cleared: {free_est:.2f}GB free / {total_vram:.2f}GB total")
-                except:
+                    print(f"   Allocated: {used_vram:.3f}GB  Reserved: {reserved_vram:.3f}GB")
+                except Exception:
                     print("✅ VRAM cleared successfully")
             except Exception as clear_e:
                 print(f"⚠️  VRAM clear warning: {clear_e}")
@@ -2605,6 +2649,22 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
                 backend = "faster-whisper"
                 print(f"🚀 Auto-switching to faster-whisper backend for {selected_model_name} on {total_vram:.1f}GB GPU")
                 print(f"   Benefits: 50% less VRAM usage, 4x faster inference, same quality")
+
+            # Auto-downgrade model for very low VRAM GPUs to avoid OOM
+            # faster-whisper int8 approximate VRAM: large ~3.1GB, medium ~1.5GB, small ~0.9GB
+            if total_vram > 0 and selected_model_name in ["large-v3", "large-v3-turbo", "large"]:
+                if total_vram <= 2.5:
+                    old_model = selected_model_name
+                    selected_model_name = "small"
+                    backend = "faster-whisper"
+                    print(f"⚠️  GPU has only {total_vram:.1f}GB VRAM — auto-downgrading '{old_model}' → 'small' to fit in VRAM")
+                    print(f"   Tip: Select 'Faster-Whisper Medium' or 'Small' in the GUI for low-VRAM GPUs")
+                elif total_vram <= 4.0:
+                    old_model = selected_model_name
+                    selected_model_name = "medium"
+                    backend = "faster-whisper"
+                    print(f"⚠️  GPU has only {total_vram:.1f}GB VRAM — auto-downgrading '{old_model}' → 'medium' to fit in VRAM")
+                    print(f"   Tip: Select 'Faster-Whisper Medium' in the GUI for this GPU")
             
             using_fw = False
             

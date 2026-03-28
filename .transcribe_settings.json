@@ -161,7 +161,14 @@
       "quality_mode": 1,
       "replace_mode": "all",
       "replace_before_date": "2026-03-15"
+    },
+    "D:/Misc Audio/ABC": {
+      "whisper_model": "faster-whisper-medium",
+      "recursive": 0,
+      "quality_mode": 1,
+      "replace_mode": "all",
+      "replace_before_date": "2026-03-15"
     }
   },
-  "last_folder": "C:/Users/RobertEvans/Downloads/wednesdaygroup/1985 MW"
+  "last_folder": "D:/Misc Audio/ABC"
 }
