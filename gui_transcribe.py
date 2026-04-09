@@ -81,6 +81,10 @@ def _run_single(path: str, outdir: Optional[str], q: queue.Queue,
         else:
             q.put("Warning: no output generated.\n")
     except Exception as e:
+        # Check if this was a stop request (don't print traceback for user-initiated stops)
+        if STOP_FLAG.is_set() or "Stop requested" in str(e):
+            q.put("Stopped.\n")
+            return
         import traceback
         q.put(f"Error: {e}\n{traceback.format_exc()}")
 
@@ -220,6 +224,12 @@ def launch_gui():
         run_btn.configure(state="disabled")
         stop_btn.configure(state="normal")
         STOP_FLAG.clear()
+        # Also reset the engine's internal stop event
+        try:
+            from transcribe_optimised import clear_stop
+            clear_stop()
+        except Exception:
+            pass
 
         snap = settings_panel.snapshot()
 
@@ -271,8 +281,12 @@ def launch_gui():
                         q.put("Output already exists (skipped).\n")
                 q.put("\nDone.\n")
             except Exception as e:
-                import traceback
-                q.put(f"Error: {e}\n{traceback.format_exc()}")
+                # Clean message for user-initiated stops (no traceback)
+                if STOP_FLAG.is_set() or "Stop requested" in str(e):
+                    q.put("\nStopped by user.\n")
+                else:
+                    import traceback
+                    q.put(f"Error: {e}\n{traceback.format_exc()}")
             finally:
                 sys.stdout, sys.stderr = old_out, old_err
                 root.after(0, lambda: run_btn.configure(state="normal"))
@@ -282,10 +296,22 @@ def launch_gui():
 
     def stop():
         STOP_FLAG.set()
+        # Also signal the engine's internal stop event for mid-transcription abort
+        try:
+            from transcribe_optimised import request_stop
+            request_stop()
+        except Exception:
+            pass
         stop_btn.configure(state="disabled")
-        log.append("\nStopping...\n")
+        log.append("\nStopping — forcing immediate halt...\n")
 
     def clear_cache():
+        # Clear cached model objects (frees VRAM without requiring re-download)
+        try:
+            from transcribe_optimised import _clear_model_cache
+            _clear_model_cache()
+        except Exception:
+            pass
         gc.collect()
         gc.collect()  # second pass for cyclic references
         try:
@@ -301,7 +327,7 @@ def launch_gui():
                 torch.cuda.empty_cache()  # reclaim after ipc_collect
         except Exception:
             pass
-        log.append("Cache cleared.\n")
+        log.append("Model unloaded & GPU cache cleared.\n")
 
     run_btn = _styled_btn(btn_bar, "  Start Transcription", start,
                           font=FONT_LG, bg=ACCENT)

@@ -48,8 +48,8 @@
       "whisper_model": "faster-whisper-distil-large-v3",
       "recursive": 1,
       "quality_mode": 1,
-      "replace_mode": "all",
-      "replace_before_date": "2026-01-09"
+      "replace_mode": "before",
+      "replace_before_date": "2026-04-06"
     },
     "C:/Users/RobertEvans/OneDrive - RME Solutions Technology/_PG Completed Recordings 84-97/1988 MW": {
       "domain_terms_file": "C:\\Users\\RobertEvans\\Downloads\\AudioProcessorAlphaVersion\\special_words.txt",

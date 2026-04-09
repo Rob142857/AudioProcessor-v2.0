@@ -26,6 +26,23 @@ import multiprocessing
 import threading
 from typing import Any, cast, Optional, Dict
 
+# === STOP EVENT ===
+# Set this event from the GUI / caller to request immediate cancellation of the
+# current transcription.  Checked in tight loops (segment iteration, wait loop).
+_STOP_EVENT = threading.Event()
+
+def request_stop():
+    """Signal the engine to abandon the current transcription immediately."""
+    _STOP_EVENT.set()
+
+def clear_stop():
+    """Reset the stop flag (call before starting a new transcription)."""
+    _STOP_EVENT.clear()
+
+class _StopRequested(Exception):
+    """Raised internally when a stop is requested mid-transcription."""
+    pass
+
 # === MODEL CACHE ===
 # Cache loaded models to avoid expensive reload on each file in batch processing.
 # This prevents GPU memory fragmentation and hangs from repeated CTranslate2 init.
@@ -235,12 +252,18 @@ def _as_result_dict(res: Any) -> Dict[str, Any]:
             parts = []
             try:
                 for s in segments_iter or []:
+                    # Check for stop request between segments (fast-path abort)
+                    if _STOP_EVENT.is_set():
+                        print("\n\u26d4 Stop requested — aborting segment iteration")
+                        raise _StopRequested("Stop requested by user")
                     txt = (getattr(s, 'text', '') or '').strip()
                     start = float(getattr(s, 'start', 0.0) or 0.0)
                     end = float(getattr(s, 'end', 0.0) or 0.0)
                     if txt:
                         seg_list.append({'text': txt, 'start': start, 'end': end})
                         parts.append(txt)
+            except _StopRequested:
+                raise
             except Exception:
                 pass
             out: Dict[str, Any] = {
@@ -1967,10 +1990,13 @@ def force_gpu_memory_cleanup():
     except Exception as e:
         print(f"⚠️  GPU cache clear warning: {e}")
 
-    # Clear whisper/transformers/ctranslate2 modules only (keeps torch intact)
+    # Clear whisper/transformers module caches only (keeps torch & ctranslate2 intact).
+    # NOTE: Do NOT clear ctranslate2 or faster_whisper — doing so destabilises
+    # cached faster-whisper model objects and forces expensive reloads.
     to_clear = [
         name for name in list(sys.modules.keys())
-        if name.startswith(("whisper", "transformers", "ctranslate2"))
+        if name.startswith(("whisper",)) and not name.startswith("whisper_")  # openai-whisper only
+        or name.startswith(("transformers",))
     ]
     for name in to_clear:
         try:
@@ -2530,13 +2556,15 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
             device_name = f"CUDA GPU ({torch_api.cuda.get_device_name(0)})"
             print("🎯 Device: CUDA GPU")
             
-            # AGGRESSIVE VRAM CLEARING before model load
+            # VRAM CLEARING before model load (preserves cached models)
             print("🧹 Clearing VRAM before model load...")
             try:
-                # 1. Clear any previously cached models first
-                _clear_model_cache()
+                # NOTE: Do NOT call _clear_model_cache() here — destroying a
+                # cached model forces an expensive (~8 s) reload for every file
+                # in a batch and increases OOM risk during re-allocation.
+                # The cache check later will reuse a valid cached model.
 
-                # 2. Release PyTorch CUDA caches
+                # Release PyTorch CUDA caches (does not affect CTranslate2)
                 torch_api.cuda.empty_cache()
                 torch_api.cuda.synchronize()
                 torch_api.cuda.reset_peak_memory_stats()
@@ -2674,6 +2702,21 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
                     backend = "native"
                     
             if backend == "faster-whisper":
+                # Log actual free VRAM before loading (CTranslate2 uses CUDA directly, not PyTorch)
+                try:
+                    import subprocess as _sp
+                    _nvsmi = _sp.run(
+                        ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+                        capture_output=True, text=True, timeout=3,
+                    )
+                    if _nvsmi.returncode == 0:
+                        _free_mb = float(_nvsmi.stdout.strip())
+                        print(f"📊 Free VRAM before model load: {_free_mb:.0f} MB")
+                        if _free_mb < 2048:
+                            print(f"⚠️  Low free VRAM ({_free_mb:.0f} MB) — GPU load may fail")
+                except Exception:
+                    pass
+
                 # Determine optimal compute type based on GPU architecture
                 try:
                     capability = torch_api.cuda.get_device_capability(0)
@@ -2838,17 +2881,46 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
                 print(f"⚠️  DirectML unavailable, falling back to CPU: {e}")
                 model = None
         if model is None:
-            # GPU paths exhausted — try native whisper on CUDA before giving up to CPU
+            # GPU paths exhausted — try progressively lighter GPU loads before CPU
             if torch_api.cuda.is_available():
+                # Log actual free VRAM for diagnostics
                 try:
-                    print("⚠️  All preferred loaders failed. Trying native Whisper on CUDA...")
-                    model = whisper.load_model(selected_model_name, device="cuda")
+                    import subprocess as _sp
+                    _nvsmi = _sp.run(
+                        ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+                        capture_output=True, text=True, timeout=3,
+                    )
+                    if _nvsmi.returncode == 0:
+                        _free_mb = float(_nvsmi.stdout.strip())
+                        print(f"📊 Actual free VRAM: {_free_mb:.0f} MB")
+                except Exception:
+                    pass
+
+                # 1) Try faster-whisper int8 on CUDA (lowest VRAM footprint)
+                try:
+                    from faster_whisper import WhisperModel as _FWModel
+                    os.environ.pop("HF_HUB_OFFLINE", None)
+                    print("⚠️  All preferred loaders failed. Trying faster-whisper int8 on CUDA...")
+                    model = _FWModel(selected_model_name, device="cuda", compute_type="int8")
+                    using_fw = True
                     chosen_device = "cuda"
-                    device_name = f"CUDA GPU ({torch_api.cuda.get_device_name(0)}) [native fallback]"
+                    device_name = f"CUDA GPU ({torch_api.cuda.get_device_name(0)}) [FW int8 fallback]"
                     print(f"🎯 Device: {device_name}")
-                except Exception as cuda_fb_e:
-                    print(f"⚠️  Native Whisper CUDA failed: {cuda_fb_e}")
+                except Exception as fw_fb_e:
+                    print(f"⚠️  Faster-whisper int8 CUDA fallback failed: {fw_fb_e}")
                     model = None
+
+                # 2) Try native whisper on CUDA (heavier, needs more VRAM)
+                if model is None:
+                    try:
+                        print("⚠️  Trying native Whisper on CUDA...")
+                        model = whisper.load_model(selected_model_name, device="cuda")
+                        chosen_device = "cuda"
+                        device_name = f"CUDA GPU ({torch_api.cuda.get_device_name(0)}) [native fallback]"
+                        print(f"🎯 Device: {device_name}")
+                    except Exception as cuda_fb_e:
+                        print(f"⚠️  Native Whisper CUDA failed: {cuda_fb_e}")
+                        model = None
             if model is None:
                 chosen_device = "cpu"
                 device_name = f"CPU ({multiprocessing.cpu_count()} cores)"
@@ -3051,6 +3123,8 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
             try:
                 result = _compatible_transcribe_call(model, working_input_path, transcribe_kwargs)
                 log_gpu_memory_status("after transcription call")
+            except _StopRequested:
+                raise
             except RuntimeError as rt_e:
                 if "CUDA out of memory" in str(rt_e) or "OOM" in str(rt_e):
                     print(f"❌ CUDA OUT OF MEMORY during transcription: {rt_e}")
@@ -3156,9 +3230,14 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
                             transcription_result = cpu_res if isinstance(cpu_res, dict) else _as_result_dict(cpu_res)
                         except Exception as cpu_e:
                             print(f"❌ Native CPU fallback failed: {cpu_e}")
+            except _StopRequested:
+                raise
             except Exception as dbg_e:
                 print(f"⚠️  Debug/Retry flow error: {dbg_e}")
             print("✅ Whisper transcription completed successfully")
+        except _StopRequested:
+            print("⛔ Transcription stopped by user")
+            transcription_error = _StopRequested("Stop requested by user")
         except Exception as e:
             transcription_error = e
         finally:
@@ -3177,6 +3256,11 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
     status_interval = 10  # Update status every 10 seconds
 
     while not transcription_complete:
+        # Check for external stop request so we don't block forever
+        if _STOP_EVENT.is_set():
+            print("\n\u26d4 Stop requested — abandoning transcription wait")
+            # The daemon thread will die when the function returns
+            raise _StopRequested("Stop requested by user")
         time.sleep(2)
         elapsed = time.time() - start_watch
         
