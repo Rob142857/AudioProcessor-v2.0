@@ -1763,14 +1763,7 @@ def transcribe_with_dataset_optimization(input_path: str, output_dir=None, threa
         formatted_text = full_text
 
     # Save files - DOCX only, next to source file
-    base_name = os.path.splitext(os.path.basename(input_path))[0]
-    
-    # Create Temp folder only for quality report
-    source_dir = os.path.dirname(input_path)
-    temp_folder = os.path.join(source_dir, "Temp")
-    os.makedirs(temp_folder, exist_ok=True)
-    
-    # We no longer save TXT file
+    # We no longer save TXT or quality report sidecar files.
     txt_path = None
 
     # Generate DOCX directly next to the source audio file
@@ -3396,16 +3389,6 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
         formatted_text = full_text
         quality_stats = {}
 
-    base_name = os.path.splitext(os.path.basename(input_path))[0]
-    
-    # Create Temp folder in the same directory as the source audio file (for quality report only)
-    source_dir = os.path.dirname(input_path)
-    temp_folder = os.path.join(source_dir, "Temp")
-    os.makedirs(temp_folder, exist_ok=True)
-    
-    # Quality report goes to Temp folder
-    quality_path = os.path.join(temp_folder, f"{base_name}_quality_report.json")
-    
     # Generate DOCX directly next to the source audio file
     docx_path = None
     elapsed = time.time() - start_time
@@ -3437,14 +3420,6 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
     if docx_path:
         print(f"📄 DOCX file: {docx_path}")
     print(f"⏱️  Total time: {format_duration(elapsed)}")
-    try:
-        base_quality = _summarize_quality(formatted_text, {"pipeline": quality_stats})
-        with open(quality_path, "w", encoding="utf-8") as qf:
-            json.dump(base_quality, qf, indent=2)
-        print(f"📊 Quality report saved: {quality_path}")
-    except Exception as qerr:
-        print(f"⚠️  Failed to save quality report: {qerr}")
-
     # Cleanup caches (do not touch torch modules)
     force_gpu_memory_cleanup()
 

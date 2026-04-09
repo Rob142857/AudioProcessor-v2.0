@@ -22,12 +22,11 @@
       "initial_prompt": ""
     },
     "C:/Users/RobertEvans/OneDrive - RME Solutions Technology/_PG Completed Recordings 84-97/1985 MW": {
-      "domain_terms_file": "c:\\Users\\RobertEvans\\Downloads\\AudioProcessorAlphaVersion\\awkward_words.txt",
+      "whisper_model": "faster-whisper-large-v3",
       "recursive": 0,
-      "skip_existing": 1,
-      "time_header": 1,
       "quality_mode": 1,
-      "max_repeat_cap": 3
+      "replace_mode": "all",
+      "replace_before_date": "2026-03-15"
     },
     "C:/Users/RobertEvans/OneDrive - RME Solutions Technology/_PG Completed Recordings 84-97/1986 MW": {
       "domain_terms_file": "c:\\Users\\RobertEvans\\Downloads\\AudioProcessorAlphaVersion\\awkward_words.txt",
@@ -46,19 +45,11 @@
       "max_repeat_cap": 3
     },
     "C:/Users/RobertEvans/OneDrive - RME Solutions Technology/_PG Completed Recordings 84-97": {
-      "domain_terms_file": "C:/Users/RobertEvans/Downloads/AudioProcessorAlphaVersion/special_words.txt",
-      "recursive": 1,
-      "skip_existing": 0,
-      "time_header": 1,
-      "quality_mode": 1,
-      "max_repeat_cap": 6,
       "whisper_model": "faster-whisper-distil-large-v3",
-      "initial_prompt": "",
-      "replace_before_enabled": 1,
-      "replace_before_date": "2026-01-09",
-      "replace_before_time": "00:00",
-      "restore_punctuation": 1,
-      "use_dataset_path": 0
+      "recursive": 1,
+      "quality_mode": 1,
+      "replace_mode": "all",
+      "replace_before_date": "2026-01-09"
     },
     "C:/Users/RobertEvans/OneDrive - RME Solutions Technology/_PG Completed Recordings 84-97/1988 MW": {
       "domain_terms_file": "C:\\Users\\RobertEvans\\Downloads\\AudioProcessorAlphaVersion\\special_words.txt",
@@ -168,7 +159,14 @@
       "quality_mode": 1,
       "replace_mode": "all",
       "replace_before_date": "2026-03-15"
+    },
+    "C:/Users/RobertEvans/OneDrive - RME Solutions Technology/_PG Completed Recordings 84-97/1992 MW": {
+      "whisper_model": "faster-whisper-large-v3-turbo",
+      "recursive": 0,
+      "quality_mode": 1,
+      "replace_mode": "all",
+      "replace_before_date": "2026-04-07"
     }
   },
-  "last_folder": "D:/Misc Audio/ABC"
+  "last_folder": "C:/Users/RobertEvans/OneDrive - RME Solutions Technology/_PG Completed Recordings 84-97"
 }
