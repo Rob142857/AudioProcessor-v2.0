@@ -7,6 +7,11 @@ import shutil
 import subprocess
 import tempfile
 import argparse
+
+# Windows-safe subprocess flags to suppress console windows
+_SUBPROCESS_NO_WINDOW = {}
+if sys.platform == "win32":
+    _SUBPROCESS_NO_WINDOW = {"creationflags": 0x08000000}  # CREATE_NO_WINDOW
 import whisper
 import torch
 from docx import Document
@@ -304,7 +309,7 @@ def preprocess_audio(input_path, out_path, bitrate="128k"):
         bitrate,
         out_path,
     ]
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, **_SUBPROCESS_NO_WINDOW)
 
 
 def choose_device(preferred: str = "auto"):
@@ -360,7 +365,8 @@ def get_media_duration(path):
         # use ffprobe if available
         try:
             cmd = [ff, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path]
-            out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
+            out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL,
+                                          **_SUBPROCESS_NO_WINDOW)
             return float(out.decode().strip())
         except Exception:
             return None
@@ -623,7 +629,8 @@ def get_pcm_from_file(input_path):
                 ffexe = None
         ff = ffexe
     cmd = [ff, "-i", input_path, "-f", "s16le", "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000", "-"]
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                          **_SUBPROCESS_NO_WINDOW)
     data = p.stdout.read()
     p.stdout.close()
     return data
@@ -721,7 +728,7 @@ def extract_segment(input_path, start, end, out_path, bitrate="128k"):
         bitrate,
         out_path,
     ]
-    subprocess.run(cmd, check=True)
+    subprocess.run(cmd, check=True, **_SUBPROCESS_NO_WINDOW)
 
 
 def clean_fillers(text):

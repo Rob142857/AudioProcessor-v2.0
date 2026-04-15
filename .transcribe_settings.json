@@ -8,7 +8,7 @@
       "time_header": 1,
       "quality_mode": 1,
       "max_repeat_cap": 3,
-      "whisper_model": "large-v3-turbo",
+      "whisper_model": "faster-whisper-large-v3",
       "initial_prompt": ""
     },
     "C:/Users/RobertEvans/OneDrive - RME Solutions Technology/_PG Completed Recordings 84-97/1995 MW": {
@@ -18,7 +18,7 @@
       "time_header": 1,
       "quality_mode": 1,
       "max_repeat_cap": 3,
-      "whisper_model": "large-v3-turbo",
+      "whisper_model": "faster-whisper-large-v3",
       "initial_prompt": ""
     },
     "C:/Users/RobertEvans/OneDrive - RME Solutions Technology/_PG Completed Recordings 84-97/1985 MW": {
@@ -45,7 +45,7 @@
       "max_repeat_cap": 3
     },
     "C:/Users/RobertEvans/OneDrive - RME Solutions Technology/_PG Completed Recordings 84-97": {
-      "whisper_model": "faster-whisper-distil-large-v3",
+      "whisper_model": "faster-whisper-large-v3",
       "recursive": 1,
       "quality_mode": 1,
       "replace_mode": "before",
@@ -73,7 +73,7 @@
       "time_header": 1,
       "quality_mode": 1,
       "max_repeat_cap": 3,
-      "whisper_model": "large-v3-turbo"
+      "whisper_model": "faster-whisper-large-v3"
     },
     "C:/Users/RobertEvans/Downloads": {
       "domain_terms_file": "c:\\Users\\RobertEvans\\Downloads\\AudioProcessorAlphaVersion\\special_words.txt",
@@ -109,7 +109,7 @@
       "time_header": 1,
       "quality_mode": 1,
       "max_repeat_cap": 3,
-      "whisper_model": "large-v3-turbo"
+      "whisper_model": "faster-whisper-large-v3"
     },
     "C:/Users/RobertEvans/OneDrive - RME Solutions Technology/_PG Completed Recordings 84-97/Tapes From Joe (MW, RL, et al)/Dr G mp3 files/1992": {
       "domain_terms_file": "C:\\Users\\RobertEvans\\Downloads\\AudioProcessorAlphaVersion\\special_words.txt",
@@ -128,7 +128,7 @@
       "time_header": 1,
       "quality_mode": 1,
       "max_repeat_cap": 3,
-      "whisper_model": "large-v3-turbo",
+      "whisper_model": "faster-whisper-large-v3",
       "initial_prompt": ""
     },
     "C:/Users/RobertEvans/OneDrive - RME Solutions Technology/_PG Completed Recordings 84-97/Meganature 1991 - Dr Groves": {

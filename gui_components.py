@@ -107,10 +107,16 @@ class SettingsPanel(tk.Frame):
         self.columnconfigure(1, weight=1)
         row = 0
 
+        # Valid model keys for validation
+        valid_models = {k for k, _ in self.MODEL_OPTIONS}
+
         # Model
         tk.Label(self, text="Model:", bg=CARD_BG, fg=FG,
                  font=("Segoe UI", 10, "bold")).grid(row=row, column=0, sticky="w", padx=16, pady=(14, 6))
-        self.model_var = tk.StringVar(value=ps.get("whisper_model", "faster-whisper-large-v3"))
+        saved_model = ps.get("whisper_model", "faster-whisper-large-v3")
+        if saved_model not in valid_models:
+            saved_model = "faster-whisper-large-v3"  # reset stale/invalid model names
+        self.model_var = tk.StringVar(value=saved_model)
         display_map = {k: v for k, v in self.MODEL_OPTIONS}
         self._display_var = tk.StringVar(value=display_map.get(self.model_var.get(), self.MODEL_OPTIONS[0][1]))
         combo = ttk.Combobox(self, textvariable=self._display_var,
@@ -181,9 +187,13 @@ class SettingsPanel(tk.Frame):
 
     def apply(self, ps: dict) -> None:
         """Apply a project-settings dict to the panel widgets."""
+        valid_models = {k for k, _ in self.MODEL_OPTIONS}
         display_map = {k: v for k, v in self.MODEL_OPTIONS}
-        self.model_var.set(ps.get("whisper_model", "faster-whisper-large-v3"))
-        self._display_var.set(display_map.get(self.model_var.get(), self.MODEL_OPTIONS[0][1]))
+        saved_model = ps.get("whisper_model", "faster-whisper-large-v3")
+        if saved_model not in valid_models:
+            saved_model = "faster-whisper-large-v3"  # reset stale/invalid model names
+        self.model_var.set(saved_model)
+        self._display_var.set(display_map.get(saved_model, self.MODEL_OPTIONS[0][1]))
         self.recursive_var.set(ps.get("recursive", 0))
         self.quality_var.set(ps.get("quality_mode", 1))
         self.replace_var.set(ps.get("replace_mode", "skip"))

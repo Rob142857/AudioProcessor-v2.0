@@ -11,13 +11,13 @@ warnings.filterwarnings("ignore", category=UserWarning, module="webrtcvad")
 # Suppress verbose tqdm progress bars from transformers/huggingface
 import os
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "0")  # Keep minimal progress
-# NOTE: Do NOT set HF_HUB_OFFLINE=1 — it blocks faster-whisper from downloading
-# CTranslate2 models on first use, causing silent fallback to CPU.
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")  # Transformers also use cached models only
+# NOTE: Do NOT set HF_HUB_OFFLINE=1 or TRANSFORMERS_OFFLINE=1 — both block
+# faster-whisper from downloading CTranslate2 models on first use.
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "warning")  # Reduce transformer logs
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")  # Avoid tokenizer warnings
 
 import sys
+import subprocess
 import time
 import gc
 import psutil
@@ -25,6 +25,19 @@ import argparse
 import multiprocessing
 import threading
 from typing import Any, cast, Optional, Dict
+
+# === WINDOWS CONSOLE SUPPRESSION ===
+# On Windows, subprocess calls to console programs (nvidia-smi, ffmpeg) open
+# a visible CMD window unless CREATE_NO_WINDOW is passed.
+_SUBPROCESS_NO_WINDOW: Dict[str, Any] = {}
+if sys.platform == "win32":
+    _SUBPROCESS_NO_WINDOW = {"creationflags": 0x08000000}  # CREATE_NO_WINDOW
+
+# === SESSION INIT CACHE ===
+# Track whether per-session GPU setup has been done to avoid redundant work
+# on every file in a batch (VRAM clearing, torch settings, memory fraction, etc.).
+_SESSION_GPU_INIT_DONE = False
+_SESSION_HW_CONFIG: Optional[Dict] = None
 
 # === STOP EVENT ===
 # Set this event from the GUI / caller to request immediate cancellation of the
@@ -61,6 +74,9 @@ def _set_cached_model(cache_key: str, model: Any) -> None:
 
 def _clear_model_cache() -> None:
     """Clear all cached models (call on shutdown or model change)."""
+    global _SESSION_GPU_INIT_DONE, _SESSION_HW_CONFIG
+    _SESSION_GPU_INIT_DONE = False
+    _SESSION_HW_CONFIG = None
     with _MODEL_CACHE_LOCK:
         for key in list(_MODEL_CACHE.keys()):
             try:
@@ -99,10 +115,10 @@ def log_gpu_memory_status(context=""):
             # Also try to get CTranslate2 memory via nvidia-smi (for Faster-Whisper)
             ct2_memory = 0.0
             try:
-                import subprocess
                 result = subprocess.run(
                     ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
-                    capture_output=True, text=True, timeout=2
+                    capture_output=True, text=True, timeout=2,
+                    **_SUBPROCESS_NO_WINDOW
                 )
                 if result.returncode == 0:
                     ct2_memory = float(result.stdout.strip()) / 1024  # Convert MB to GB
@@ -222,7 +238,12 @@ def _compatible_transcribe_call(_model, _audio, _kwargs):
         # Apply lightweight aliasing for known parameter name differences
         kw = dict(_kwargs or {})
         if 'logprob_threshold' in kw and 'log_prob_threshold' in allowed:
-            kw['log_prob_threshold'] = kw.pop('logprob_threshold')
+            # Only alias if the caller didn't already set the FW-native key
+            if 'log_prob_threshold' not in kw:
+                kw['log_prob_threshold'] = kw.pop('logprob_threshold')
+            else:
+                # Both present — drop the native-whisper key to avoid conflict
+                kw.pop('logprob_threshold')
         # Keep only supported keys; leave values unchanged for the rest
         filtered = {k: v for k, v in kw.items() if k in allowed}
     except Exception:
@@ -264,8 +285,10 @@ def _as_result_dict(res: Any) -> Dict[str, Any]:
                         parts.append(txt)
             except _StopRequested:
                 raise
-            except Exception:
-                pass
+            except Exception as _seg_err:
+                print(f"⚠️  FW segment iteration error: {type(_seg_err).__name__}: {_seg_err}")
+                import traceback as _tb
+                _tb.print_exc()
             out: Dict[str, Any] = {
                 'segments': seg_list,
                 'text': ' '.join(parts).strip(),
@@ -277,8 +300,10 @@ def _as_result_dict(res: Any) -> Dict[str, Any]:
             except Exception:
                 pass
             return out
-    except Exception:
-        pass
+    except _StopRequested:
+        raise
+    except Exception as _outer_err:
+        print(f"⚠️  _as_result_dict outer error: {type(_outer_err).__name__}: {_outer_err}")
     return {'segments': [], 'text': ''}
 
 
@@ -307,7 +332,6 @@ def preprocess_audio_with_padding(input_path: str, temp_dir: str = None) -> str:
     - "strong": Aggressive noise reduction for extremely poor sources
     """
     import tempfile
-    import subprocess
     import shutil
     
     if temp_dir is None:
@@ -396,9 +420,9 @@ def preprocess_audio_with_padding(input_path: str, temp_dir: str = None) -> str:
         # Determine timeout based on input file duration
         # For long files (>1 hour), preprocessing can take significant time
         try:
-            import subprocess as sp
             probe_cmd = [ffmpeg_cmd, "-i", input_path]
-            probe_result = sp.run(probe_cmd, capture_output=True, text=True, timeout=10)
+            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10,
+                                          **_SUBPROCESS_NO_WINDOW)
             # Extract duration from ffmpeg output
             duration_match = re.search(r"Duration: (\d{2}):(\d{2}):(\d{2})", probe_result.stderr)
             if duration_match:
@@ -414,7 +438,8 @@ def preprocess_audio_with_padding(input_path: str, temp_dir: str = None) -> str:
             timeout = 600  # Default 10 minutes on error
         
         print(f"🔧 Running ffmpeg preprocessing...")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                                **_SUBPROCESS_NO_WINDOW)
         
         if result.returncode != 0:
             print(f"❌ FFmpeg preprocessing failed:")
@@ -2144,7 +2169,8 @@ def transcribe_with_vad_parallel(input_path, vad_segments, model, base_transcrib
                         "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
                         "-y", segment_path
                     ]
-                    subprocess.run(cmd, check=True, capture_output=True)
+                    subprocess.run(cmd, check=True, capture_output=True,
+                                    **_SUBPROCESS_NO_WINDOW)
 
                 return segment_path, (start_time, end_time)
             except Exception as e:
@@ -2285,6 +2311,7 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
     - Safe cleanup that avoids torch re-import problems
     Returns path to the .docx file saved next to the source file.
     """
+    global _SESSION_GPU_INIT_DONE, _SESSION_HW_CONFIG
     # Initialize all variables at the beginning to ensure they're always accessible
     use_vad = False
     enable_speakers = False
@@ -2405,7 +2432,12 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
     except Exception:
         disable_vad = False
     
-    config = get_maximum_hardware_config(max_perf=max_perf)
+    # Cache hardware config across batch files to avoid re-detection overhead
+    if _SESSION_HW_CONFIG is not None:
+        config = dict(_SESSION_HW_CONFIG)
+    else:
+        config = get_maximum_hardware_config(max_perf=max_perf)
+        _SESSION_HW_CONFIG = dict(config)
     config['disable_vad'] = disable_vad
     
     # Compact hardware config summary
@@ -2491,8 +2523,9 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
     if initial_prompt:
         print(f"📝 Final initial_prompt ({len(initial_prompt)} chars): {initial_prompt[:150]}...")
 
-    # Pre-run cleanup
-    force_gpu_memory_cleanup()
+    # Pre-run cleanup (skip if session already initialized — model is cached)
+    if not _SESSION_GPU_INIT_DONE:
+        force_gpu_memory_cleanup()
 
     # Choose device and load one model only
     device_name = "CPU"
@@ -2540,8 +2573,8 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
         print(f"🗂️  Model: {selected_model_name} (via {backend} backend)")
 
     try:
-        # Elevate process priority on Windows for max perf
-        if config.get('max_perf'):
+        # Elevate process priority on Windows for max perf (once per session)
+        if config.get('max_perf') and not _SESSION_GPU_INIT_DONE:
             try:
                 import psutil
                 p = psutil.Process(os.getpid())
@@ -2556,111 +2589,94 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
             device_name = f"CUDA GPU ({torch_api.cuda.get_device_name(0)})"
             print("🎯 Device: CUDA GPU")
             
-            # VRAM CLEARING before model load (preserves cached models)
-            print("🧹 Clearing VRAM before model load...")
-            try:
-                # NOTE: Do NOT call _clear_model_cache() here — destroying a
-                # cached model forces an expensive (~8 s) reload for every file
-                # in a batch and increases OOM risk during re-allocation.
-                # The cache check later will reuse a valid cached model.
-
-                # Release PyTorch CUDA caches (does not affect CTranslate2)
-                torch_api.cuda.empty_cache()
-                torch_api.cuda.synchronize()
-                torch_api.cuda.reset_peak_memory_stats()
-                torch_api.cuda.reset_accumulated_memory_stats()
-
-                # 3. Release IPC memory (shared-memory tensors from other processes)
-                try:
-                    torch_api.cuda.ipc_collect()
-                except Exception:
-                    pass
-
-                # 4. Python GC to drop dangling model/tensor references
-                import gc
-                gc.collect()
-                gc.collect()  # second pass for cyclic references
-
-                # 5. Final empty_cache after GC released references
-                torch_api.cuda.empty_cache()
-                torch_api.cuda.synchronize()
-
-                try:
-                    used_vram = torch_api.cuda.memory_allocated() / (1024**3)
-                    reserved_vram = torch_api.cuda.memory_reserved() / (1024**3)
-                    total_vram = float(config.get("cuda_total_vram_gb") or 0.0)
-                    free_est = max(0.0, total_vram - reserved_vram)
-                    print(f"📊 VRAM cleared: {free_est:.2f}GB free / {total_vram:.2f}GB total")
-                    print(f"   Allocated: {used_vram:.3f}GB  Reserved: {reserved_vram:.3f}GB")
-                except Exception:
-                    print("✅ VRAM cleared successfully")
-            except Exception as clear_e:
-                print(f"⚠️  VRAM clear warning: {clear_e}")
+            # total_vram is needed for backend/model decisions below
+            total_vram = float(config.get("cuda_total_vram_gb") or 0.0)
             
-            # Apply CUDA per-process memory fraction if an allowed VRAM cap is set
-            try:
-                total_vram = float(config.get("cuda_total_vram_gb") or 0.0)
-                allowed_vram = float(config.get("allowed_vram_gb") or 0.0)
-                if total_vram > 0:
-                    if 0.5 <= allowed_vram < total_vram:
-                        frac = max(0.05, min(0.95, allowed_vram / total_vram))
-                        torch_api.cuda.set_per_process_memory_fraction(frac, device=0)
-                        print(f"🧩 Limiting CUDA allocator to ~{frac*100:.0f}% of VRAM ({allowed_vram:.1f}GB)")
-                    elif config.get('max_perf'):
-                        # Leave a safety margin unless explicitly overridden
-                        # Adjust default for low-VRAM GPUs with large models
-                        default_frac = "0.85" if total_vram <= 8 and selected_model_name in ["large-v3", "large-v3-turbo"] else "0.92"
-                        high_frac = os.environ.get("TRANSCRIBE_GPU_FRACTION", default_frac)
-                        try:
-                            frac_val = float(high_frac)
-                        except Exception:
-                            frac_val = float(default_frac)
-                        try:
-                            torch_api.cuda.set_per_process_memory_fraction(min(0.99, max(0.5, frac_val)), device=0)
-                            print(f"🧩 Allowing CUDA allocator to use ~{min(0.99, max(0.5, frac_val))*100:.0f}% of VRAM (safety margin enabled)")
-                        except Exception:
-                            pass
-            except Exception as e:
-                print(f"⚠️  Could not set CUDA memory fraction: {e}")
-            # Enable ULTRA performance knobs for maximum GPU utilization
-            try:
-                if hasattr(torch_api.backends, "cudnn"):
-                    torch_api.backends.cudnn.benchmark = True
-                    # Enable deterministic mode for reproducibility but max performance
-                    torch_api.backends.cudnn.deterministic = False
-                # TF32 can speed up matmul on Ampere+; harmless elsewhere
-                if hasattr(torch_api.backends, "cuda") and hasattr(torch_api.backends.cuda, "matmul"):
+            # === GPU INIT: once per session (batch) ===
+            # VRAM clearing, torch config, and CUDA allocator settings are
+            # expensive and only need to happen once.  The model cache handles
+            # reuse across files.
+            if not _SESSION_GPU_INIT_DONE:
+                print("🧹 Clearing VRAM before model load...")
+                try:
+                    torch_api.cuda.empty_cache()
+                    torch_api.cuda.synchronize()
+                    torch_api.cuda.reset_peak_memory_stats()
+                    torch_api.cuda.reset_accumulated_memory_stats()
                     try:
-                        torch_api.backends.cuda.matmul.allow_tf32 = True
-                        # Enable cuBLAS optimizations
-                        torch_api.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+                        torch_api.cuda.ipc_collect()
                     except Exception:
                         pass
+                    gc.collect()
+                    gc.collect()
+                    torch_api.cuda.empty_cache()
+                    torch_api.cuda.synchronize()
+                    try:
+                        used_vram = torch_api.cuda.memory_allocated() / (1024**3)
+                        reserved_vram = torch_api.cuda.memory_reserved() / (1024**3)
+                        free_est = max(0.0, total_vram - reserved_vram)
+                        print(f"📊 VRAM cleared: {free_est:.2f}GB free / {total_vram:.2f}GB total")
+                        print(f"   Allocated: {used_vram:.3f}GB  Reserved: {reserved_vram:.3f}GB")
+                    except Exception:
+                        print("✅ VRAM cleared successfully")
+                except Exception as clear_e:
+                    print(f"⚠️  VRAM clear warning: {clear_e}")
+                
+                # Apply CUDA per-process memory fraction
                 try:
-                    torch_api.set_float32_matmul_precision("high")
+                    allowed_vram = float(config.get("allowed_vram_gb") or 0.0)
+                    if total_vram > 0:
+                        if 0.5 <= allowed_vram < total_vram:
+                            frac = max(0.05, min(0.95, allowed_vram / total_vram))
+                            torch_api.cuda.set_per_process_memory_fraction(frac, device=0)
+                            print(f"🧩 Limiting CUDA allocator to ~{frac*100:.0f}% of VRAM ({allowed_vram:.1f}GB)")
+                        elif config.get('max_perf'):
+                            default_frac = "0.85" if total_vram <= 8 and selected_model_name in ["large-v3", "large-v3-turbo"] else "0.92"
+                            high_frac = os.environ.get("TRANSCRIBE_GPU_FRACTION", default_frac)
+                            try:
+                                frac_val = float(high_frac)
+                            except Exception:
+                                frac_val = float(default_frac)
+                            try:
+                                torch_api.cuda.set_per_process_memory_fraction(min(0.99, max(0.5, frac_val)), device=0)
+                                print(f"🧩 Allowing CUDA allocator to use ~{min(0.99, max(0.5, frac_val))*100:.0f}% of VRAM (safety margin enabled)")
+                            except Exception:
+                                pass
+                except Exception as e:
+                    print(f"⚠️  Could not set CUDA memory fraction: {e}")
+                # Enable ULTRA performance knobs
+                try:
+                    if hasattr(torch_api.backends, "cudnn"):
+                        torch_api.backends.cudnn.benchmark = True
+                        torch_api.backends.cudnn.deterministic = False
+                    if hasattr(torch_api.backends, "cuda") and hasattr(torch_api.backends.cuda, "matmul"):
+                        try:
+                            torch_api.backends.cuda.matmul.allow_tf32 = True
+                            torch_api.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+                        except Exception:
+                            pass
+                    try:
+                        torch_api.set_float32_matmul_precision("high")
+                    except Exception:
+                        pass
+                    try:
+                        if total_vram >= 12:
+                            torch_api.cuda.set_per_process_memory_fraction(0.99, device=0)
+                            print("🧩 GPU Memory Pooling: Enabled (high-VRAM)")
+                    except Exception:
+                        pass
                 except Exception:
                     pass
-                # Only raise memory fraction aggressively on high-VRAM GPUs.
-                # On 8GB-class GPUs, forcing 0.99 increases OOM risk for large models.
+                # Final pre-load cache clear
                 try:
-                    total_vram = float(config.get("cuda_total_vram_gb") or 0.0)
-                    if total_vram >= 12:
-                        torch_api.cuda.set_per_process_memory_fraction(0.99, device=0)
-                        print("🧩 GPU Memory Pooling: Enabled (high-VRAM)")
+                    torch_api.cuda.empty_cache()
+                    torch_api.cuda.synchronize()
                 except Exception:
                     pass
-            except Exception:
-                pass
-            # Final pre-load cache clear to reduce fragmentation
-            try:
-                torch_api.cuda.empty_cache()
-                torch_api.cuda.synchronize()
-            except Exception:
-                pass
-            alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
-            if not alloc_conf:
-                # Provide sane defaults with expandable segments unless user overrides
-                os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:64"
+                alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+                if not alloc_conf:
+                    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:64"
+            # === END GPU INIT ===
             
             # Use the backend determined from model name parsing above
             # Auto-switch to faster-whisper for large models on low-VRAM GPUs (only if native)
@@ -2696,6 +2712,7 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
                     
                     # Ensure HF Hub is online so CTranslate2 models can be downloaded
                     os.environ.pop("HF_HUB_OFFLINE", None)
+                    os.environ.pop("TRANSFORMERS_OFFLINE", None)
                     
                 except Exception as fw_imp_e:
                     print(f"⚠️  faster-whisper import failed ({fw_imp_e}); falling back to native backend")
@@ -2704,10 +2721,10 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
             if backend == "faster-whisper":
                 # Log actual free VRAM before loading (CTranslate2 uses CUDA directly, not PyTorch)
                 try:
-                    import subprocess as _sp
-                    _nvsmi = _sp.run(
+                    _nvsmi = subprocess.run(
                         ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
                         capture_output=True, text=True, timeout=3,
+                        **_SUBPROCESS_NO_WINDOW
                     )
                     if _nvsmi.returncode == 0:
                         _free_mb = float(_nvsmi.stdout.strip())
@@ -2869,6 +2886,8 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
                 print(f"📊 VRAM in use after load: {used_after:.2f} GB / {total_vram_lookup:.2f} GB")
             except Exception:
                 pass
+            # Mark session as initialized so subsequent files skip heavy GPU setup
+            _SESSION_GPU_INIT_DONE = True
         elif config.get("dml_available", False):
             try:
                 import torch_directml  # type: ignore
@@ -2885,10 +2904,10 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
             if torch_api.cuda.is_available():
                 # Log actual free VRAM for diagnostics
                 try:
-                    import subprocess as _sp
-                    _nvsmi = _sp.run(
+                    _nvsmi = subprocess.run(
                         ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
                         capture_output=True, text=True, timeout=3,
+                        **_SUBPROCESS_NO_WINDOW
                     )
                     if _nvsmi.returncode == 0:
                         _free_mb = float(_nvsmi.stdout.strip())
@@ -2900,6 +2919,7 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
                 try:
                     from faster_whisper import WhisperModel as _FWModel
                     os.environ.pop("HF_HUB_OFFLINE", None)
+                    os.environ.pop("TRANSFORMERS_OFFLINE", None)
                     print("⚠️  All preferred loaders failed. Trying faster-whisper int8 on CUDA...")
                     model = _FWModel(selected_model_name, device="cuda", compute_type="int8")
                     using_fw = True
@@ -3010,7 +3030,8 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
         nonlocal transcription_complete, transcription_result, transcription_error, use_vad, using_fw
         try:
             print("🔄 Starting transcription process...")
-            log_gpu_memory_status("start of transcription")
+            if not _SESSION_GPU_INIT_DONE:
+                log_gpu_memory_status("start of transcription")
             if model is None:
                 raise RuntimeError("Transcription model is not loaded")
 
@@ -3046,6 +3067,13 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
             
             # Tune settings based on backend (faster-whisper vs native)
             if using_fw:
+                # Remove native-whisper-only keys that clash with FW parameter names.
+                # CRITICAL: 'logprob_threshold' would be aliased to 'log_prob_threshold'
+                # by _compatible_transcribe_call, silently overwriting the FW-specific
+                # value (-1.0 lenient) with the native value (-0.5 strict).
+                transcribe_kwargs.pop("logprob_threshold", None)
+                transcribe_kwargs.pop("verbose", None)  # not a FW param
+
                 if quality_mode:
                     # HIGH QUALITY mode for Faster-Whisper (optimized for vintage tape recordings)
                     # beam=5 is Whisper's sweet spot — research shows diminishing returns above 5
@@ -3118,11 +3146,9 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
             print("\n" + "="*80)
             print("🎬 STARTING MAIN TRANSCRIPTION")
             print("="*80)
-            log_gpu_memory_status("before transcription call")
             
             try:
                 result = _compatible_transcribe_call(model, working_input_path, transcribe_kwargs)
-                log_gpu_memory_status("after transcription call")
             except _StopRequested:
                 raise
             except RuntimeError as rt_e:
@@ -3477,8 +3503,9 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
     docx_path = None
     elapsed = time.time() - start_time
     
-    # Final GPU memory check after text processing
-    log_gpu_memory_status("after text processing complete")
+    # Final GPU memory check after text processing (first file only)
+    if not _SESSION_GPU_INIT_DONE:
+        log_gpu_memory_status("after text processing complete")
     
     try:
         from txt_to_docx import convert_txt_to_docx_from_text
