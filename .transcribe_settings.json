@@ -26,7 +26,11 @@
       "recursive": 0,
       "quality_mode": 1,
       "replace_mode": "all",
+<<<<<<< Updated upstream
       "replace_before_date": "2026-03-15"
+=======
+      "replace_before_date": "2026-03-23"
+>>>>>>> Stashed changes
     },
     "C:/Users/RobertEvans/OneDrive - RME Solutions Technology/_PG Completed Recordings 84-97/1986 MW": {
       "domain_terms_file": "c:\\Users\\RobertEvans\\Downloads\\AudioProcessorAlphaVersion\\awkward_words.txt",
@@ -168,5 +172,9 @@
       "replace_before_date": "2026-04-07"
     }
   },
+<<<<<<< Updated upstream
   "last_folder": "C:/Users/RobertEvans/OneDrive - RME Solutions Technology/_PG Completed Recordings 84-97"
+=======
+  "last_folder": "C:/Users/RobertEvans/OneDrive - RME Solutions Technology/_PG Completed Recordings 84-97/1985 MW"
+>>>>>>> Stashed changes
 }
