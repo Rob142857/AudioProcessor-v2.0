@@ -18,7 +18,7 @@ Converts audio/video files into professionally formatted DOCX transcripts. Autom
 - **Domain terms** — feed a `special_words.txt` to improve recognition of specialist vocabulary
 - **Clean componentised GUI** — `gui_transcribe.py` (main) + `gui_components.py` (panels)
 
-## Quick Start
+## Quick Start 
 
 ### One-Liner Install (GeForce GPU)
 
