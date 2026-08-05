@@ -9,7 +9,8 @@
       "quality_mode": 1,
       "replace_mode": "skip",
       "replace_before_date": "2026-01-01",
-      "force_reprocess": 0
+      "force_reprocess": 0,
+      "retain_troubleshooting_artifacts": 1
     }
   }
 }

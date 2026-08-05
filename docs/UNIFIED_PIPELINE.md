@@ -9,12 +9,12 @@ The local tool remains responsible for reading private audio and producing the f
 ```text
 recording
   -> local tape preprocessing
-  -> Faster-Whisper large-v3
+  -> Faster-Whisper large-v3 + token-budgeted pinned-glossary hotwords
   -> immutable raw text + segment JSON + VTT + SRT
   -> pinned glossary snapshot
   -> protected GLM-4.7-Flash cleanup
   -> fidelity/coverage checks
-  -> final DOCX + manifest + status report
+  -> raw Whisper DOCX + GLM Review DOCX + manifest + status report
 ```
 
 For recordings whose legacy Faster-Whisper DOCX already exists, the same runner
@@ -27,7 +27,7 @@ source-adjacent legacy DOCX
   -> pinned glossary snapshot
   -> protected GLM-4.7-Flash cleanup
   -> imported-text/hash checks (timestamp coverage is explicitly not applicable)
-  -> final DOCX + manifest + status report
+  -> separate GLM Review DOCX + manifest + status report
 ```
 
 This is not `cleanup-only` and it does not fabricate empty Whisper segments.
@@ -35,14 +35,14 @@ No segment JSON, VTT, SRT, audio duration, or coverage claim is created. The
 legacy importer fails closed on ambiguous document structure and keeps the body
 only in hashed `raw.txt`, never in the manifest.
 
-Generated artifacts always go into a separate output folder; intermediate work never overwrites the source archive. A folder batch defaults to the sibling `<archive> - Polished` directory. The normal one-click launcher additionally requests a guarded post-run publication batch, described below, which can replace source-adjacent legacy DOCX files only after complete verification and backup.
+Generated artifacts always go into a separate output folder. A folder batch defaults to the sibling `<archive> - Polished` directory. Publication never writes metadata sidecars into recording folders. Fresh STT may create or refresh the raw `<stem>.docx` selected by policy, while GLM output always uses `<stem> - GLM Review.docx`. Imported-DOCX mode leaves its source Word file byte-for-byte unchanged.
 
 Every recording receives a collision-proof directory containing:
 
 ```text
 <relative folders>/<recording stem>__<source extension>/
   manifest.json
-  run.jsonl
+  run.jsonl (optional troubleshooting log)
   raw.txt
   stt.formatted.txt (only when distinct from the model output)
   raw.segments.json
@@ -52,6 +52,7 @@ Every recording receives a collision-proof directory containing:
   cleanup.json
   cleaned.txt
   qa.json
+  whisper.docx (fresh STT only; pre-GLM)
   final.docx
 ```
 
@@ -69,8 +70,8 @@ Use a dedicated Cloudflare Access service token whose policy is limited to the t
 For an unattended process, `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` may instead be supplied together in that process's environment; they override the credential store. Use `configure_cleanup_credentials.py --clear` to remove the saved pair.
 
 The desktop GUI is launched with `run.bat`. Its **Polished archive pipeline**
-switch is on by default and shows the fixed route: local Faster-Whisper →
-protected GLM-4.7-Flash cleanup → polished Word. It uses the same manifests,
+switch is on by default and shows the fixed route: local Faster-Whisper Word →
+protected GLM-4.7-Flash cleanup → separate GLM Review Word. It uses the same manifests,
 checksums, cleanup credentials, separate polished output root, verification,
 backup, and guarded source-DOCX publisher as the command-line runner.
 Folder runs use the stable sibling `<archive> - Polished` output. A GUI
@@ -79,11 +80,11 @@ sibling `<source-folder> - Polished Single Files` tree, keeping generated work
 outside the guarded source scope and making a restart unambiguous.
 
 Select **Use existing Word transcripts (skip Whisper)** for an archive that
-already contains source-adjacent legacy DOCX files. Choose **Replace all** or
-**Replace transcripts before…**; **Skip existing** is deliberately invalid in
+already contains source-adjacent legacy DOCX files. Choose **Refresh all** or
+**Refresh transcripts before…**; **Skip existing** is deliberately invalid in
 this mode because every raw input is an existing document. Whisper model and
 quality controls are disabled, the preflight needs no GPU/audio stack, and the
-flow label changes to existing Word → protected GLM-4.7-Flash → polished Word.
+flow label changes to existing Word → protected GLM-4.7-Flash → separate GLM Review Word.
 The advanced Force control reruns GLM and rendering from the hash-verified
 preserved import; it never causes a DOCX to be re-imported.
 
@@ -96,16 +97,16 @@ cleanup, and render checkpoint. The GUI Stop button requests cancellation from
 both the pipeline and active Whisper engine. Completed recordings, completed
 stages, and completed GLM chunks resume; Whisper does not checkpoint partial
 decoding within one recording, so the current recording restarts from its
-beginning if it is stopped during Whisper. The current operation or protected
-cleanup chunk may take a little time to finish, after which publication is
-suppressed and the same folder can be run again to resume.
+beginning if it is stopped during Whisper. Each completed review copy is
+published atomically before the runner advances, so a later cancellation keeps
+finished siblings while the current incomplete job remains resumable.
 Closing the GUI while work is active uses the same safe-stop path and keeps the
 window alive until the worker and any atomic Word publication transaction have
 finished; it never abandons the publisher merely because the close button was
 pressed.
 
 Before local transcription starts, a publication run also groups the already
-selected recordings by their eventual source-adjacent `.docx` target. If two
+selected recordings by their eventual source-adjacent ` - GLM Review.docx` target. If two
 formats or files would map to the same Word filename, the run stops immediately
 and lists every conflicting source path. The tool never guesses which recording
 is authoritative; select one source from each reported group before retrying.
@@ -130,14 +131,15 @@ Useful controls:
 - `--retry-review` retries only work which previously reached `needs_review`.
 - `--force` deliberately reruns all selected stages.
 - `--existing-transcripts-only` (aliases `--use-existing-docx` and `--skip-stt`) imports legacy DOCX bodies and runs GLM/render only; combine it with `--existing-docx-mode all` or `before`.
+- `--no-troubleshooting-logs` disables optional per-job event logs and full terminology-list duplication; compact hash/provenance checkpoints remain.
 - `--no-publish-source-docx` is a launcher-only opt-out which leaves final DOCX files solely in the polished output tree.
 - Ctrl+C stops between files; completed checkpoints remain reusable.
 
 The batch launcher enables UTF-8 console/Python I/O, selects the doctor mode which matches the requested work, and requires CUDA for any run that transcribes audio. Cleanup-only and render-only runs do not require the GPU; dry runs use the inventory-only doctor mode.
 
-### Safe source-adjacent publication
+### Safe source-adjacent review publication
 
-The launcher adds `--publish-source-docx` by default. Publication is one post-run transaction, never a per-recording side effect. For the normal archive-folder workflow, each target mirrors the audio's input-relative path and changes its extension to `.docx`.
+The launcher adds `--publish-source-docx` by default. Publication occurs per completed recording. For fresh STT it publishes the pre-GLM Word transcript as `<stem>.docx` and the cleaned document as `<stem> - GLM Review.docx`. Imported-DOCX mode publishes only the review sibling and requires the source DOCX container hash to remain exactly unchanged.
 
 Single-file publication is intentionally supported for a reviewed canary. Its guarded source scope is the input file's parent directory, so always pass a new, dedicated `--output` directory which contains only that canary's generated manifest and artifacts. Do not reuse a shared `Polished Transcripts` directory for this purpose. Folder batches remain the normal archive workflow.
 
@@ -145,26 +147,26 @@ Single-file publication is intentionally supported for a reviewed canary. Its gu
 .\run_full_pipeline.bat "C:\path\to\recordings\one-tape.wav" --output "C:\path\to\fresh-canary-output"
 ```
 
-The publisher proceeds only when every discovered job is newly verified or an already-verified skip and every manifest reports passed QA. It refuses publication after `needs_review`, failure, cancellation, `--dry-run`, or `--limit` runs. Use `--no-publish-source-docx` for limited trials; omit it only when deliberately exercising the guarded single-file publication canary above.
+Both `verified` and `needs_review` final jobs may produce a review copy because the document is explicitly awaiting a human word-for-word check. QA status and approval are not conflated: every review manifest, publication record and transaction report says `approval_state: pending_human_review`. Failed, cancelled and incomplete jobs do not publish. Dry runs and limited runs remain non-publishing.
 
-Each published document ends with a single restrained provenance note in this form: `Processed by speech-to-text from a digitised tape recording originally recorded in person by MW on 22 January 1985.` Old cleanup timestamps, model/device details, and earlier generated provenance text are removed during rendering rather than appearing in the publication.
+Each GLM Review document ends with a restrained provenance note in this form: `Processed by speech-to-text from a digitised tape recording originally recorded in person by MW on 22 January 1985.` A second removable line reads `Needs human review.` until a person has completed the word-for-word check. Raw Whisper documents do not carry the GLM review notice. Old cleanup timestamps, model/device details, and earlier generated provenance text are removed during rendering rather than appearing in the publication.
 
 For fresh STT, transcript completeness is a hard verification and publication gate. There must be at least one text-bearing STT segment with a valid end timestamp, the source audio duration must be known, and the final segment must reach the end within the greater of 2 seconds or 5% of the recording duration, capped at 120 seconds. This is the documented trailing-silence tolerance; a longer gap is sent to review instead of being assumed silent. Publication re-reads the hashed segment artifact and repeats this check. Imported-DOCX mode instead rechecks the exact DOCX container → extracted raw text → GLM output → render hash chain and records STT coverage as `not_applicable`; it never claims timestamp completeness it cannot prove. Both routes require recorded glossary-grounding minimum and maximum counts to be integers at least as large as the pinned glossary count.
 
-Before changing any existing target, it copies and verifies the original in a new sibling tree outside both the archive and polished output:
+Before changing an older tool-generated review (or a deliberately refreshed fresh-STT Word file), the publisher copies and verifies it inside the separate polished workspace:
 
 ```text
-<input-name> - Legacy DOCX Backup - <UTC run-id>/
+publication-backups/<UTC run-id>/<relative source folders>/
 ```
 
-Replacements are staged and committed atomically as one guarded batch. A mid-commit failure rolls back changed targets; verified backups are retained after success or failure. New source-adjacent DOCX targets have no prior file to back up. The latest publication or suppression result is recorded as `source-docx-publication-report.json` in the polished output root.
+Each completed job is staged and committed atomically. A mid-commit failure rolls back changed targets; verified backups are retained after success or failure. An existing review target is replaceable only when its current hash is proven by an immutable prior journal. A manually edited review copy fails closed. The source recording folders contain only the two intended Word documents, never logs, manifests, backups or checkpoint sidecars.
 
 Before commit, the publisher also writes a unique per-run planned journal. If
 the process or machine stops after an atomic replacement but before the final
 published receipt, the next run accepts that partial commit only after it
-rechecks the journal's plan hash, generated artifact, target mapping, and
-byte-exact original backup. It can then finish the remaining targets without
-re-importing its own polished documents.
+rechecks the journal's plan hash, target mapping and current generated hash; a
+replacement additionally requires its byte-exact original backup. It can then
+finish safely without ever importing a ` - GLM Review.docx` as source text.
 
 The service token is never written to settings, logs, manifests, or checkpoint files. The client refuses insecure non-local HTTP endpoints and Access login redirects/HTML, and validates access once before creating per-recording work.
 
@@ -176,7 +178,7 @@ The read-only archive inventory on 5 August 2026 found:
 - 2,260 recordings recognised by the old extension list.
 - 6 AIFF recordings that the old recursive runner silently omitted.
 - 22 same-stem multi-format groups; fresh STT treats these as collisions, while skip-Whisper mode cleans each shared DOCX once without selecting an audio variant.
-- 2,259 existing DOCX files. Artifact generation preserves them; launcher publication replaces only fully verified targets after retaining originals in the timestamped backup tree.
+- 2,259 existing DOCX files. Skip-Whisper publication preserves every source transcript and creates separate ` - GLM Review.docx` siblings for human checking.
 - 2,250 canonical source-adjacent DOCX inputs selected by skip-Whisper discovery; six unique recording names have no adjacent DOCX and nine alternate/old DOCX names do not exactly match a recording stem.
 
 The dry-run completed against the real archive and found all 2,278 recordings without modifying the archive.

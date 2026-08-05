@@ -50,7 +50,7 @@ def add_job(
     marker: str,
     *,
     status: str = "verified",
-) -> tuple[Path, Path, bytes]:
+) -> tuple[Path, Path, Path, Path, bytes]:
     source_relative = Path(relative_source)
     source = legacy_root / source_relative
     source.parent.mkdir(parents=True, exist_ok=True)
@@ -58,11 +58,17 @@ def add_job(
     job = generated_root / source_relative.parent / f"{source_relative.stem}__{source_relative.suffix[1:]}"
     generated = job / "final.docx"
     write_docx(generated, f"new-{marker}")
-    target = legacy_root / source_relative.with_suffix(".docx")
-    original = write_docx(target, f"old-{marker}")
+    whisper_generated = job / "whisper.docx"
+    write_docx(whisper_generated, f"raw-new-{marker}")
+    whisper_target = legacy_root / source_relative.with_suffix(".docx")
+    original = write_docx(whisper_target, f"raw-old-{marker}")
+    review_target = legacy_root / source_relative.with_name(
+        f"{source_relative.stem} - GLM Review.docx"
+    )
     stt, stt_fixture = stt_manifest_fields(job)
     manifest = {
         "status": status,
+        "approval_state": "pending_human_review",
         "qa": {
             "status": "passed" if status == "verified" else "needs_review",
             "stt_coverage": stt_fixture["coverage"],
@@ -78,14 +84,19 @@ def add_job(
             "grounding_glossary_terms_max": 1635,
         },
         "source": {"relative_path": source_relative.as_posix()},
+        "render": {"output_sha256": hashlib.sha256(generated.read_bytes()).hexdigest()},
         "artifacts": {
             "docx": str(generated),
+            "whisper_docx": str(whisper_generated),
             "segments": stt_fixture["segments"],
         },
     }
+    manifest["stt"]["whisper_docx_sha256"] = hashlib.sha256(
+        whisper_generated.read_bytes()
+    ).hexdigest()
     job.mkdir(parents=True, exist_ok=True)
     (job / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-    return generated, target, original
+    return generated, whisper_generated, whisper_target, review_target, original
 
 
 class LegacyReplacementTests(unittest.TestCase):
@@ -100,28 +111,42 @@ class LegacyReplacementTests(unittest.TestCase):
     def test_plan_is_read_only_and_confined_to_verified_scope(self):
         with tempfile.TemporaryDirectory() as temporary:
             _root, generated, legacy = self.roots(temporary)
-            _new, target, original = add_job(generated, legacy, "1985 MW/0122 Topic.mp3", "one")
+            _new, _raw_new, raw_target, review_target, original = add_job(
+                generated, legacy, "1985 MW/0122 Topic.mp3", "one"
+            )
 
             plan = replacement.plan_legacy_docx_replacements(generated, legacy)
 
-            self.assertEqual(len(plan.items), 1)
-            self.assertEqual(plan.items[0].target, target.resolve())
-            self.assertEqual(plan.items[0].operation, "replace")
-            self.assertEqual(target.read_bytes(), original)
+            self.assertEqual(len(plan.items), 2)
+            self.assertEqual(
+                {item.target for item in plan.items},
+                {raw_target.resolve(), review_target.resolve()},
+            )
+            self.assertEqual(
+                {item.operation for item in plan.items}, {"create", "replace"}
+            )
+            self.assertEqual(raw_target.read_bytes(), original)
+            self.assertFalse(review_target.exists())
             self.assertEqual(len(plan.plan_sha256), 64)
 
-    def test_non_verified_transcript_is_refused(self):
+    def test_needs_review_transcript_is_publishable_for_human_checking(self):
         with tempfile.TemporaryDirectory() as temporary:
             _root, generated, legacy = self.roots(temporary)
             add_job(generated, legacy, "1985 MW/0122 Topic.mp3", "one", status="needs_review")
-            with self.assertRaisesRegex(replacement.ReplacementError, "non-verified"):
-                replacement.plan_legacy_docx_replacements(generated, legacy)
+            manifest_path = next(generated.rglob("manifest.json"))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["cleanup"]["needs_review"] = True
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            plan = replacement.plan_legacy_docx_replacements(generated, legacy)
+
+            self.assertEqual(len(plan.items), 2)
 
     def test_cleanup_must_prove_full_glm_glossary_grounding(self):
         invalid_updates = {
             "missing_cleanup": None,
             "disabled": {"enabled": False},
-            "needs_review": {"needs_review": True},
+            "invalid_review_state": {"needs_review": None},
             "missing_model": {"model": ""},
             "invalid_hash": {"glossary_sha256": "abc123"},
             "empty_glossary": {"glossary_count": 0},
@@ -190,11 +215,17 @@ class LegacyReplacementTests(unittest.TestCase):
             job = generated / second_source.parent / "0302 Symbols__3gp"
             final = job / "final.docx"
             write_docx(final, "3gp")
+            whisper = job / "whisper.docx"
+            write_docx(whisper, "raw-3gp")
             stt, stt_fixture = stt_manifest_fields(job)
+            stt["whisper_docx_sha256"] = hashlib.sha256(
+                whisper.read_bytes()
+            ).hexdigest()
             (job / "manifest.json").write_text(
                 json.dumps(
                     {
                         "status": "verified",
+                        "approval_state": "pending_human_review",
                         "qa": {
                             "status": "passed",
                             "stt_coverage": stt_fixture["coverage"],
@@ -210,8 +241,14 @@ class LegacyReplacementTests(unittest.TestCase):
                             "grounding_glossary_terms_max": 1635,
                         },
                         "source": {"relative_path": second_source.as_posix()},
+                        "render": {
+                            "output_sha256": hashlib.sha256(
+                                final.read_bytes()
+                            ).hexdigest()
+                        },
                         "artifacts": {
                             "docx": str(final),
+                            "whisper_docx": str(whisper),
                             "segments": stt_fixture["segments"],
                         },
                     }
@@ -228,67 +265,79 @@ class LegacyReplacementTests(unittest.TestCase):
             plan = replacement.plan_legacy_docx_replacements(generated, legacy)
             with self.assertRaisesRegex(replacement.ReplacementError, "confirm"):
                 replacement.apply_legacy_docx_replacements(
-                    plan, expected_scope_root=legacy, backup_root=root / "backup"
+                    plan,
+                    expected_scope_root=legacy,
+                    backup_root=generated / "backups" / "run-1",
                 )
             with self.assertRaisesRegex(replacement.ReplacementError, "expected_count"):
                 replacement.apply_legacy_docx_replacements(
                     plan,
                     expected_scope_root=legacy,
-                    backup_root=root / "backup",
+                    backup_root=generated / "backups" / "run-2",
                     confirm=True,
-                    expected_count=2,
+                    expected_count=99,
                 )
 
     def test_success_replaces_atomically_and_retains_original_backup(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root, generated, legacy = self.roots(temporary)
-            new, target, original = add_job(generated, legacy, "1985 MW/0122 Topic.mp3", "one")
+            _root, generated, legacy = self.roots(temporary)
+            new_review, new_raw, raw_target, review_target, original = add_job(
+                generated, legacy, "1985 MW/0122 Topic.mp3", "one"
+            )
             plan = replacement.plan_legacy_docx_replacements(generated, legacy)
-            backup_root = root / "backup"
+            backup_root = generated / "publication-backups" / "run"
 
             replaced = replacement.apply_legacy_docx_replacements(
                 plan,
                 expected_scope_root=legacy,
                 backup_root=backup_root,
                 confirm=True,
-                expected_count=1,
+                expected_count=2,
             )
 
-            self.assertEqual(replaced, (target.resolve(),))
-            self.assertEqual(target.read_bytes(), new.read_bytes())
+            self.assertEqual(
+                set(replaced), {raw_target.resolve(), review_target.resolve()}
+            )
+            self.assertEqual(review_target.read_bytes(), new_review.read_bytes())
+            self.assertEqual(raw_target.read_bytes(), new_raw.read_bytes())
             self.assertEqual((backup_root / "1985 MW/0122 Topic.docx").read_bytes(), original)
+            self.assertFalse(
+                (backup_root / "1985 MW/0122 Topic - GLM Review.docx").exists()
+            )
 
     def test_success_creates_source_adjacent_docx_when_none_exists(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root, generated, legacy = self.roots(temporary)
-            new, target, _original = add_job(
+            _root, generated, legacy = self.roots(temporary)
+            new_review, new_raw, raw_target, review_target, _original = add_job(
                 generated, legacy, "1985 MW/0129 New Topic.mp3", "new"
             )
-            target.unlink()
+            raw_target.unlink()
             plan = replacement.plan_legacy_docx_replacements(generated, legacy)
-            backup_root = root / "backup"
+            backup_root = generated / "publication-backups" / "run"
 
-            self.assertEqual(plan.items[0].operation, "create")
-            self.assertIsNone(plan.items[0].original_sha256)
+            self.assertEqual({item.operation for item in plan.items}, {"create"})
             published = replacement.apply_legacy_docx_replacements(
                 plan,
                 expected_scope_root=legacy,
                 backup_root=backup_root,
                 confirm=True,
-                expected_count=1,
+                expected_count=2,
             )
 
-            self.assertEqual(published, (target.resolve(),))
-            self.assertEqual(target.read_bytes(), new.read_bytes())
+            self.assertEqual(set(published), {raw_target.resolve(), review_target.resolve()})
+            self.assertEqual(raw_target.read_bytes(), new_raw.read_bytes())
+            self.assertEqual(review_target.read_bytes(), new_review.read_bytes())
             self.assertFalse((backup_root / "1985 MW/0129 New Topic.docx").exists())
 
     def test_changed_generated_file_aborts_before_backup_or_target_change(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root, generated, legacy = self.roots(temporary)
-            new, target, original = add_job(generated, legacy, "1985 MW/0122 Topic.mp3", "one")
+            _root, generated, legacy = self.roots(temporary)
+            new, _raw_new, raw_target, review_target, original = add_job(
+                generated, legacy, "1985 MW/0122 Topic.mp3", "one"
+            )
             plan = replacement.plan_legacy_docx_replacements(generated, legacy)
             write_docx(new, "changed-after-plan")
-            backup_root = root / "backup"
+            backup_root = generated / "publication-backups" / "run"
 
             with self.assertRaisesRegex(replacement.ReplacementError, "changed after planning"):
                 replacement.apply_legacy_docx_replacements(
@@ -296,19 +345,24 @@ class LegacyReplacementTests(unittest.TestCase):
                     expected_scope_root=legacy,
                     backup_root=backup_root,
                     confirm=True,
-                    expected_count=1,
+                    expected_count=2,
                 )
 
-            self.assertEqual(target.read_bytes(), original)
+            self.assertEqual(raw_target.read_bytes(), original)
+            self.assertFalse(review_target.exists())
             self.assertFalse(backup_root.exists())
 
     def test_mid_commit_failure_rolls_back_all_targets_and_keeps_backups(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root, generated, legacy = self.roots(temporary)
-            _new1, target1, original1 = add_job(generated, legacy, "1985 MW/0122 One.mp3", "one")
-            _new2, target2, original2 = add_job(generated, legacy, "1985 MW/0129 Two.mp3", "two")
+            _root, generated, legacy = self.roots(temporary)
+            _new1, _raw1, target1, review1, original1 = add_job(
+                generated, legacy, "1985 MW/0122 One.mp3", "one"
+            )
+            _new2, _raw2, target2, review2, original2 = add_job(
+                generated, legacy, "1985 MW/0129 Two.mp3", "two"
+            )
             plan = replacement.plan_legacy_docx_replacements(generated, legacy)
-            backup_root = root / "backup"
+            backup_root = generated / "publication-backups" / "run"
             real_commit = replacement._commit_stage
             calls = 0
 
@@ -326,29 +380,31 @@ class LegacyReplacementTests(unittest.TestCase):
                         expected_scope_root=legacy,
                         backup_root=backup_root,
                         confirm=True,
-                        expected_count=2,
+                        expected_count=4,
                     )
 
             self.assertEqual(target1.read_bytes(), original1)
             self.assertEqual(target2.read_bytes(), original2)
+            self.assertFalse(review1.exists())
+            self.assertFalse(review2.exists())
             self.assertEqual((backup_root / "1985 MW/0122 One.docx").read_bytes(), original1)
             self.assertEqual((backup_root / "1985 MW/0129 Two.docx").read_bytes(), original2)
 
     def test_failure_after_create_restores_existing_and_removes_new_target(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root, generated, legacy = self.roots(temporary)
-            _new1, target1, original1 = add_job(
+            _root, generated, legacy = self.roots(temporary)
+            _new1, _raw1, target1, review1, original1 = add_job(
                 generated, legacy, "1985 MW/0122 One.mp3", "one"
             )
-            _new2, target2, _original2 = add_job(
+            _new2, _raw2, target2, review2, _original2 = add_job(
                 generated, legacy, "1985 MW/0129 Two.mp3", "two"
             )
             target2.unlink()
-            _new3, target3, original3 = add_job(
+            _new3, _raw3, target3, review3, original3 = add_job(
                 generated, legacy, "1985 MW/0205 Three.mp3", "three"
             )
             plan = replacement.plan_legacy_docx_replacements(generated, legacy)
-            backup_root = root / "backup"
+            backup_root = generated / "publication-backups" / "run"
             real_commit = replacement._commit_stage
             calls = 0
 
@@ -366,12 +422,15 @@ class LegacyReplacementTests(unittest.TestCase):
                         expected_scope_root=legacy,
                         backup_root=backup_root,
                         confirm=True,
-                        expected_count=3,
+                        expected_count=6,
                     )
 
             self.assertEqual(target1.read_bytes(), original1)
             self.assertFalse(target2.exists())
             self.assertEqual(target3.read_bytes(), original3)
+            self.assertFalse(review1.exists())
+            self.assertFalse(review2.exists())
+            self.assertFalse(review3.exists())
             self.assertEqual((backup_root / "1985 MW/0122 One.docx").read_bytes(), original1)
             self.assertFalse((backup_root / "1985 MW/0129 Two.docx").exists())
             self.assertEqual((backup_root / "1985 MW/0205 Three.docx").read_bytes(), original3)

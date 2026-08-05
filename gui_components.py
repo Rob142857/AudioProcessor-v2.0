@@ -162,8 +162,8 @@ class SettingsPanel(tk.Frame):
         self.pipeline_flow = tk.Label(
             self,
             text=(
-                "Local Faster-Whisper  →  protected GLM-4.7-Flash cleanup  "
-                "→  polished Word"
+                "Local Faster-Whisper Word  →  protected GLM-4.7-Flash cleanup  "
+                "→  separate GLM Review Word"
             ),
             bg="#eff6ff",
             fg="#1d4ed8",
@@ -179,8 +179,8 @@ class SettingsPanel(tk.Frame):
             self,
             text=(
                 "Completed recordings, stages, and GLM chunks resume after interruption; "
-                "a recording stopped during Whisper restarts from its beginning. Source "
-                "Word files change only after the selected run verifies, with backups."
+                "a recording stopped during Whisper restarts from its beginning. Raw "
+                "Whisper Word files and separate GLM Review copies are kept side by side."
             ),
             bg=CARD_BG,
             fg=FG_DIM,
@@ -274,11 +274,11 @@ class SettingsPanel(tk.Frame):
         repl_frame.grid(row=row, column=0, columnspan=3, sticky="w", padx=16, pady=(4, 2))
 
         self.replace_var = tk.StringVar(value=ps.get("replace_mode", "skip"))  # skip | all | before
-        tk.Label(repl_frame, text="Existing outputs:", bg=CARD_BG, fg=FG, font=FONT_SM).pack(side="left", padx=(0, 6))
+        tk.Label(repl_frame, text="Processing selection:", bg=CARD_BG, fg=FG, font=FONT_SM).pack(side="left", padx=(0, 6))
         for val, label in [
             ("skip", "Skip existing"),
-            ("all", "Replace all"),
-            ("before", "Replace transcripts before…"),
+            ("all", "Refresh all"),
+            ("before", "Refresh transcripts before…"),
         ]:
             tk.Radiobutton(repl_frame, text=label, variable=self.replace_var, value=val,
                            bg=CARD_BG, fg=FG, selectcolor=CARD_BG, activebackground=CARD_BG,
@@ -317,6 +317,32 @@ class SettingsPanel(tk.Frame):
         )
         self.force_check.pack(side="left")
 
+        row += 1
+        retention_frame = tk.Frame(self, bg=CARD_BG)
+        retention_frame.grid(
+            row=row, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 4)
+        )
+        self.retain_troubleshooting_var = tk.IntVar(
+            value=int(bool(ps.get("retain_troubleshooting_artifacts", 1)))
+        )
+        tk.Checkbutton(
+            retention_frame,
+            text="Retain detailed troubleshooting logging",
+            variable=self.retain_troubleshooting_var,
+            bg=CARD_BG,
+            fg=FG_DIM,
+            selectcolor=CARD_BG,
+            activebackground=CARD_BG,
+            font=FONT_SM,
+        ).pack(side="left")
+        tk.Label(
+            retention_frame,
+            text="(compact hashes and resume checkpoints are always kept)",
+            bg=CARD_BG,
+            fg="#9ca3af",
+            font=("Segoe UI", 8),
+        ).pack(side="left", padx=(8, 0))
+
         # Bottom padding
         row += 1
         tk.Frame(self, bg=CARD_BG, height=10).grid(row=row, column=0)
@@ -351,7 +377,7 @@ class SettingsPanel(tk.Frame):
         if conflict:
             self.existing_transcripts_note.configure(
                 text=(
-                    "Choose Replace all or Replace transcripts before; Skip existing "
+                    "Choose Refresh all or Refresh transcripts before; Skip existing "
                     "selects no source Word transcripts."
                 ),
                 fg="#b45309",
@@ -359,8 +385,8 @@ class SettingsPanel(tk.Frame):
         else:
             self.existing_transcripts_note.configure(
                 text=(
-                    "Requires a source-adjacent DOCX. Runs protected GLM-4.7-Flash "
-                    "cleanup and Word stages only; no audio inference."
+                    "Requires a source-adjacent Whisper DOCX. It remains byte-for-byte "
+                    "unchanged; GLM output is written as a separate Review copy."
                 ),
                 fg=FG_DIM,
             )
@@ -372,11 +398,11 @@ class SettingsPanel(tk.Frame):
             fg="#1d4ed8" if enabled else FG_DIM,
             text=(
                 (
-                    "Existing source Word  →  protected GLM-4.7-Flash cleanup  "
-                    "→  polished Word (no audio inference)"
+                    "Existing Whisper Word  →  protected GLM-4.7-Flash cleanup  "
+                    "→  separate GLM Review Word (no audio inference)"
                     if existing_only
-                    else "Local Faster-Whisper  →  protected GLM-4.7-Flash cleanup  "
-                    "→  polished Word"
+                else "Local Faster-Whisper Word  →  protected GLM-4.7-Flash cleanup  "
+                    "→  separate GLM Review Word"
                 )
                 if enabled
                 else "Local transcription only (legacy mode; no protected cleanup)"
@@ -423,6 +449,9 @@ class SettingsPanel(tk.Frame):
         self.replace_var.set(ps.get("replace_mode", "skip"))
         self.date_var.set(ps.get("replace_before_date", datetime.date.today().isoformat()))
         self.force_var.set(int(bool(ps.get("force_reprocess", 0))))
+        self.retain_troubleshooting_var.set(
+            int(bool(ps.get("retain_troubleshooting_artifacts", 1)))
+        )
         self._toggle_date()
         self._toggle_pipeline()
 
@@ -437,6 +466,7 @@ class SettingsPanel(tk.Frame):
             "replace_mode": self.replace_var.get(),
             "replace_before_date": self.date_var.get(),
             "force_reprocess": self.force_var.get(),
+            "retain_troubleshooting_artifacts": self.retain_troubleshooting_var.get(),
         }
 
 

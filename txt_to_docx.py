@@ -102,6 +102,7 @@ _WORKFLOW_LINE_RE = re.compile(
     r"(?:cleaned\s+up\s+at|processed\s+at|generated\s+at)(?:\s*:|\s+)|"
     r"processed\s+by\s+speech[- ]to[- ]text\s+from\s+a\s+digitised\s+tape\s+recording\s+"
     r"originally\s+(?:taken\s+from|recorded\s+in\s+person\s+by)\b|"
+    r"needs\s+human\s+review\.?$|"
     r"(?:model|device|processing\s+time|audio\s+preprocessing|"
     r"pipeline(?:\s+version)?|cleanup\s+model|transcription\s+information)\s*:"
     r")",
@@ -339,12 +340,24 @@ def _add_publication_opening(doc: Document, publication: PublicationMetadata) ->
     _set_font(metadata_run, size=10, color=MUTED_COLOUR)
 
 
-def _add_provenance_postscript(doc: Document, publication: PublicationMetadata) -> None:
+def _add_provenance_postscript(
+    doc: Document,
+    publication: PublicationMetadata,
+    *,
+    needs_human_review: bool = False,
+) -> None:
     paragraph = doc.add_paragraph()
     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
     _set_paragraph_rhythm(paragraph, before=12, after=0, line_spacing=1.0)
     run = paragraph.add_run(publication.postscript)
     _set_font(run, size=9, color=MUTED_COLOUR, italic=True)
+
+    if needs_human_review:
+        review_paragraph = doc.add_paragraph()
+        review_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        _set_paragraph_rhythm(review_paragraph, before=3, after=0, line_spacing=1.0)
+        review_run = review_paragraph.add_run("Needs human review.")
+        _set_font(review_run, size=9, color=MUTED_COLOUR, italic=True, bold=True)
 
 
 def _set_core_properties(doc: Document, publication: PublicationMetadata) -> None:
@@ -398,6 +411,7 @@ def convert_txt_to_docx_from_text(
     output_path: Optional[Path] = None,
     relative_source_path: Optional[Path] = None,
     publication_metadata: Optional[PublicationMetadata] = None,
+    needs_human_review: bool = False,
 ) -> Path:
     """Convert transcript text directly to an atomically written DOCX.
     
@@ -410,6 +424,7 @@ def convert_txt_to_docx_from_text(
         output_path: Optional explicit DOCX destination (defaults to next to the source)
         relative_source_path: Optional archive-relative path used for metadata inference
         publication_metadata: Optional explicit publication fields, bypassing inference
+        needs_human_review: Append a removable review notice to GLM-produced documents
     
     Returns:
         Path to the created DOCX file
@@ -443,7 +458,11 @@ def convert_txt_to_docx_from_text(
     _set_core_properties(doc, publication)
     _add_publication_opening(doc, publication)
     add_paragraphs_from_text(doc, body_text)
-    _add_provenance_postscript(doc, publication)
+    _add_provenance_postscript(
+        doc,
+        publication,
+        needs_human_review=needs_human_review,
+    )
 
     # Explicit output destinations let callers preserve a source-relative tree in
     # a separate output root. The default remains next to the source audio.

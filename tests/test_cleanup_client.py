@@ -32,6 +32,7 @@ def response(status: int, body: str, **headers: str) -> HttpResponse:
 def cleanup_response(
     corrected: str, *, status: str = "passed", model: str = "@cf/zai-org/glm-4.7-flash"
 ) -> HttpResponse:
+    corrected_sha256 = hashlib.sha256(corrected.encode("utf-8")).hexdigest()
     return response(
         200,
         json.dumps(
@@ -47,6 +48,20 @@ def cleanup_response(
                 "grounding": {
                     "glossary_terms_considered": 2,
                     "term_candidates": 1,
+                },
+                "repair": {
+                    "attempted": True,
+                    "profile": DEFAULT_CLEANUP_PROFILE,
+                    "model": "@cf/zai-org/glm-4.7-flash",
+                    "input_sha256": corrected_sha256,
+                    "output_sha256": corrected_sha256,
+                    "input_bytes": len(corrected.encode("utf-8")),
+                    "output_bytes": len(corrected.encode("utf-8")),
+                    "proposal_count": 0,
+                    "applied_count": 0,
+                    "review_count": 0,
+                    "rejected_count": 0,
+                    "decisions": [],
                 },
                 "usage": {"input_tokens": 20, "output_tokens": 20},
             }
@@ -188,6 +203,11 @@ class CleanupClientTests(unittest.TestCase):
             self.assertEqual(call["headers"]["CF-Access-Client-Secret"], "client-secret")
         first_payload = json.loads(transport.calls[1]["body"])
         second_payload = json.loads(transport.calls[2]["body"])
+        for call in transport.calls[1:]:
+            self.assertEqual(
+                call["headers"]["Idempotency-Key"],
+                hashlib.sha256(call["body"]).hexdigest(),
+            )
         self.assertEqual(first_payload["terms"], ["Gurdjieff", "Fourth Way"])
         self.assertEqual(second_payload["terms"], first_payload["terms"])
         self.assertEqual(
@@ -225,7 +245,7 @@ class CleanupClientTests(unittest.TestCase):
                 json.loads(path.read_text(encoding="utf-8"))
                 for path in sorted(input_directory.glob("chunk-*.json"))
             ]
-            self.assertEqual(CHECKPOINT_VERSION, 4)
+            self.assertEqual(CHECKPOINT_VERSION, 10)
             self.assertTrue(
                 all(
                     record["checkpoint_version"] == CHECKPOINT_VERSION
@@ -508,6 +528,91 @@ class CleanupClientTests(unittest.TestCase):
 
         with self.assertRaisesRegex(CleanupProtocolError, "pinned profile"):
             client.cleanup_text("cleaned")
+
+    def test_requires_semantic_repair_provenance(self):
+        bad = cleanup_response("Cleaned.")
+        decoded = json.loads(bad.body.decode("utf-8"))
+        del decoded["repair"]
+        transport = ScriptedTransport(
+            [
+                response(200, "Gurdjieff\n"),
+                response(200, json.dumps(decoded), **{"Content-Type": "application/json"}),
+            ]
+        )
+        client = self.make_client(transport)
+
+        with self.assertRaisesRegex(CleanupProtocolError, "no semantic repair metadata"):
+            client.cleanup_text("cleaned")
+
+    def test_rejects_semantic_repair_output_hash_mismatch(self):
+        bad = cleanup_response("Cleaned.")
+        decoded = json.loads(bad.body.decode("utf-8"))
+        decoded["repair"]["output_sha256"] = "0" * 64
+        transport = ScriptedTransport(
+            [
+                response(200, "Gurdjieff\n"),
+                response(200, json.dumps(decoded), **{"Content-Type": "application/json"}),
+            ]
+        )
+        client = self.make_client(transport)
+
+        with self.assertRaisesRegex(CleanupProtocolError, "output provenance"):
+            client.cleanup_text("cleaned")
+
+    def test_repair_review_metadata_fails_safe_even_if_quality_says_passed(self):
+        reply = cleanup_response("Cleaned.")
+        decoded = json.loads(reply.body.decode("utf-8"))
+        decoded["repair"].update(
+            {
+                "proposal_count": 1,
+                "applied_count": 0,
+                "review_count": 1,
+                "rejected_count": 0,
+                "decisions": [{"disposition": "review"}],
+            }
+        )
+        transport = ScriptedTransport(
+            [
+                response(200, "Gurdjieff\n"),
+                response(200, json.dumps(decoded), **{"Content-Type": "application/json"}),
+            ]
+        )
+
+        result = self.make_client(transport).cleanup_text("cleaned")
+
+        self.assertTrue(result.needs_review)
+
+    def test_tampered_repair_checkpoint_is_ignored_and_refetched(self):
+        text = "one two three"
+        terms = response(200, "Gurdjieff\n")
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint_dir = Path(temporary)
+            first = self.make_client(
+                ScriptedTransport([terms, cleanup_response("One two three.")])
+            ).cleanup_text(text, checkpoint_dir)
+            checkpoint = next(
+                (checkpoint_dir / first.input_sha256).glob("chunk-*.json")
+            )
+            record = json.loads(checkpoint.read_text(encoding="utf-8"))
+            record["response"]["repair"]["output_sha256"] = "0" * 64
+            checkpoint.write_text(json.dumps(record), encoding="utf-8")
+
+            retry_transport = ScriptedTransport(
+                [
+                    response(200, "Gurdjieff\n"),
+                    cleanup_response("Fresh one two three."),
+                ]
+            )
+            retried = self.make_client(retry_transport).cleanup_text(
+                text, checkpoint_dir
+            )
+
+        self.assertEqual(retried.text, "Fresh one two three.")
+        self.assertFalse(retried.chunks[0].from_checkpoint)
+        self.assertEqual(len(retry_transport.calls), 2)
+        self.assertTrue(
+            any("ignored invalid checkpoint" in warning for warning in retried.warnings)
+        )
 
     def test_from_environment_requires_both_access_credentials(self):
         with patch.dict(os.environ, {}, clear=True), patch(

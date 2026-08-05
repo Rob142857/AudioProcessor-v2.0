@@ -171,6 +171,8 @@ class ExistingTranscriptPipelineTests(unittest.TestCase):
             # Multiple recording formats share one already-created Word transcript.
             audio.with_suffix(".flac").write_bytes(b"second synthetic recording variant")
             (audio.parent / "missing-transcript.wav").write_bytes(b"no transcript")
+            review = audio.with_name(f"{audio.stem} - GLM Review.docx")
+            shutil.copyfile(transcript, review)
 
             selected = discover_audio(
                 archive,
@@ -180,6 +182,13 @@ class ExistingTranscriptPipelineTests(unittest.TestCase):
             )
 
             self.assertEqual(selected, [transcript.resolve()])
+            with self.assertRaisesRegex(ValueError, "generated output|GLM Review"):
+                discover_audio(
+                    review,
+                    output,
+                    existing_transcripts_only=True,
+                    existing_docx_mode="all",
+                )
             with self.assertRaisesRegex(ValueError, "Skip existing|select nothing"):
                 discover_audio(
                     archive,
@@ -218,6 +227,13 @@ class ExistingTranscriptPipelineTests(unittest.TestCase):
                 self.assertFalse(paths["srt"].exists())
 
                 manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
+                self.assertEqual(
+                    manifest["approval_state"], "pending_human_review"
+                )
+                self.assertEqual(
+                    manifest["publication"]["approval_state"],
+                    "pending_human_review",
+                )
                 self.assertIs(manifest["stt"]["performed"], False)
                 self.assertEqual(manifest["stt"]["backend"], "imported-docx")
                 self.assertIsNone(manifest["artifacts"]["segments"])
@@ -321,13 +337,14 @@ class ExistingTranscriptPipelineTests(unittest.TestCase):
             self.assertEqual(failed_manifest["status"], "failed")
             self.assertIn("refusing to re-import", failed_manifest["error"])
 
-    def test_publication_retains_exact_backup_and_repeat_is_noop(self):
+    def test_publication_keeps_source_and_backs_up_only_prior_review_copy(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             archive, _audio, transcript, output = self.make_archive(root)
             source = transcript.resolve()
             original_bytes = source.read_bytes()
             original_hash = sha256_file(source)
+            review = source.with_name(f"{source.stem} - GLM Review.docx")
             config = self.config(archive, output, publish=True)
             runner = PipelineRunner(config)
             self.install_fakes(runner, FakeCleanupClient())
@@ -356,33 +373,103 @@ class ExistingTranscriptPipelineTests(unittest.TestCase):
             )
             self.assertIsNotNone(first)
             self.assertEqual(first["status"], "published")
-            self.assertEqual(first["operations"]["replace"], 1)
-            backup = (
-                Path(first["backup_root"])
-                / Path(first["plan"]["items"][0]["target_relative"])
+            self.assertEqual(first["approval_state"], "pending_human_review")
+            self.assertEqual(first["operations"]["create"], 1)
+            self.assertTrue(Path(first["backup_root"]).is_dir())
+            self.assertEqual(list(Path(first["backup_root"]).rglob("*.docx")), [])
+            self.assertEqual(source.read_bytes(), original_bytes)
+            self.assertEqual(sha256_file(source), original_hash)
+            self.assertEqual(review.read_bytes(), generated_bytes)
+
+            changed_text = BODY_TEXT.replace("careful observation", "patient observation")
+            forced_config = self.config(archive, output, force=True, publish=True)
+            forced = PipelineRunner(forced_config)
+            self.install_fakes(
+                forced, FakeCleanupClient(result_text=changed_text)
             )
-            self.assertTrue(backup.is_file())
-            self.assertEqual(backup.read_bytes(), original_bytes)
-            self.assertEqual(sha256_file(backup), original_hash)
-            self.assertEqual(source.read_bytes(), generated_bytes)
+            try:
+                self.assertEqual(forced.process_one(source), "verified")
+            finally:
+                forced.close()
+            regenerated_bytes = paths["docx"].read_bytes()
+            self.assertNotEqual(regenerated_bytes, generated_bytes)
 
             second = publish_source_docx_batch(
-                config,
+                forced_config,
                 counts,
                 manifest_paths=[paths["manifest"]],
                 now=first_time + timedelta(seconds=1),
             )
             self.assertIsNotNone(second)
             self.assertEqual(second["status"], "published")
-            self.assertEqual(second["operations"]["noop"], 1)
-            self.assertFalse(Path(second["backup_root"]).exists())
-            self.assertEqual(source.read_bytes(), generated_bytes)
+            self.assertEqual(second["operations"]["replace"], 1)
+            backup = (
+                Path(second["backup_root"])
+                / Path(second["plan"]["items"][0]["target_relative"])
+            )
+            self.assertEqual(backup.read_bytes(), generated_bytes)
+            self.assertEqual(review.read_bytes(), regenerated_bytes)
+            self.assertEqual(source.read_bytes(), original_bytes)
+
+            third = publish_source_docx_batch(
+                forced_config,
+                counts,
+                manifest_paths=[paths["manifest"]],
+                now=first_time + timedelta(seconds=2),
+            )
+            self.assertEqual(third["operations"]["noop"], 1)
+            self.assertFalse(Path(third["backup_root"]).exists())
+
+    def test_manually_changed_review_copy_fails_closed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            archive, _audio, transcript, output = self.make_archive(root)
+            source = transcript.resolve()
+            source_bytes = source.read_bytes()
+            config = self.config(archive, output, publish=True)
+            runner = PipelineRunner(config)
+            self.install_fakes(runner, FakeCleanupClient())
+            try:
+                self.assertEqual(runner.process_one(source), "verified")
+            finally:
+                runner.close()
+            paths = artifact_paths(artifact_directory(source, archive, output))
+            counts = {
+                "discovered": 1,
+                "queued": 0,
+                "skipped": 0,
+                "verified": 1,
+                "needs_review": 0,
+                "failed": 0,
+                "cancelled": 0,
+            }
+            publish_source_docx_batch(
+                config, counts, manifest_paths=[paths["manifest"]]
+            )
+            review = source.with_name(f"{source.stem} - GLM Review.docx")
+            write_legacy_docx(
+                review,
+                (
+                    "A human deliberately changed this review copy and those edits must not be overwritten.",
+                    "The pipeline must fail closed until the conflict is resolved explicitly.",
+                ),
+            )
+
+            with self.assertRaisesRegex(
+                ReplacementError, "manually changed|not a proven prior publication"
+            ):
+                plan_legacy_docx_replacements(
+                    output, archive, manifest_paths=[paths["manifest"]]
+                )
+            self.assertEqual(source.read_bytes(), source_bytes)
 
     def test_hard_interruption_after_commit_is_recoverable_from_planned_journal(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             archive, _audio, transcript, output = self.make_archive(root)
             source = transcript.resolve()
+            source_bytes = source.read_bytes()
+            review = source.with_name(f"{source.stem} - GLM Review.docx")
             config = self.config(archive, output, publish=True)
             runner = PipelineRunner(config)
             self.install_fakes(runner, FakeCleanupClient())
@@ -413,9 +500,10 @@ class ExistingTranscriptPipelineTests(unittest.TestCase):
                 expected_count,
             ):
                 item = plan.items[0]
-                backup = Path(backup_root) / item.target_relative
-                backup.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(item.target, backup)
+                if item.original_sha256 is not None:
+                    backup = Path(backup_root) / item.target_relative
+                    backup.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(item.target, backup)
                 staged = item.target.parent / f".{item.target.name}.power-loss-test"
                 shutil.copyfile(item.generated, staged)
                 os.replace(staged, item.target)
@@ -436,7 +524,8 @@ class ExistingTranscriptPipelineTests(unittest.TestCase):
 
             journal = output / "source-docx-publication-20260805-130000-123456.json"
             self.assertEqual(json.loads(journal.read_text(encoding="utf-8"))["status"], "planned")
-            self.assertEqual(source.read_bytes(), generated_bytes)
+            self.assertEqual(source.read_bytes(), source_bytes)
+            self.assertEqual(review.read_bytes(), generated_bytes)
 
             changed_text = BODY_TEXT.replace(
                 "careful observation", "patient observation", 1
@@ -458,7 +547,8 @@ class ExistingTranscriptPipelineTests(unittest.TestCase):
 
             regenerated_bytes = paths["docx"].read_bytes()
             self.assertNotEqual(regenerated_bytes, generated_bytes)
-            self.assertEqual(source.read_bytes(), generated_bytes)
+            self.assertEqual(source.read_bytes(), source_bytes)
+            self.assertEqual(review.read_bytes(), generated_bytes)
             recovered = publish_source_docx_batch(
                 resumed_config,
                 counts,
@@ -467,13 +557,16 @@ class ExistingTranscriptPipelineTests(unittest.TestCase):
             )
             self.assertEqual(recovered["status"], "published")
             self.assertEqual(recovered["operations"]["replace"], 1)
-            self.assertEqual(source.read_bytes(), regenerated_bytes)
+            self.assertEqual(review.read_bytes(), regenerated_bytes)
+            self.assertEqual(source.read_bytes(), source_bytes)
 
     def test_incomplete_rollback_journal_remains_recoverable(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             archive, _audio, transcript, output = self.make_archive(root)
             source = transcript.resolve()
+            source_bytes = source.read_bytes()
+            review = source.with_name(f"{source.stem} - GLM Review.docx")
             config = self.config(archive, output, publish=True)
             runner = PipelineRunner(config)
             self.install_fakes(runner, FakeCleanupClient())
@@ -506,9 +599,10 @@ class ExistingTranscriptPipelineTests(unittest.TestCase):
                 expected_count,
             ):
                 item = plan.items[0]
-                backup = Path(backup_root) / item.target_relative
-                backup.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(item.target, backup)
+                if item.original_sha256 is not None:
+                    backup = Path(backup_root) / item.target_relative
+                    backup.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(item.target, backup)
                 staged = item.target.parent / f".{item.target.name}.rollback-test"
                 shutil.copyfile(item.generated, staged)
                 os.replace(staged, item.target)
@@ -530,7 +624,8 @@ class ExistingTranscriptPipelineTests(unittest.TestCase):
             journal = output / "source-docx-publication-20260805-140000-123456.json"
             report = json.loads(journal.read_text(encoding="utf-8"))
             self.assertEqual(report["status"], "rollback_incomplete")
-            self.assertEqual(source.read_bytes(), generated_bytes)
+            self.assertEqual(source.read_bytes(), source_bytes)
+            self.assertEqual(review.read_bytes(), generated_bytes)
 
             resumed = PipelineRunner(config)
             self.install_fakes(resumed, FakeCleanupClient())

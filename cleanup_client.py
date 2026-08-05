@@ -29,10 +29,10 @@ from pipeline_control import CancelCheck, raise_if_cancelled
 
 DEFAULT_ENDPOINT = "https://pg.objectiveartefacts.com.au/api/tooling/cleanup-chunk"
 DEFAULT_MODEL = "@cf/zai-org/glm-4.7-flash"
-DEFAULT_CLEANUP_PROFILE = "semantic-conservative-v3"
+DEFAULT_CLEANUP_PROFILE = "semantic-conservative-repair-v9"
 DEFAULT_TARGET_WORDS = 800
 DEFAULT_MAX_CHARS = 18_000
-CHECKPOINT_VERSION = 4
+CHECKPOINT_VERSION = 10
 CANCEL_BACKOFF_POLL_SECONDS = 0.1
 CREDENTIAL_SERVICE = "AudioProcessor Cloudflare Access"
 CREDENTIAL_CLIENT_ID_KEY = "client-id"
@@ -49,6 +49,13 @@ _ACCESS_MARKERS = (
     "cloudflareaccess.com",
     "/cdn-cgi/access/login",
     "cf-access",
+)
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_REPAIR_COUNT_FIELDS = (
+    "proposal_count",
+    "applied_count",
+    "review_count",
+    "rejected_count",
 )
 
 
@@ -176,6 +183,66 @@ class GlossarySnapshot:
         }
 
 
+def _validated_repair_metadata(
+    value: Any,
+    *,
+    corrected: str,
+    context: str,
+) -> Mapping[str, Any]:
+    """Validate the bounded semantic-repair ledger returned by profile v9."""
+
+    if not isinstance(value, Mapping):
+        raise CleanupProtocolError(f"{context} returned no semantic repair metadata")
+    if value.get("attempted") is not True:
+        raise CleanupProtocolError(f"{context} did not mark semantic repair attempted")
+    if value.get("profile") != DEFAULT_CLEANUP_PROFILE:
+        raise CleanupProtocolError(
+            f"{context} returned repair profile {value.get('profile')!r}, "
+            f"not {DEFAULT_CLEANUP_PROFILE!r}"
+        )
+    if value.get("model") != DEFAULT_MODEL:
+        raise CleanupProtocolError(
+            f"{context} returned repair model {value.get('model')!r}, "
+            f"not {DEFAULT_MODEL!r}"
+        )
+    input_sha256 = value.get("input_sha256")
+    output_sha256 = value.get("output_sha256")
+    if not isinstance(input_sha256, str) or not _SHA256_RE.fullmatch(input_sha256):
+        raise CleanupProtocolError(f"{context} returned an invalid repair input hash")
+    if not isinstance(output_sha256, str) or not _SHA256_RE.fullmatch(output_sha256):
+        raise CleanupProtocolError(f"{context} returned an invalid repair output hash")
+    if output_sha256 != _sha256_text(corrected):
+        raise CleanupProtocolError(
+            f"{context} returned mismatched semantic repair output provenance"
+        )
+    for name in ("input_bytes", "output_bytes", *_REPAIR_COUNT_FIELDS):
+        item = value.get(name)
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            raise CleanupProtocolError(
+                f"{context} returned an invalid semantic repair {name}"
+            )
+    if value.get("output_bytes") != len(corrected.encode("utf-8")):
+        raise CleanupProtocolError(
+            f"{context} returned mismatched semantic repair output size"
+        )
+    decisions = value.get("decisions")
+    if not isinstance(decisions, list) or len(decisions) > 12 or any(
+        not isinstance(decision, Mapping) for decision in decisions
+    ):
+        raise CleanupProtocolError(f"{context} returned an invalid repair decision ledger")
+    if value.get("proposal_count") != len(decisions) or sum(
+        int(value.get(name, 0))
+        for name in ("applied_count", "review_count", "rejected_count")
+    ) != len(decisions):
+        raise CleanupProtocolError(f"{context} returned inconsistent repair counts")
+    error = value.get("error")
+    if error is not None and (not isinstance(error, str) or len(error) > 1_024):
+        raise CleanupProtocolError(f"{context} returned an invalid repair error")
+    if len(json.dumps(value, ensure_ascii=False)) > 64 * 1024:
+        raise CleanupProtocolError(f"{context} returned oversized repair metadata")
+    return value
+
+
 @dataclass(frozen=True)
 class CleanupChunkResult:
     """One service response plus the source slice it corresponds to."""
@@ -187,6 +254,7 @@ class CleanupChunkResult:
     model: str | None
     quality: Any
     grounding: Any
+    repair: Any
     usage: Any
     from_checkpoint: bool = False
 
@@ -198,9 +266,20 @@ class CleanupChunkResult:
     def needs_review(self) -> bool:
         if not isinstance(self.quality, Mapping):
             return True
-        return (
+        quality_requires_review = (
             self.quality.get("status") != "passed"
             or bool(self.quality.get("used_original"))
+        )
+        if quality_requires_review:
+            return True
+        if not self.source_text.strip():
+            return False
+        if not isinstance(self.repair, Mapping):
+            return True
+        return (
+            self.repair.get("attempted") is not True
+            or bool(self.repair.get("error"))
+            or self.repair.get("review_count") != 0
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -213,6 +292,7 @@ class CleanupChunkResult:
             "model": self.model,
             "quality": self.quality,
             "grounding": self.grounding,
+            "repair": self.repair,
             "usage": self.usage,
             "from_checkpoint": self.from_checkpoint,
         }
@@ -347,7 +427,7 @@ class CleanupClient:
         target_words: int = DEFAULT_TARGET_WORDS,
         max_chars: int = DEFAULT_MAX_CHARS,
         preceding_context_words: int = 100,
-        timeout: float = 60.0,
+        timeout: float = 300.0,
         max_attempts: int = 4,
         retry_base_delay: float = 1.0,
         transport: Transport | None = None,
@@ -558,6 +638,7 @@ class CleanupClient:
                         model=None,
                         quality=quality,
                         grounding=None,
+                        repair=None,
                         usage=None,
                     )
                 else:
@@ -641,11 +722,13 @@ class CleanupClient:
         payload["model"] = self.model
         payload["cleanupProfile"] = DEFAULT_CLEANUP_PROFILE
 
+        encoded_payload = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         response = self._request(
             "POST",
             self.endpoint,
-            body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            body=encoded_payload,
             content_type="application/json; charset=utf-8",
+            idempotency_key=hashlib.sha256(encoded_payload).hexdigest(),
             cancel_check=cancel_check,
         )
         try:
@@ -682,6 +765,11 @@ class CleanupClient:
                 f"{cleanup_profile!r}, not the pinned profile "
                 f"{DEFAULT_CLEANUP_PROFILE!r}"
             )
+        repair = _validated_repair_metadata(
+            decoded.get("repair"),
+            corrected=corrected,
+            context=f"cleanup chunk {chunk.index + 1}",
+        )
         return CleanupChunkResult(
             index=chunk.index,
             total_chunks=total_chunks,
@@ -690,6 +778,7 @@ class CleanupClient:
             model=model,
             quality=decoded.get("quality"),
             grounding=decoded.get("grounding"),
+            repair=repair,
             usage=decoded.get("usage"),
         )
 
@@ -700,6 +789,7 @@ class CleanupClient:
         *,
         body: bytes | None,
         content_type: str | None = None,
+        idempotency_key: str | None = None,
         cancel_check: CancelCheck | None = None,
     ) -> HttpResponse:
         headers = {
@@ -710,6 +800,10 @@ class CleanupClient:
         }
         if content_type:
             headers["Content-Type"] = content_type
+        if idempotency_key:
+            if not _SHA256_RE.fullmatch(idempotency_key):
+                raise CleanupConfigurationError("invalid cleanup idempotency key")
+            headers["Idempotency-Key"] = idempotency_key
 
         last_network_error: BaseException | None = None
         for attempt in range(self.max_attempts):
@@ -828,6 +922,23 @@ class CleanupClient:
             model = response.get("model")
             if model is not None and not isinstance(model, str):
                 raise ValueError("checkpoint model id is invalid")
+            if chunk.text.strip():
+                if model != self.model:
+                    raise ValueError(
+                        f"checkpoint used {model!r}, not pinned model {self.model!r}"
+                    )
+                try:
+                    repair = _validated_repair_metadata(
+                        response.get("repair"),
+                        corrected=corrected,
+                        context=f"checkpoint chunk {chunk.index + 1}",
+                    )
+                except CleanupProtocolError as exc:
+                    raise ValueError(str(exc)) from exc
+            else:
+                if corrected != chunk.text or model is not None or response.get("repair") is not None:
+                    raise ValueError("local passthrough checkpoint is inconsistent")
+                repair = None
             return (
                 CleanupChunkResult(
                     index=chunk.index,
@@ -837,6 +948,7 @@ class CleanupClient:
                     model=model,
                     quality=response.get("quality"),
                     grounding=response.get("grounding"),
+                    repair=repair,
                     usage=response.get("usage"),
                     from_checkpoint=True,
                 ),
@@ -871,6 +983,7 @@ class CleanupClient:
                 "model": result.model,
                 "quality": result.quality,
                 "grounding": result.grounding,
+                "repair": result.repair,
                 "usage": result.usage,
             },
         }

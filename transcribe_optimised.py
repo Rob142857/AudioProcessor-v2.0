@@ -24,7 +24,8 @@ import psutil
 import argparse
 import multiprocessing
 import threading
-from typing import Any, cast, Optional, Dict
+from pathlib import Path
+from typing import Any, Callable, cast, Optional, Dict, Iterable, Sequence
 
 from console_compat import configure_safe_stdio
 
@@ -262,6 +263,11 @@ def _compatible_transcribe_call(_model, _audio, _kwargs):
             else:
                 # Both present — drop the native-whisper key to avoid conflict
                 kw.pop('logprob_threshold')
+        # Faster-Whisper ignores hotwords whenever ``prefix`` is present.  A
+        # caller should never be able to accidentally disable the terminology
+        # bias by passing both options.
+        if kw.get('hotwords'):
+            kw.pop('prefix', None)
         # Keep only supported keys; leave values unchanged for the rest
         filtered = {k: v for k, v in kw.items() if k in allowed}
     except Exception:
@@ -299,7 +305,38 @@ def _as_result_dict(res: Any) -> Dict[str, Any]:
                     start = float(getattr(s, 'start', 0.0) or 0.0)
                     end = float(getattr(s, 'end', 0.0) or 0.0)
                     if txt:
-                        seg_list.append({'text': txt, 'start': start, 'end': end})
+                        segment = {'text': txt, 'start': start, 'end': end}
+                        # Keep Faster-Whisper's diagnostics.  These are needed
+                        # to find questionable spans without decoding the whole
+                        # recording again, and all values are JSON-compatible.
+                        for name in (
+                            'id', 'seek', 'avg_logprob', 'compression_ratio',
+                            'no_speech_prob', 'temperature', 'tokens',
+                        ):
+                            if hasattr(s, name):
+                                value = getattr(s, name)
+                                if name == 'tokens' and value is not None:
+                                    value = list(value)
+                                segment[name] = value
+
+                        words_value = getattr(s, 'words', None)
+                        if words_value is not None:
+                            words = []
+                            for word in words_value:
+                                word_text = getattr(word, 'word', '')
+                                words.append(
+                                    {
+                                        'start': float(getattr(word, 'start', 0.0) or 0.0),
+                                        'end': float(getattr(word, 'end', 0.0) or 0.0),
+                                        'word': str(word_text or ''),
+                                        'probability': float(
+                                            getattr(word, 'probability', 0.0) or 0.0
+                                        ),
+                                    }
+                                )
+                            segment['words'] = words
+
+                        seg_list.append(segment)
                         parts.append(txt)
             except _StopRequested:
                 raise
@@ -307,6 +344,12 @@ def _as_result_dict(res: Any) -> Dict[str, Any]:
                 print(f"⚠️  FW segment iteration error: {type(_seg_err).__name__}: {_seg_err}")
                 import traceback as _tb
                 _tb.print_exc()
+                # A Faster-Whisper result is a lazy generator.  Returning the
+                # segments accumulated before a decoder/I/O failure would make
+                # a truncated lecture look like a successful transcript.
+                raise RuntimeError(
+                    "Faster-Whisper segment iteration failed before completion"
+                ) from _seg_err
             out: Dict[str, Any] = {
                 'segments': seg_list,
                 'text': ' '.join(parts).strip(),
@@ -317,12 +360,79 @@ def _as_result_dict(res: Any) -> Dict[str, Any]:
                     out['language'] = lang
             except Exception:
                 pass
+            for source_name, output_name in (
+                ('language_probability', 'language_probability'),
+                ('duration', 'duration'),
+                ('duration_after_vad', 'duration_after_vad'),
+                ('all_language_probs', 'all_language_probs'),
+            ):
+                try:
+                    value = getattr(info, source_name, None)
+                    if value is not None:
+                        out[output_name] = value
+                except Exception:
+                    pass
             return out
     except _StopRequested:
         raise
     except Exception as _outer_err:
         print(f"⚠️  _as_result_dict outer error: {type(_outer_err).__name__}: {_outer_err}")
+        raise
     return {'segments': [], 'text': ''}
+
+
+def _preprocessing_padding_seconds(mode: str) -> float:
+    return 1.2 if str(mode).strip().casefold() == "minimal" else 1.5
+
+
+def _shift_transcript_timestamps(
+    result: Dict[str, Any],
+    *,
+    lead_seconds: float,
+    source_duration_seconds: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Map timestamps from a lead-padded decode back to the source recording."""
+
+    if lead_seconds <= 0 or not isinstance(result, dict):
+        return result
+    shifted = dict(result)
+    segments = result.get('segments')
+    if not isinstance(segments, list):
+        return shifted
+
+    ceiling = (
+        max(0.0, float(source_duration_seconds))
+        if source_duration_seconds is not None
+        else None
+    )
+
+    def adjust(value: Any) -> float:
+        adjusted = max(0.0, float(value or 0.0) - lead_seconds)
+        return min(adjusted, ceiling) if ceiling is not None else adjusted
+
+    shifted_segments: list[Any] = []
+    for original in segments:
+        if not isinstance(original, dict):
+            shifted_segments.append(original)
+            continue
+        segment = dict(original)
+        segment['start'] = adjust(segment.get('start'))
+        segment['end'] = max(segment['start'], adjust(segment.get('end')))
+        words = segment.get('words')
+        if isinstance(words, list):
+            shifted_words: list[Any] = []
+            for original_word in words:
+                if not isinstance(original_word, dict):
+                    shifted_words.append(original_word)
+                    continue
+                word = dict(original_word)
+                word['start'] = adjust(word.get('start'))
+                word['end'] = max(word['start'], adjust(word.get('end')))
+                shifted_words.append(word)
+            segment['words'] = shifted_words
+        shifted_segments.append(segment)
+    shifted['segments'] = shifted_segments
+    return shifted
 
 
 def preprocess_audio_with_padding(input_path: str, temp_dir: str = None) -> str:
@@ -597,12 +707,57 @@ def create_efficient_dataloader(audio_path: str, batch_size: int = 4, num_worker
 
 
 # --- Special words support (prompt biasing) ---------------------------------
+FASTER_WHISPER_HOTWORD_TOKEN_BUDGET = 223
+HOTWORD_SELECTION_VERSION = "faster-whisper-hotwords-v1"
+
+
 def _read_lines(path: str) -> list:
     try:
         with open(path, 'r', encoding='utf-8') as f:
             return [ln.strip() for ln in f.readlines()]
     except Exception:
         return []
+
+
+def _clean_awkward_terms(terms: Iterable[Any]) -> list[str]:
+    """Return complete, unique terminology entries in stable source order."""
+
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for value in terms:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if not text:
+            continue
+        # Never allow an editable glossary entry to smuggle Whisper decoder
+        # control tokens or non-text controls into the prompt token stream.
+        if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", text):
+            continue
+        if re.search(r"<\|[^<>]*\|>", text):
+            continue
+        text = text.lstrip('-•*\t >').strip()
+        if not text or text.startswith('#'):
+            continue
+        # Collapse layout whitespace without changing punctuation or case.
+        text = re.sub(r"\s+", " ", text)
+        key = text.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(text)
+    return cleaned
+
+
+def load_core_awkward_terms() -> list[str]:
+    """Load the repository's curated, must-keep terminology list."""
+
+    repo_dir = Path(__file__).resolve().parent
+    for filename in ('special_words.txt', 'special_words.md'):
+        candidate = repo_dir / filename
+        if candidate.is_file():
+            return _clean_awkward_terms(_read_lines(str(candidate)))
+    return []
 
 
 def load_awkward_terms(input_path: str) -> list:
@@ -647,40 +802,195 @@ def load_awkward_terms(input_path: str) -> list:
     except Exception:
         pass
 
-    # Normalize simple bullet formats and filter empties/comments
-    cleaned = []
-    for ln in terms:
-        if not ln:
-            continue
-        s = ln.lstrip('-•*\t >').strip()
-        if not s or s.startswith('#'):
-            continue
-        if s not in cleaned:
-            cleaned.append(s)
-
-    # Cap length to keep prompt focused - increased for better domain coverage
-    # Whisper can handle up to 224 tokens (~500-600 chars) effectively
-    return cleaned[:100]  # Increased from 40 to 100 terms
+    # Do not truncate here. A complete glossary may contain thousands of terms;
+    # the tokenizer-aware selector below chooses whole entries for each file.
+    return _clean_awkward_terms(terms)
 
 
-def build_initial_prompt(terms: list, max_chars: int = 600) -> Optional[str]:
-    """Build a concise initial_prompt string to bias Whisper.
+def build_initial_prompt(terms: Iterable[Any], max_chars: int = 240) -> Optional[str]:
+    """Build a short prompt without cutting a terminology entry in half.
 
-    Keeps capitalization as provided; trims to max_chars.
-    Increased from 400 to 600 chars for better domain term coverage.
+    Faster-Whisper terminology belongs in ``hotwords``. This helper is kept for
+    short factual metadata (and the native-Whisper compatibility path).
     """
     if not terms:
         return None
     try:
-        # Best practice: provide only a short neutral vocabulary list to reduce prompt leakage
-        # Avoid meta-instructions that can be transcribed verbatim.
-        payload = '; '.join(terms)
-        prompt = payload.strip()
-        if len(prompt) > max_chars:
-            prompt = prompt[: max_chars - 3].rstrip() + '...'
-        return prompt
+        selected: list[str] = []
+        for term in _clean_awkward_terms(terms):
+            candidate = '; '.join([*selected, term])
+            if len(candidate) <= max_chars:
+                selected.append(term)
+        return '; '.join(selected) or None
     except Exception:
         return None
+
+
+def _encoded_token_ids(
+    encode: Callable[[str], Any],
+    text: str,
+) -> list[Any]:
+    encoded = encode(text)
+    ids = getattr(encoded, 'ids', encoded)
+    if isinstance(ids, Sequence) and not isinstance(ids, (str, bytes, bytearray)):
+        return list(ids)
+    return list(ids or [])
+
+
+def _hotword_relevance(term: str, context: str) -> tuple[int, int, float]:
+    """Return a deterministic lexical relevance score for one glossary term."""
+
+    normalized_term = re.sub(r"[^\w]+", " ", term.casefold()).strip()
+    normalized_context = re.sub(r"[^\w]+", " ", context.casefold()).strip()
+    if not normalized_term:
+        return (0, 0, 0.0)
+    exact = int(
+        re.search(
+            rf"(?<!\w){re.escape(normalized_term)}(?!\w)",
+            normalized_context,
+        )
+        is not None
+    )
+    term_words = set(normalized_term.split())
+    context_words = set(normalized_context.split())
+    overlap = len(term_words & context_words)
+    coverage = overlap / max(1, len(term_words))
+    return (exact, overlap, coverage)
+
+
+def select_faster_whisper_hotwords(
+    terms: Iterable[Any],
+    *,
+    core_terms: Iterable[Any],
+    context: str,
+    encode: Callable[[str], Any],
+    max_tokens: int = FASTER_WHISPER_HOTWORD_TOKEN_BUDGET,
+) -> dict[str, Any]:
+    """Choose complete hotword entries using Faster-Whisper's tokenizer.
+
+    The curated repository terms are reserved first. Remaining glossary terms
+    are ranked by their relation to the source path/title and then by stable
+    input order. No term is ever character- or token-sliced.
+    """
+
+    if max_tokens < 1:
+        raise ValueError("Faster-Whisper hotword token budget must be positive")
+
+    core = _clean_awkward_terms(core_terms)
+    combined = _clean_awkward_terms([*core, *_clean_awkward_terms(terms)])
+    core_keys = {term.casefold() for term in core}
+    remaining = [term for term in combined if term.casefold() not in core_keys]
+    original_index = {term.casefold(): index for index, term in enumerate(combined)}
+    remaining.sort(
+        key=lambda term: (
+            -_hotword_relevance(term, context)[0],
+            -_hotword_relevance(term, context)[1],
+            -_hotword_relevance(term, context)[2],
+            original_index[term.casefold()],
+            term.casefold(),
+        )
+    )
+
+    # Punctuation makes phrase boundaries clear. If a future core list grows
+    # beyond the installed limit, a whitespace separator saves tokens while
+    # still retaining every complete term. Fail loudly only when inclusion is
+    # mathematically impossible instead of silently dropping a core entry.
+    separator = '; '
+
+    def token_count(selected: Sequence[str], delimiter: str) -> int:
+        if not selected:
+            return 0
+        payload = delimiter.join(selected)
+        # Faster-Whisper itself prepends this space before tokenization.
+        return len(_encoded_token_ids(encode, ' ' + payload.strip()))
+
+    if token_count(core, separator) > max_tokens:
+        separator = ' '
+    core_token_count = token_count(core, separator)
+    if core_token_count > max_tokens:
+        raise ValueError(
+            "The curated special_words list exceeds Faster-Whisper's "
+            f"{max_tokens}-token hotword allowance"
+        )
+
+    selected = list(core)
+    selected_keys = {term.casefold() for term in selected}
+    for term in remaining:
+        candidate = [*selected, term]
+        if token_count(candidate, separator) <= max_tokens:
+            selected.append(term)
+            selected_keys.add(term.casefold())
+
+    dropped = [term for term in combined if term.casefold() not in selected_keys]
+    payload = separator.join(selected) if selected else None
+    return {
+        'version': HOTWORD_SELECTION_VERSION,
+        'hotwords': payload,
+        'selected_terms': selected,
+        'dropped_terms': dropped,
+        'selected_count': len(selected),
+        'dropped_count': len(dropped),
+        'source_term_count': len(combined),
+        'core_term_count': len(core),
+        'token_count': token_count(selected, separator),
+        'token_budget': int(max_tokens),
+        'separator': separator,
+    }
+
+
+def build_faster_whisper_hotwords(
+    model: Any,
+    terms: Iterable[Any],
+    *,
+    core_terms: Iterable[Any],
+    context: str,
+) -> dict[str, Any]:
+    """Build hotwords using the tokenizer bundled with the loaded FW model."""
+
+    tokenizer = getattr(model, 'hf_tokenizer', None)
+    encode_method = getattr(tokenizer, 'encode', None)
+    if not callable(encode_method):
+        raise RuntimeError(
+            "Loaded Faster-Whisper model does not expose its tokenizer; "
+            "refusing to use a character-truncated hotword prompt"
+        )
+
+    def encode(text: str) -> Any:
+        try:
+            return encode_method(text, add_special_tokens=False)
+        except TypeError:
+            return encode_method(text)
+
+    model_limit = int(getattr(model, 'max_length', 448) or 448)
+    budget = min(FASTER_WHISPER_HOTWORD_TOKEN_BUDGET, max(1, model_limit // 2 - 1))
+    return select_faster_whisper_hotwords(
+        terms,
+        core_terms=core_terms,
+        context=context,
+        encode=encode,
+        max_tokens=budget,
+    )
+
+
+def should_apply_initial_prompt(
+    *,
+    prompt: Optional[str],
+    allow_prompt: bool,
+    using_faster_whisper: bool,
+    hotwords: Optional[str],
+) -> bool:
+    """Keep Faster-Whisper's decoder context within its safe token budget.
+
+    Faster-Whisper prepends hotwords and initial-prompt history separately.
+    Combining two near-half-window payloads can crowd out the actual decode.
+    Terminology wins; recording metadata still guides hotword selection.
+    """
+
+    return bool(
+        prompt
+        and allow_prompt
+        and not (using_faster_whisper and hotwords)
+    )
 
 # --- Artifact mitigation: collapse excessive exact repetitions ----------------
 def _collapse_repetitions(text: str, max_repeats: int = 10) -> str:
@@ -1449,9 +1759,10 @@ def transcribe_with_dataset_optimization(input_path: str, output_dir=None, threa
 
     print(f"⚙️  Threads: {config['cpu_threads']} CPU, {interop} interop")
 
-    # Build optional initial_prompt from special terms
+    # The legacy/native path has no hotwords option. Fit complete terms into its
+    # prompt allowance; never cut a vocabulary item midway through.
     awkward_terms = load_awkward_terms(input_path)
-    initial_prompt = build_initial_prompt(awkward_terms)
+    initial_prompt = build_initial_prompt(awkward_terms, max_chars=600)
     
     # Log loaded domain terms for debugging
     if awkward_terms:
@@ -1465,20 +1776,13 @@ def transcribe_with_dataset_optimization(input_path: str, output_dir=None, threa
     # Combine with GUI-provided context hint if available (prepended for visibility)
     gui_prompt = os.environ.get("TRANSCRIBE_INITIAL_PROMPT", "").strip()
     if gui_prompt:
-        if initial_prompt:
-            initial_prompt = f"{gui_prompt}. {initial_prompt}"
-        else:
-            initial_prompt = gui_prompt
+        initial_prompt = build_initial_prompt(
+            [gui_prompt, *awkward_terms], max_chars=600
+        )
         print(f"🎯 Context hint: '{gui_prompt}'")
     elif initial_prompt:
         preview = initial_prompt[:100]
         print(f"🧩 Using domain terms bias (initial_prompt): '{preview}...'")
-    
-    # CRITICAL: Truncate to Whisper's effective limit (~600 chars / 224 tokens).
-    # Factual recording metadata is placed first; lower-priority terms may be truncated.
-    if initial_prompt and len(initial_prompt) > 600:
-        initial_prompt = initial_prompt[:597].rstrip() + "..."
-        print(f"⚠️  Initial prompt truncated to 600 chars (Whisper token limit)")
     
     if initial_prompt:
         print(f"📝 Final initial_prompt ({len(initial_prompt)} chars): {initial_prompt[:150]}...")
@@ -2203,6 +2507,10 @@ def transcribe_with_vad_parallel(input_path, vad_segments, model, base_transcrib
                     for segment in result["segments"]:
                         segment["start"] += time_range[0]
                         segment["end"] += time_range[0]
+                        for word in segment.get("words") or []:
+                            if isinstance(word, dict):
+                                word["start"] = float(word.get("start") or 0.0) + time_range[0]
+                                word["end"] = float(word.get("end") or 0.0) + time_range[0]
 
                 return result
             except Exception as e:
@@ -2305,6 +2613,7 @@ def transcribe_file_simple_auto(
     return_details: bool = False,
     write_docx: bool = True,
     docx_output_path=None,
+    glossary_terms: Optional[Iterable[str]] = None,
 ):
     """
     High-quality, simplified single-file transcription on best available device.
@@ -2317,6 +2626,8 @@ def transcribe_file_simple_auto(
     ``return_details=True`` a dict is returned containing the formatted text,
     original model text and segments, metadata, output path and timing. Set
     ``write_docx=False`` for an STT-only call (requires ``return_details=True``).
+    ``glossary_terms`` accepts the complete pinned cleanup glossary; the
+    Faster-Whisper selector chooses a deterministic tokenizer-bounded subset.
     """
     global _SESSION_GPU_INIT_DONE, _SESSION_HW_CONFIG
     if not write_docx and not return_details:
@@ -2469,6 +2780,9 @@ def transcribe_file_simple_auto(
 
     # Preprocess audio with silence padding to prevent missed words
     # Preprocessing is MANDATORY for optimal quality with tape recordings
+    preprocessing_mode = str(
+        os.environ.get("TRANSCRIBE_PREPROC_MODE", "vintage_tape")
+    ).strip().lower()
     try:
         skip_preprocessing = os.environ.get("TRANSCRIBE_SKIP_PREPROCESS", "").strip() in ("1", "true", "yes")
         if skip_preprocessing:
@@ -2482,14 +2796,31 @@ def transcribe_file_simple_auto(
         preprocessed_path = input_path
     preprocessing_used = preprocessed_path != input_path
     working_input_path = preprocessed_path if preprocessing_used else input_path
+    preprocessing_lead_seconds = (
+        _preprocessing_padding_seconds(preprocessing_mode)
+        if preprocessing_used
+        else 0.0
+    )
 
-    duration = get_media_duration(working_input_path)
+    decoded_duration = get_media_duration(working_input_path)
+    source_duration = (
+        get_media_duration(input_path) if preprocessing_used else decoded_duration
+    )
+    if source_duration is None and decoded_duration is not None and preprocessing_used:
+        source_duration = max(
+            0.0, decoded_duration - (2.0 * preprocessing_lead_seconds)
+        )
+    duration = source_duration or decoded_duration
     if duration:
-        print(f"⏱️  Duration: {format_duration(duration)}")
+        print(f"⏱️  Source duration: {format_duration(duration)}")
 
-    # Build optional initial prompt from awkward words
-    awkward_terms = load_awkward_terms(input_path)
-    initial_prompt = build_initial_prompt(awkward_terms)
+    # Load the entire available glossary. Faster-Whisper terminology is selected
+    # after model load with its own tokenizer; the initial prompt remains short
+    # factual recording metadata only.
+    awkward_terms = _clean_awkward_terms(
+        [*load_awkward_terms(input_path), *(glossary_terms or ())]
+    )
+    core_awkward_terms = load_core_awkward_terms()
     
     # Log loaded domain terms for debugging
     if awkward_terms:
@@ -2500,26 +2831,13 @@ def transcribe_file_simple_auto(
     # and consumes the limited prompt budget. Use only factual vocabulary and
     # caller-supplied metadata below.
     
-    # Combine with GUI-provided context hint if available (prepended for visibility)
     gui_prompt = os.environ.get("TRANSCRIBE_INITIAL_PROMPT", "").strip()
+    initial_prompt = build_initial_prompt([gui_prompt], max_chars=240) if gui_prompt else None
     if gui_prompt:
-        if initial_prompt:
-            initial_prompt = f"{gui_prompt}. {initial_prompt}"
-        else:
-            initial_prompt = gui_prompt
         print(f"🎯 Context hint: '{gui_prompt}'")
-    elif initial_prompt:
-        preview = initial_prompt[:100]
-        print(f"🧩 Using domain terms bias (initial_prompt): '{preview}...'")
-    
-    # CRITICAL: Truncate to Whisper's effective limit (~600 chars / 224 tokens).
-    # Factual recording metadata is placed first; lower-priority terms may be truncated.
-    if initial_prompt and len(initial_prompt) > 600:
-        initial_prompt = initial_prompt[:597].rstrip() + "..."
-        print(f"⚠️  Initial prompt truncated to 600 chars (Whisper token limit)")
-    
+
     if initial_prompt:
-        print(f"📝 Final initial_prompt ({len(initial_prompt)} chars): {initial_prompt[:150]}...")
+        print(f"📝 Metadata initial_prompt ({len(initial_prompt)} chars): {initial_prompt}")
 
     # Pre-run cleanup (skip if session already initialized — model is cached)
     if not _SESSION_GPU_INIT_DONE:
@@ -3018,14 +3336,71 @@ def transcribe_file_simple_auto(
     except Exception:
         nvml = None
 
+    hotword_selection: dict[str, Any] = {
+        'version': HOTWORD_SELECTION_VERSION,
+        'applied': False,
+        'selected_terms': [],
+        'dropped_terms': list(awkward_terms),
+        'selected_count': 0,
+        'dropped_count': len(awkward_terms),
+        'source_term_count': len(awkward_terms),
+        'core_term_count': len(core_awkward_terms),
+        'token_count': 0,
+        'token_budget': FASTER_WHISPER_HOTWORD_TOKEN_BUDGET,
+        'reason': 'native-whisper',
+    }
+    faster_whisper_hotwords: Optional[str] = None
+    if using_fw:
+        # Use a move-stable filename plus the signature-bound metadata prompt;
+        # an absolute parent path would make selection change after relocation.
+        hotword_context = f"{Path(input_path).name}; {gui_prompt}".strip()
+        hotword_selection = build_faster_whisper_hotwords(
+            model,
+            awkward_terms,
+            core_terms=core_awkward_terms,
+            context=hotword_context,
+        )
+        faster_whisper_hotwords = hotword_selection.get('hotwords')
+        hotword_selection['applied'] = bool(faster_whisper_hotwords)
+        hotword_selection['reason'] = (
+            'applied' if faster_whisper_hotwords else 'no-terms'
+        )
+        print(
+            "📖 Faster-Whisper hotwords: "
+            f"{hotword_selection['selected_count']} selected, "
+            f"{hotword_selection['dropped_count']} deferred "
+            f"({hotword_selection['token_count']}/"
+            f"{hotword_selection['token_budget']} tokens)"
+        )
+    elif awkward_terms:
+        # Native Whisper has no hotwords option. Retain whole-entry prompt bias
+        # for compatibility, with factual metadata first.
+        initial_prompt = build_initial_prompt(
+            [gui_prompt, *awkward_terms] if gui_prompt else awkward_terms,
+            max_chars=600,
+        )
+
     # Run transcription in a watchdog thread
     import threading
     transcription_complete = False
     transcription_result = None
     transcription_error = None
+    actual_backend = "faster-whisper" if using_fw else "native-whisper"
+    actual_device_name = device_name
+
+    def _result_has_transcript_content(value: Any) -> bool:
+        if not isinstance(value, dict):
+            return False
+        segments_value = value.get('segments')
+        text_value = value.get('text')
+        return bool(
+            (isinstance(segments_value, list) and segments_value)
+            or (isinstance(text_value, str) and text_value.strip())
+        )
 
     def _run_transcribe():
-        nonlocal transcription_complete, transcription_result, transcription_error, use_vad, using_fw
+        nonlocal transcription_complete, transcription_result, transcription_error
+        nonlocal use_vad, using_fw, actual_backend, actual_device_name
         try:
             print("🔄 Starting transcription process...")
             if not _SESSION_GPU_INIT_DONE:
@@ -3071,6 +3446,12 @@ def transcribe_file_simple_auto(
                 # value (-1.0 lenient) with the native value (-0.5 strict).
                 transcribe_kwargs.pop("logprob_threshold", None)
                 transcribe_kwargs.pop("verbose", None)  # not a FW param
+                transcribe_kwargs.pop("prefix", None)
+                # Confidence-guided review requires per-word timing and
+                # probability in both quality modes.
+                transcribe_kwargs["word_timestamps"] = True
+                if faster_whisper_hotwords:
+                    transcribe_kwargs["hotwords"] = faster_whisper_hotwords
 
                 if quality_mode:
                     # HIGH QUALITY mode for Faster-Whisper (optimized for vintage tape recordings)
@@ -3087,7 +3468,6 @@ def transcribe_file_simple_auto(
                     # The initial_prompt punctuation primer already handles punctuation style.
                     transcribe_kwargs["condition_on_previous_text"] = False
                     transcribe_kwargs["vad_filter"] = False     # Already preprocessed
-                    transcribe_kwargs["word_timestamps"] = True # Better segment boundaries
                     transcribe_kwargs["repetition_penalty"] = 1.1  # Subtle anti-loop guard
                     print("🎯 FW QUALITY mode: beam=5, patience=1.2, repetition_penalty=1.1")
                 else:
@@ -3105,10 +3485,21 @@ def transcribe_file_simple_auto(
             
             # Gate initial prompt behind explicit opt-in to preserve strict verbatim neutrality
             allow_prompt = str(os.environ.get("TRANSCRIBE_ALLOW_PROMPT", "0")).lower() in ("1","true","yes")
-            if initial_prompt and allow_prompt:
+            apply_initial_prompt = should_apply_initial_prompt(
+                prompt=initial_prompt,
+                allow_prompt=allow_prompt,
+                using_faster_whisper=using_fw,
+                hotwords=faster_whisper_hotwords,
+            )
+            if apply_initial_prompt:
                 transcribe_kwargs["initial_prompt"] = initial_prompt
-                print(f"✅ Initial prompt APPLIED to transcription ({len(initial_prompt)} chars)")
+                print(f"✅ Metadata initial prompt applied ({len(initial_prompt)} chars)")
                 print(f"   Preview: {initial_prompt[:100]}...")
+            elif initial_prompt and using_fw and faster_whisper_hotwords:
+                print(
+                    "ℹ️  Metadata prompt used for hotword ranking only; "
+                    "not added beside Faster-Whisper hotwords"
+                )
             elif initial_prompt:
                 print(f"⚠️  Initial prompt NOT applied (TRANSCRIBE_ALLOW_PROMPT={os.environ.get('TRANSCRIBE_ALLOW_PROMPT', 'not set')})")
             else:
@@ -3185,8 +3576,11 @@ def transcribe_file_simple_auto(
                         'no_speech_threshold': 0.5,
                         'without_timestamps': False,
                         'chunk_length': 30,
+                        'word_timestamps': True,
+                        'hotwords': faster_whisper_hotwords,
                     }
-                    # Drop initial_prompt on FW retries to avoid bias blocking detection
+                    # Drop initial_prompt on retries, but keep terminology active
+                    # for every Faster-Whisper decoding window.
                     result2 = _compatible_transcribe_call(model, working_input_path, fw_retry1)
                     transcription_result = _as_result_dict(result2)
                     segs_dbg2 = transcription_result.get('segments') if isinstance(transcription_result, dict) else None
@@ -3195,7 +3589,8 @@ def transcribe_file_simple_auto(
                     print(f"🔎 Retry result: segments={segs_count2}, text_len={len(txt_dbg2) if isinstance(txt_dbg2, str) else 0}")
 
                     # Retry 2 (optional): VAD-filtered greedy capture; OFF by default due to runtime
-                    if segs_count2 == 0 and (not isinstance(txt_dbg2, str) or len(txt_dbg2.strip()) == 0):
+                    if not _result_has_transcript_content(transcription_result):
+                        retry2_succeeded = False
                         if str(os.environ.get('TRANSCRIBE_FW_RETRY2', '0')).lower() in ('1','true','yes'):
                             print("⚠️  Retry still empty — trying VAD-filtered greedy decode with low no_speech threshold (FW_RETRY2=on)")
                             fw_retry2 = {
@@ -3212,6 +3607,8 @@ def transcribe_file_simple_auto(
                                 'no_speech_threshold': 0.1,
                                 'without_timestamps': False,
                                 'chunk_length': 30,
+                                'word_timestamps': True,
+                                'hotwords': faster_whisper_hotwords,
                             }
                             try:
                                 result3 = _compatible_transcribe_call(model, working_input_path, fw_retry2)
@@ -3220,40 +3617,45 @@ def transcribe_file_simple_auto(
                                 segs_count3 = len(segs_dbg3) if isinstance(segs_dbg3, list) else 0
                                 txt_dbg3 = transcription_result.get('text') if isinstance(transcription_result, dict) else ''
                                 print(f"🔎 Retry2 result: segments={segs_count3}, text_len={len(txt_dbg3) if isinstance(txt_dbg3, str) else 0}")
-                                if segs_count3 > 0 or (isinstance(txt_dbg3, str) and len(txt_dbg3.strip()) > 0):
-                                    # success; skip CPU fallback
-                                    pass
+                                if _result_has_transcript_content(transcription_result):
+                                    retry2_succeeded = True
                                 else:
                                     raise RuntimeError('Retry2 still empty')
                             except Exception as r2e:
                                 print(f"⚠️  Retry2 error/empty: {r2e}")
                                 # Fall through to CPU fallback
-                        # Final fallback: native Whisper on CPU
-                        try:
-                            print("🔁 All FW attempts empty — falling back to native Whisper on CPU for this file")
-                            import whisper as _wh
-                            _cpu_model = _wh.load_model(selected_model_name, device='cpu')
-                            # Decode-time guard rails to mitigate repetition/hallucination
-                            cpu_kwargs = {
-                                'language': transcribe_kwargs.get('language'),
-                                # Try multiple temperatures progressively to escape repetitive paths
-                                'temperature': [0.0, 0.2, 0.4],
-                                'beam_size': 5,
-                                'patience': 2.0,
-                                # Disable conditioning on previous text to prevent feedback loops
-                                'condition_on_previous_text': False,
-                                # Enable stricter thresholds to reject low-confidence gibberish
-                                'compression_ratio_threshold': 2.0,
-                                'logprob_threshold': -0.5,
-                                'no_speech_threshold': 0.3,
-                            }
-                            # Avoid bias during fallback; only pass prompt if explicitly requested via env
-                            if initial_prompt and str(os.environ.get('TRANSCRIBE_FALLBACK_ALLOW_PROMPT', '0')).lower() in ('1','true','yes'):
-                                cpu_kwargs['initial_prompt'] = initial_prompt
-                            cpu_res = _cpu_model.transcribe(working_input_path, **cpu_kwargs)
-                            transcription_result = cpu_res if isinstance(cpu_res, dict) else _as_result_dict(cpu_res)
-                        except Exception as cpu_e:
-                            print(f"❌ Native CPU fallback failed: {cpu_e}")
+                        if not retry2_succeeded:
+                            # Final fallback: native Whisper on CPU.  Record the
+                            # actual backend so provenance never claims that FW
+                            # hotwords or GPU confidence data produced this text.
+                            try:
+                                print("🔁 All FW attempts empty — falling back to native Whisper on CPU for this file")
+                                import whisper as _wh
+                                _cpu_model = _wh.load_model(selected_model_name, device='cpu')
+                                # Decode-time guard rails to mitigate repetition/hallucination
+                                cpu_kwargs = {
+                                    'language': transcribe_kwargs.get('language'),
+                                    # Try multiple temperatures progressively to escape repetitive paths
+                                    'temperature': [0.0, 0.2, 0.4],
+                                    'beam_size': 5,
+                                    'patience': 2.0,
+                                    # Disable conditioning on previous text to prevent feedback loops
+                                    'condition_on_previous_text': False,
+                                    # Enable stricter thresholds to reject low-confidence gibberish
+                                    'compression_ratio_threshold': 2.0,
+                                    'logprob_threshold': -0.5,
+                                    'no_speech_threshold': 0.3,
+                                    'word_timestamps': True,
+                                }
+                                # Avoid bias during fallback; only pass prompt if explicitly requested via env
+                                if initial_prompt and str(os.environ.get('TRANSCRIBE_FALLBACK_ALLOW_PROMPT', '0')).lower() in ('1','true','yes'):
+                                    cpu_kwargs['initial_prompt'] = initial_prompt
+                                cpu_res = _cpu_model.transcribe(working_input_path, **cpu_kwargs)
+                                transcription_result = cpu_res if isinstance(cpu_res, dict) else _as_result_dict(cpu_res)
+                                actual_backend = 'native-whisper-fallback'
+                                actual_device_name = 'CPU (native Whisper fallback)'
+                            except Exception as cpu_e:
+                                print(f"❌ Native CPU fallback failed: {cpu_e}")
             except _StopRequested:
                 raise
             except Exception as dbg_e:
@@ -3353,6 +3755,13 @@ def transcribe_file_simple_auto(
 
     # Extract text (with artifact suppression around music)
     result = transcription_result
+    if isinstance(result, dict) and preprocessing_lead_seconds > 0:
+        result = _shift_transcript_timestamps(
+            result,
+            lead_seconds=preprocessing_lead_seconds,
+            source_duration_seconds=source_duration,
+        )
+        transcription_result = result
     full_text = ""
     raw_text = ""
     raw_segments = []
@@ -3500,7 +3909,7 @@ def transcribe_file_simple_auto(
             force_gpu_memory_cleanup()
         raise RuntimeError("No speech text was produced after all transcription attempts")
 
-    print(f"⚡ Hardware utilised: {device_name}")
+    print(f"⚡ Hardware utilised: {actual_device_name}")
     
     # Prosody analysis disabled - pure Whisper output is best
     # All attempts to modify sentence boundaries have introduced more errors than they fixed
@@ -3552,18 +3961,37 @@ def transcribe_file_simple_auto(
     if not _SESSION_GPU_INIT_DONE:
         log_gpu_memory_status("after text processing complete")
     
-    from pathlib import Path
     source_path = Path(input_path)
 
-    backend_name = "Faster-Whisper" if using_fw else "Native Whisper"
+    backend_name = (
+        "Faster-Whisper"
+        if actual_backend == "faster-whisper"
+        else "Native Whisper (fallback)"
+        if actual_backend == "native-whisper-fallback"
+        else "Native Whisper"
+    )
+    terminology_metadata = dict(hotword_selection)
+    if actual_backend != "faster-whisper" and terminology_metadata.get('applied'):
+        terminology_metadata.update(
+            {
+                'applied': False,
+                'reason': 'not-applied-by-native-whisper-fallback',
+            }
+        )
     metadata = {
         'model': f"{backend_name} {selected_model_name}",
-        'device': device_name,
+        'backend': actual_backend,
+        'device': actual_device_name,
         'time_taken': format_duration(elapsed),
         'elapsed_seconds': elapsed,
-        'audio_duration_seconds': float(duration) if duration else None,
+        'audio_duration_seconds': float(source_duration) if source_duration else None,
+        'decoded_audio_duration_seconds': (
+            float(decoded_duration) if decoded_duration else None
+        ),
+        'preprocessing_lead_padding_seconds': preprocessing_lead_seconds,
         'preprocessing': "Vintage tape preset" if preprocessing_used else "None",
         'quality': quality_stats,
+        'terminology': terminology_metadata,
     }
 
     if write_docx:

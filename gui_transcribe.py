@@ -159,11 +159,11 @@ def _validate_replace_policy(mode: str, cutoff_date: str) -> Optional[str]:
         parsed = datetime.datetime.strptime(value, "%Y-%m-%d")
     except ValueError as exc:
         raise ValueError(
-            "Replace-transcripts-before requires a valid date in YYYY-MM-DD format."
+            "Refresh-transcripts-before requires a valid date in YYYY-MM-DD format."
         ) from exc
     if parsed.strftime("%Y-%m-%d") != value:
         raise ValueError(
-            "Replace-transcripts-before requires a valid date in YYYY-MM-DD format."
+            "Refresh-transcripts-before requires a valid date in YYYY-MM-DD format."
         )
     return value
 
@@ -178,7 +178,7 @@ def _validate_polished_selection(settings: dict) -> Optional[str]:
     if bool(settings.get("existing_transcripts_only", False)) and mode == "skip":
         raise ValueError(
             "Use existing Word transcripts (skip Whisper) cannot be combined with "
-            "Skip existing. Choose Replace all, or Replace transcripts before a date."
+            "Skip existing. Choose Refresh all, or Refresh transcripts before a date."
         )
     return cutoff
 
@@ -186,6 +186,15 @@ def _validate_polished_selection(settings: dict) -> Optional[str]:
 def _default_terms_file() -> Optional[str]:
     p = os.path.join(REPO_ROOT, "special_words.txt")
     return p if os.path.isfile(p) else None
+
+
+def _launch_context_finder_process():
+    """Open the standalone research tool without coupling its worker to this GUI."""
+
+    script = os.path.join(REPO_ROOT, "context_finder_gui.py")
+    if not os.path.isfile(script):
+        raise FileNotFoundError(f"Context Finder module is missing: {script}")
+    return subprocess.Popen([sys.executable, script], cwd=REPO_ROOT)
 
 
 # ── Transcription helpers ────────────────────────────────────────────
@@ -258,6 +267,9 @@ def _run_polished_pipeline(input_path: str, settings: dict, q: queue.Queue) -> i
     existing_transcripts_only = bool(
         settings.get("existing_transcripts_only", False)
     )
+    retain_troubleshooting_artifacts = bool(
+        settings.get("retain_troubleshooting_artifacts", True)
+    )
     cutoff = _validate_polished_selection(settings)
     config = PipelineConfig(
         input_path=source,
@@ -269,17 +281,24 @@ def _run_polished_pipeline(input_path: str, settings: dict, q: queue.Queue) -> i
         existing_docx_mode=str(settings.get("replace_mode", "skip")),
         replace_before_date=cutoff,
         existing_transcripts_only=existing_transcripts_only,
+        retain_troubleshooting_artifacts=retain_troubleshooting_artifacts,
     )
     q.put(f"Polished artifacts: {output_root}\n")
+    if not retain_troubleshooting_artifacts:
+        q.put(
+            "Optional per-job event logging is off; compact hash-bound resume and "
+            "provenance metadata will still be retained.\n"
+        )
     if existing_transcripts_only:
         q.put(
-            "Pipeline: existing source-adjacent Word -> protected "
-            "GLM-4.7-Flash -> polished Word (Whisper and audio inference skipped)\n"
+            "Pipeline: existing Whisper Word -> protected GLM-4.7-Flash -> "
+            "separate '<name> - GLM Review.docx' (Whisper and audio skipped; "
+            "source Word remains unchanged)\n"
         )
     else:
         q.put(
-            "Pipeline: local Faster-Whisper -> protected GLM-4.7-Flash "
-            "-> polished Word\n"
+            "Pipeline: local Faster-Whisper -> raw '<name>.docx' plus protected "
+            "GLM-4.7-Flash '<name> - GLM Review.docx'\n"
         )
     return int(execute_pipeline(config, cancel_check=STOP_FLAG.is_set))
 
@@ -555,11 +574,15 @@ def launch_gui():
                     if STOP_FLAG.is_set():
                         q.put("\nStopped safely. Completed checkpoints were preserved.\n")
                     elif exit_code == 0:
-                        q.put("\nPolished pipeline completed and verified.\n")
+                        q.put(
+                            "\nPipeline completed. Raw Whisper documents and "
+                            "separate GLM Review copies are ready.\n"
+                        )
                     elif exit_code == 3:
                         q.put(
-                            "\nPipeline completed, but one or more documents need review; "
-                            "those source transcripts were not replaced.\n"
+                            "\nPipeline completed. One or more GLM Review documents are "
+                            "flagged for human checking; original Whisper documents "
+                            "remain untouched.\n"
                         )
                     else:
                         q.put(
@@ -649,6 +672,12 @@ def launch_gui():
         except Exception as exc:
             messagebox.showerror("Could not open cleanup access", str(exc))
 
+    def open_context_finder():
+        try:
+            _launch_context_finder_process()
+        except Exception as exc:
+            messagebox.showerror("Could not open Context Finder", str(exc))
+
     run_btn = _styled_btn(btn_bar, "  Start Polished Pipeline", start,
                           font=FONT_LG, bg=ACCENT)
     run_btn.pack(side="left", padx=(0, 8))
@@ -667,7 +696,12 @@ def launch_gui():
         btn_bar, "Cleanup Access", configure_cleanup_access,
         font=FONT_LG, bg="#475569",
     )
-    access_btn.pack(side="left")
+    access_btn.pack(side="left", padx=(0, 8))
+    context_btn = _styled_btn(
+        btn_bar, "Context Finder", open_context_finder,
+        font=FONT_LG, bg="#0f766e",
+    )
+    context_btn.pack(side="left")
 
     def update_run_label(*_args):
         run_btn.configure(

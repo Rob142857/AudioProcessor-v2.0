@@ -195,6 +195,7 @@ class GuiEngineContractTests(unittest.TestCase):
         self.assertEqual("2026-04-06", captured["replace_before_date"])
         self.assertFalse(captured["force"])
         self.assertFalse(captured["existing_transcripts_only"])
+        self.assertTrue(captured["retain_troubleshooting_artifacts"])
         self.assertFalse(captured["cancelled"])
 
     def test_existing_transcript_mode_maps_to_no_whisper_pipeline_contract(self):
@@ -221,6 +222,7 @@ class GuiEngineContractTests(unittest.TestCase):
             "replace_mode": "all",
             "replace_before_date": "",
             "force_reprocess": 1,
+            "retain_troubleshooting_artifacts": 0,
         }
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
             sys.modules, {"archive_pipeline": fake_archive}
@@ -234,13 +236,14 @@ class GuiEngineContractTests(unittest.TestCase):
 
         self.assertTrue(captured["existing_transcripts_only"])
         self.assertTrue(captured["force"])
+        self.assertFalse(captured["retain_troubleshooting_artifacts"])
         self.assertEqual("all", captured["existing_docx_mode"])
         self.assertTrue(captured["executed"])
         messages = ""
         while not q.empty():
             messages += q.get_nowait()
-        self.assertIn("existing source-adjacent Word", messages)
-        self.assertIn("Whisper and audio inference skipped", messages)
+        self.assertIn("existing Whisper Word", messages)
+        self.assertIn("Whisper and audio skipped", messages)
 
     def test_existing_transcript_mode_rejects_skip_existing(self):
         with self.assertRaisesRegex(ValueError, "cannot be combined with Skip existing"):
@@ -335,11 +338,15 @@ class GuiEngineContractTests(unittest.TestCase):
             "Completed recordings, stages, and GLM chunks resume", component_source
         )
         self.assertIn("restarts from its beginning", component_source)
-        self.assertIn("only after the selected run verifies", component_source)
+        self.assertIn("separate GLM Review copies", component_source)
         self.assertIn("force_reprocess", component_source)
         self.assertIn("Use existing Word transcripts (skip Whisper)", component_source)
-        self.assertIn("source-adjacent DOCX", component_source)
+        self.assertIn("source-adjacent Whisper DOCX", component_source)
         self.assertIn("no audio inference", component_source)
+        self.assertIn(
+            "Retain detailed troubleshooting logging", component_source
+        )
+        self.assertIn("retain_troubleshooting_artifacts", gui_source)
         self.assertIn("existing_transcripts_only", gui_source)
         self.assertNotIn("CF_ACCESS_CLIENT_SECRET", component_source)
         self.assertNotIn("CF_ACCESS_CLIENT_SECRET", gui_source)
@@ -449,11 +456,11 @@ class TranscriptionApiShapeTests(unittest.TestCase):
     def test_structured_return_options_are_keyword_only(self):
         names = [arg.arg for arg in self.function.args.kwonlyargs]
         self.assertEqual(
-            ["return_details", "write_docx", "docx_output_path"],
+            ["return_details", "write_docx", "docx_output_path", "glossary_terms"],
             names,
         )
         defaults = [ast.literal_eval(value) for value in self.function.args.kw_defaults]
-        self.assertEqual([False, True, None], defaults)
+        self.assertEqual([False, True, None, None], defaults)
 
     def test_structured_result_contains_required_fields(self):
         for key in (

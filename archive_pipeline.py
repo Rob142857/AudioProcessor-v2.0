@@ -42,7 +42,8 @@ DEFAULT_CLEANUP_ENDPOINT = (
     "https://pg.objectiveartefacts.com.au/api/tooling/cleanup-chunk"
 )
 DEFAULT_CLEANUP_MODEL = "@cf/zai-org/glm-4.7-flash"
-DEFAULT_CLEANUP_PROFILE = "semantic-conservative-v3"
+DEFAULT_CLEANUP_PROFILE = "semantic-conservative-repair-v9"
+HOTWORD_SELECTION_VERSION = "faster-whisper-hotwords-v1"
 SUPPORTED_AUDIO_EXTENSIONS = frozenset(
     {
         ".aac",
@@ -67,6 +68,7 @@ SUPPORTED_AUDIO_EXTENSIONS = frozenset(
 FINAL_STATUSES = frozenset({"verified", "needs_review"})
 EXISTING_DOCX_MODES = frozenset({"skip", "all", "before"})
 SOURCE_DOCX_PUBLICATION_REPORT = "source-docx-publication-report.json"
+GLM_REVIEW_SUFFIX = " - GLM Review"
 
 # Values which can materially change recognition, preprocessing, or prompt
 # bias.  They form part of the per-source STT request signature so a changed
@@ -174,6 +176,27 @@ def cleanup_record_summary(value: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def compact_stt_metadata(
+    value: dict[str, Any], *, retain_troubleshooting_artifacts: bool
+) -> dict[str, Any]:
+    """Drop duplicated terminology bodies while retaining deterministic proof."""
+
+    metadata = dict(value)
+    terminology = metadata.get("terminology")
+    if retain_troubleshooting_artifacts or not isinstance(terminology, dict):
+        return metadata
+    compact = dict(terminology)
+    for key in ("hotwords", "selected_terms", "dropped_terms"):
+        if key not in compact:
+            continue
+        body = compact.pop(key)
+        compact[f"{key}_sha256"] = sha256_text(stable_json(body))
+        if isinstance(body, (list, tuple)):
+            compact.setdefault(f"{key}_count", len(body))
+    metadata["terminology"] = compact
+    return metadata
+
+
 def quick_fingerprint(path: Path) -> dict[str, Any]:
     stat = path.stat()
     return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
@@ -199,6 +222,25 @@ def source_publication_scope(input_path: Path) -> Path:
 
     input_path = Path(input_path).resolve()
     return input_path if input_path.is_dir() else input_path.parent
+
+
+def is_glm_review_docx(path: Path) -> bool:
+    """Return whether *path* uses the tool-owned human-review filename."""
+
+    candidate = Path(path)
+    return (
+        candidate.suffix.casefold() == ".docx"
+        and candidate.stem.casefold().endswith(GLM_REVIEW_SUFFIX.casefold())
+    )
+
+
+def glm_review_relative_path(source_relative: Path) -> Path:
+    """Map an audio or source-DOCX relative path to its review-copy sibling."""
+
+    source_relative = Path(source_relative)
+    return source_relative.with_name(
+        f"{source_relative.stem}{GLM_REVIEW_SUFFIX}.docx"
+    )
 
 
 def require_disjoint_publication_roots(input_path: Path, output_root: Path) -> Path:
@@ -281,8 +323,8 @@ def should_process_existing_docx(
     """Apply the GUI/CLI source-adjacent DOCX selection policy.
 
     The policy only decides which recordings enter the resume-safe pipeline;
-    it never deletes an existing document.  Publication remains a separate,
-    verified, backup-protected post-run transaction.
+    it never deletes an existing document. Publication remains a separate,
+    verified, backup-protected transaction performed as each job completes.
     """
 
     cutoff = validate_existing_docx_policy(mode, replace_before_date)
@@ -332,8 +374,8 @@ def _existing_transcript_discovery(
     validate_existing_docx_policy(existing_docx_mode, replace_before_date)
     if existing_docx_mode == "skip":
         raise ValueError(
-            "existing-transcript mode requires 'Replace all' or "
-            "'Replace transcripts before'; 'Skip existing' would select nothing"
+            "existing-transcript mode requires 'Refresh all' or "
+            "'Refresh transcripts before'; 'Skip existing' would select nothing"
         )
 
     input_path = input_path.resolve()
@@ -346,6 +388,11 @@ def _existing_transcript_discovery(
     }
 
     if input_path.is_file() and input_path.suffix.casefold() == ".docx":
+        if is_glm_review_docx(input_path):
+            raise ValueError(
+                "a GLM Review document is generated output, not an importable "
+                f"source transcript: {input_path}"
+            )
         if input_path.is_symlink():
             return [], stats
         selected = (
@@ -483,42 +530,61 @@ def recording_candidates_for_transcript(transcript: Path) -> list[Path]:
 def validate_source_docx_target_collisions(
     sources: Iterable[Path],
     input_path: Path,
+    *,
+    include_whisper_docx: bool = True,
 ) -> None:
-    """Reject selected recordings which would publish to the same DOCX path.
+    """Reject selected sources which would publish to the same DOCX target.
 
     Artifact directories include the source extension and are collision-safe,
-    but source-adjacent publication intentionally replaces that extension with
-    ``.docx``.  Detect ambiguous multi-format sources before transcription so a
-    long run cannot finish only to discover that publication is impossible.
+    but source-adjacent publication normalises source extensions. Fresh-STT runs
+    publish both ``<stem>.docx`` and ``<stem> - GLM Review.docx``; validate the
+    union so one source's raw Whisper target cannot overwrite another source's
+    review target. Imported-DOCX runs publish only the review target.
     """
 
     scope_root = source_publication_scope(input_path)
-    grouped: dict[str, tuple[Path, list[Path]]] = {}
-    for source_value in sources:
-        source = Path(source_value).resolve()
-        relative = source_relative_path(source, input_path)
-        target = (scope_root / relative).with_suffix(".docx")
+    grouped: dict[str, tuple[Path, list[tuple[Path, str]]]] = {}
+
+    def add_target(target: Path, source: Path, role: str) -> None:
         key = os.path.normcase(os.path.abspath(str(target)))
         if key not in grouped:
             grouped[key] = (target, [])
-        grouped[key][1].append(source)
+        grouped[key][1].append((source, role))
+
+    for source_value in sources:
+        source = Path(source_value).resolve()
+        relative = source_relative_path(source, input_path)
+        add_target(
+            scope_root / glm_review_relative_path(relative),
+            source,
+            "GLM review",
+        )
+        if include_whisper_docx:
+            add_target(
+                (scope_root / relative).with_suffix(".docx"),
+                source,
+                "raw Whisper",
+            )
 
     collisions = [
-        (target, source_paths)
-        for target, source_paths in grouped.values()
-        if len(source_paths) > 1
+        (target, source_roles)
+        for target, source_roles in grouped.values()
+        if len(source_roles) > 1
     ]
     if not collisions:
         return
 
     details: list[str] = []
-    for target, source_paths in sorted(
+    for target, source_roles in sorted(
         collisions, key=lambda item: str(item[0]).casefold()
     ):
         details.append(f"target: {target}")
         details.extend(
-            f"  source: {source}"
-            for source in sorted(source_paths, key=lambda path: str(path).casefold())
+            f"  {role}: {source}"
+            for source, role in sorted(
+                source_roles,
+                key=lambda item: (str(item[0]).casefold(), item[1]),
+            )
         )
     raise ValueError(
         "selected recordings contain source-adjacent DOCX target collisions; "
@@ -618,9 +684,7 @@ def immutable_publication_hashes(
                     backup_root_value = report.get("backup_root")
                     generated_value = item.get("generated")
                     if (
-                        not isinstance(original_sha256, str)
-                        or not re.fullmatch(r"[0-9a-fA-F]{64}", original_sha256)
-                        or not isinstance(relative_value, str)
+                        not isinstance(relative_value, str)
                         or not relative_value.strip()
                         or not isinstance(backup_root_value, str)
                         or not backup_root_value.strip()
@@ -635,11 +699,16 @@ def immutable_publication_hashes(
                     backup = backup_root / relative
                     generated = Path(generated_value).resolve()
                     if (
-                        backup.is_symlink()
+                        not _is_relative_to(generated, generated_root)
+                    ):
+                        continue
+                    if original_sha256 is not None and (
+                        not isinstance(original_sha256, str)
+                        or not re.fullmatch(r"[0-9a-fA-F]{64}", original_sha256)
+                        or backup.is_symlink()
                         or not backup.is_file()
                         or not _is_relative_to(backup.resolve(), backup_root)
                         or not file_hash_matches(backup, original_sha256)
-                        or not _is_relative_to(generated, generated_root)
                     ):
                         continue
                 hashes.add(generated_sha256.casefold())
@@ -668,6 +737,7 @@ def artifact_paths(job_directory: Path) -> dict[str, Path]:
         "cleanup_chunks": job_directory / "cleanup-chunks",
         "qa": job_directory / "qa.json",
         "publication": job_directory / "publication.json",
+        "whisper_docx": job_directory / "whisper.docx",
         "docx": job_directory / "final.docx",
     }
 
@@ -929,6 +999,7 @@ class PipelineConfig:
     existing_docx_mode: str = "all"
     replace_before_date: Optional[str] = None
     existing_transcripts_only: bool = False
+    retain_troubleshooting_artifacts: bool = True
     limit: Optional[int] = None
 
     @property
@@ -952,7 +1023,7 @@ class PipelineConfig:
                 {
                     "pipeline": PIPELINE_VERSION,
                     "format": "docx",
-                    "publication_renderer": "narrative-proposal-semantic-v3",
+                    "publication_renderer": "narrative-proposal-semantic-v4-review-notice",
                     "australian_semantic_substitution": False,
                 }
             )
@@ -1049,7 +1120,7 @@ class PipelineRunner:
             if self.config.existing_docx_mode == "skip":
                 raise ValueError(
                     "existing-transcript mode cannot use 'Skip existing'; select "
-                    "'Replace all' or 'Replace transcripts before'"
+                    "'Refresh all' or 'Refresh transcripts before'"
                 )
             if not self.config.cleanup_enabled:
                 raise ValueError(
@@ -1068,8 +1139,14 @@ class PipelineRunner:
         self.config.output_root.mkdir(parents=True, exist_ok=True)
         self.index = JobIndex(self.config.output_root / "pipeline.sqlite3")
         self.cleanup_client: Any = None
+        self._stt_glossary_terms: tuple[str, ...] = ()
         self.cancel_check = cancel_check or (lambda: False)
         self.selected_manifest_paths: tuple[Path, ...] = ()
+        # Only manifests actually visited by this invocation are eligible for
+        # its final publication reconciliation. This prevents a cancelled run
+        # from publishing an old final manifest for a later, unvisited source.
+        self.processed_manifest_paths: list[Path] = []
+        self.per_job_publication_reports: list[dict[str, Any]] = []
         self.stt_runtime_versions = (
             {}
             if self.config.existing_transcripts_only
@@ -1083,6 +1160,12 @@ class PipelineRunner:
 
     def _check_cancelled(self, phase: str) -> None:
         raise_if_cancelled(self.cancel_check, phase=phase)
+
+    def _append_event(
+        self, path: Path, event: str, **details: Any
+    ) -> None:
+        if self.config.retain_troubleshooting_artifacts:
+            append_event(path, event, **details)
 
     def _get_cleanup_client(self) -> Any:
         if self.cleanup_client is None:
@@ -1119,6 +1202,8 @@ class PipelineRunner:
         self,
         source: Path,
         manifest: Optional[dict[str, Any]] = None,
+        *,
+        glossary_sha256: Optional[str] = None,
     ) -> str:
         """Fingerprint every known input which can affect the raw transcript."""
         if self.config.existing_transcripts_only:
@@ -1199,6 +1284,8 @@ class PipelineRunner:
                     "threads": self.config.threads,
                     "environment": content_environment,
                     "prompt": prompt_values,
+                    "cleanup_glossary_sha256": glossary_sha256,
+                    "hotword_selection_version": HOTWORD_SELECTION_VERSION,
                     "runtime": self.stt_runtime_versions,
                 }
             )
@@ -1220,6 +1307,7 @@ class PipelineRunner:
                 **fingerprint,
             },
             "status": "pending",
+            "approval_state": "pending_human_review",
             "stage": "discovered",
             "attempts": 0,
             "created_at": utc_now(),
@@ -1249,6 +1337,9 @@ class PipelineRunner:
                 "signature": self.config.cleanup_signature,
             },
             "render": {"signature": self.config.render_signature},
+            "retention": {
+                "troubleshooting_logs_enabled": self.config.retain_troubleshooting_artifacts
+            },
             "artifacts": {},
         }
 
@@ -1287,7 +1378,7 @@ class PipelineRunner:
                 and raw_input.get("signature") == stt_request_signature
                 and file_hash_matches(paths["raw_text"], stt.get("raw_sha256"))
                 and stt.get("raw_sha256") == raw_input.get("text_sha256")
-                and self._import_source_state(manifest, paths) in {"original", "published"}
+                and self._import_source_state(manifest, paths) == "original"
             )
         return (
             (not self.config.force or self.config.cleanup_only or self.config.render_only)
@@ -1329,13 +1420,6 @@ class PipelineRunner:
             return "missing"
         if current_hash == original_hash.casefold():
             return "original"
-        published_hashes = immutable_publication_hashes(
-            self.config.output_root,
-            paths["manifest"],
-            source_docx,
-        )
-        if current_hash in published_hashes:
-            return "published"
         return "changed"
 
     def _clean_is_reusable(
@@ -1385,6 +1469,16 @@ class PipelineRunner:
             and file_hash_matches(paths["docx"], render.get("output_sha256"))
         )
 
+    def _whisper_docx_is_reusable(
+        self, manifest: dict[str, Any], paths: dict[str, Path]
+    ) -> bool:
+        if self.config.existing_transcripts_only:
+            return True
+        return file_hash_matches(
+            paths["whisper_docx"],
+            manifest.get("stt", {}).get("whisper_docx_sha256"),
+        )
+
     def _transcribe(self, source: Path) -> dict[str, Any]:
         os.environ["TRANSCRIBE_MODEL_NAME"] = self.config.stt_model
         os.environ.setdefault("TRANSCRIBE_VERBATIM", "1")
@@ -1403,6 +1497,7 @@ class PipelineRunner:
                 threads_override=self.config.threads,
                 return_details=True,
                 write_docx=False,
+                glossary_terms=self._stt_glossary_terms,
             )
         finally:
             if original_prompt is None:
@@ -1431,11 +1526,28 @@ class PipelineRunner:
             relative_source_path=source_relative_path(
                 source, self.config.input_path
             ),
+            needs_human_review=(metadata.get("document_stage") == "glm-review"),
         )
         rendered = Path(rendered)
         if not rendered.is_file() or rendered.stat().st_size < 1_000:
             raise RuntimeError(f"DOCX validation failed: {rendered}")
         return rendered
+
+    def _render_whisper_docx(
+        self, source: Path, text: str, output_path: Path
+    ) -> Path:
+        """Render the pre-GLM transcript through the ordinary Word test seam."""
+
+        return self._render_docx(
+            source,
+            text,
+            output_path,
+            {
+                "document_stage": "raw-whisper-transcript",
+                "model": self.config.stt_model,
+                "pipeline_version": PIPELINE_VERSION,
+            },
+        )
 
     def process_one(self, source: Path) -> str:
         relative = source_relative_path(source, self.config.input_path)
@@ -1445,11 +1557,6 @@ class PipelineRunner:
         paths = artifact_paths(job_directory)
         fingerprint = quick_fingerprint(source)
         manifest = read_json(paths["manifest"])
-        stt_request_signature = self._stt_request_signature(source, manifest)
-        if not manifest:
-            manifest = self._base_manifest(
-                source, relative, fingerprint, stt_request_signature
-            )
 
         glossary_sha256: Optional[str] = None
         glossary_error: Optional[Exception] = None
@@ -1464,6 +1571,16 @@ class PipelineRunner:
                 # Record this as a normal job failure below rather than losing
                 # provenance before a manifest exists.
                 glossary_error = exc
+
+        stt_request_signature = self._stt_request_signature(
+            source,
+            manifest,
+            glossary_sha256=glossary_sha256,
+        )
+        if not manifest:
+            manifest = self._base_manifest(
+                source, relative, fingerprint, stt_request_signature
+            )
 
         qa_record = manifest.get("qa") if isinstance(manifest.get("qa"), dict) else {}
         raw_evidence_passed = (
@@ -1488,14 +1605,10 @@ class PipelineRunner:
             manifest, fingerprint, paths, stt_request_signature
         ):
             stt = manifest.get("stt", {})
-            timestamp_artifacts_valid = self.config.existing_transcripts_only or (
-                file_hash_matches(paths["vtt"], stt.get("vtt_sha256"))
-                and file_hash_matches(paths["srt"], stt.get("srt_sha256"))
-            )
             raw_text_for_reuse = paths["raw_text"].read_text(encoding="utf-8")
             raw_sha256_for_reuse = sha256_text(raw_text_for_reuse)
             if (
-                timestamp_artifacts_valid
+                self._whisper_docx_is_reusable(manifest, paths)
                 and self._clean_is_reusable(
                     manifest,
                     raw_sha256_for_reuse,
@@ -1528,7 +1641,7 @@ class PipelineRunner:
         manifest["status"] = "running"
         manifest["error"] = None
         self._save_manifest(source, relative, paths, manifest)
-        append_event(paths["events"], "job_started", attempt=manifest["attempts"])
+        self._append_event(paths["events"], "job_started", attempt=manifest["attempts"])
 
         try:
             self._check_cancelled("job start")
@@ -1557,7 +1670,7 @@ class PipelineRunner:
                         atomic_write_text(paths["srt"], expected_srt)
                     manifest["stt"]["vtt_sha256"] = sha256_file(paths["vtt"])
                     manifest["stt"]["srt_sha256"] = sha256_file(paths["srt"])
-                append_event(paths["events"], "raw_reused")
+                self._append_event(paths["events"], "raw_reused")
             else:
                 if self.config.cleanup_only or self.config.render_only:
                     raise RuntimeError(
@@ -1575,7 +1688,7 @@ class PipelineRunner:
                         )
                     manifest["stage"] = "importing_source_docx"
                     self._save_manifest(source, relative, paths, manifest)
-                    append_event(paths["events"], "source_docx_import_started")
+                    self._append_event(paths["events"], "source_docx_import_started")
                     from existing_transcript_import import import_existing_transcript
 
                     imported = import_existing_transcript(source)
@@ -1639,7 +1752,7 @@ class PipelineRunner:
                     )
                     manifest["stage"] = "raw_complete"
                     self._save_manifest(source, relative, paths, manifest)
-                    append_event(
+                    self._append_event(
                         paths["events"],
                         "source_docx_import_completed",
                         words=imported.word_count,
@@ -1648,7 +1761,10 @@ class PipelineRunner:
                 else:
                     manifest["stage"] = "transcribing"
                     self._save_manifest(source, relative, paths, manifest)
-                    append_event(paths["events"], "transcription_started")
+                    self._append_event(paths["events"], "transcription_started")
+                    self._stt_glossary_terms = tuple(
+                        getattr(self.cleanup_client, "glossary_terms", ())
+                    )
                     details = self._transcribe(source)
                     # Preserve and clean the closest available representation of the
                     # model output.  The engine's `text` value may already contain
@@ -1684,6 +1800,12 @@ class PipelineRunner:
                     details_metadata = details.get("metadata", {})
                     if not isinstance(details_metadata, dict):
                         details_metadata = {}
+                    details_metadata = compact_stt_metadata(
+                        details_metadata,
+                        retain_troubleshooting_artifacts=(
+                            self.config.retain_troubleshooting_artifacts
+                        ),
+                    )
                     actual_model = str(
                         details_metadata.get("model") or self.config.stt_model
                     )
@@ -1731,12 +1853,35 @@ class PipelineRunner:
                     )
                     manifest["stage"] = "raw_complete"
                     self._save_manifest(source, relative, paths, manifest)
-                    append_event(
+                    self._append_event(
                         paths["events"],
                         "transcription_completed",
                         words=len(raw_text.split()),
                         segments=len(segments),
                     )
+
+            if not self.config.existing_transcripts_only and not self._whisper_docx_is_reusable(
+                manifest, paths
+            ):
+                formatted_hash = manifest.get("stt", {}).get("formatted_stt_sha256")
+                whisper_text = (
+                    paths["formatted_stt"].read_text(encoding="utf-8")
+                    if file_hash_matches(paths["formatted_stt"], formatted_hash)
+                    else raw_text
+                )
+                rendered_whisper = self._render_whisper_docx(
+                    source, whisper_text, paths["whisper_docx"]
+                )
+                manifest["stt"]["whisper_docx_sha256"] = sha256_file(
+                    rendered_whisper
+                )
+                manifest["artifacts"]["whisper_docx"] = str(rendered_whisper)
+                self._save_manifest(source, relative, paths, manifest)
+                self._append_event(
+                    paths["events"],
+                    "whisper_docx_rendered",
+                    artifact_path=str(rendered_whisper),
+                )
 
             self._check_cancelled("between transcription and cleanup")
             raw_sha256 = sha256_text(raw_text)
@@ -1778,12 +1923,12 @@ class PipelineRunner:
                 cleanup_metadata = cleanup_record_summary(read_json(paths["cleanup"]))
                 cleanup_metadata["record_sha256"] = sha256_file(paths["cleanup"])
                 cleanup_needs_review = bool(cleanup_metadata.get("needs_review"))
-                append_event(paths["events"], "cleanup_reused")
+                self._append_event(paths["events"], "cleanup_reused")
             else:
                 self._check_cancelled("cleanup")
                 manifest["stage"] = "cleaning"
                 self._save_manifest(source, relative, paths, manifest)
-                append_event(paths["events"], "cleanup_started")
+                self._append_event(paths["events"], "cleanup_started")
                 cleanup_result = self._get_cleanup_client().cleanup_text(
                     raw_text,
                     checkpoint_dir=paths["cleanup_chunks"],
@@ -1849,7 +1994,7 @@ class PipelineRunner:
                     paths["cleanup"],
                     {**cleanup_metadata, "chunk_results": chunk_payloads},
                 )
-                append_event(
+                self._append_event(
                     paths["events"],
                     "cleanup_completed",
                     model=cleanup_result.model,
@@ -1876,8 +2021,9 @@ class PipelineRunner:
             if not self._render_is_reusable(manifest, clean_sha256, paths):
                 manifest["stage"] = "rendering"
                 self._save_manifest(source, relative, paths, manifest)
-                append_event(paths["events"], "render_started")
+                self._append_event(paths["events"], "render_started")
                 metadata = {
+                    "document_stage": "glm-review",
                     "model": (
                         (
                             "Existing Word transcript (speech-to-text skipped) -> "
@@ -1907,7 +2053,7 @@ class PipelineRunner:
                     "output_sha256": sha256_file(rendered),
                 }
                 manifest["artifacts"]["docx"] = str(rendered)
-                append_event(
+                self._append_event(
                     paths["events"], "render_completed", artifact_path=str(rendered)
                 )
 
@@ -1961,6 +2107,7 @@ class PipelineRunner:
                 "pipeline_version": PIPELINE_VERSION,
                 "generated_at": utc_now(),
                 "document_state": manifest["status"],
+                "approval_state": "pending_human_review",
                 # Database/vector publication remains an explicit later action.
                 "search_ingestion_state": "not_published",
                 "metadata_precedence": "embedded-tags > relative-path > filename",
@@ -2024,24 +2171,25 @@ class PipelineRunner:
             }
             atomic_write_json(paths["publication"], publication_record)
             manifest["publication"] = publication_record
+            manifest["approval_state"] = "pending_human_review"
             manifest["artifacts"]["publication"] = str(paths["publication"])
             manifest["stage"] = manifest["status"]
             self._save_manifest(source, relative, paths, manifest)
-            append_event(paths["events"], "job_finished", status=manifest["status"])
+            self._append_event(paths["events"], "job_finished", status=manifest["status"])
             return str(manifest["status"])
         except KeyboardInterrupt:
             manifest["status"] = "cancelled"
             manifest["stage"] = "cancelled"
             manifest["error"] = "cancelled by user"
             self._save_manifest(source, relative, paths, manifest)
-            append_event(paths["events"], "job_cancelled")
+            self._append_event(paths["events"], "job_cancelled")
             raise
         except PipelineCancelledError as exc:
             manifest["status"] = "cancelled"
             manifest["stage"] = "cancelled"
             manifest["error"] = f"{exc}; completed checkpoints preserved"
             self._save_manifest(source, relative, paths, manifest)
-            append_event(paths["events"], "job_cancelled")
+            self._append_event(paths["events"], "job_cancelled")
             return "cancelled"
         except Exception as exc:
             if self.cancel_check() or "stop requested" in str(exc).casefold():
@@ -2049,19 +2197,21 @@ class PipelineRunner:
                 manifest["stage"] = "cancelled"
                 manifest["error"] = "cancelled by user; completed checkpoints preserved"
                 self._save_manifest(source, relative, paths, manifest)
-                append_event(paths["events"], "job_cancelled")
+                self._append_event(paths["events"], "job_cancelled")
                 return "cancelled"
             manifest["status"] = "failed"
             manifest["stage"] = "failed"
             manifest["error"] = f"{type(exc).__name__}: {exc}"
             manifest["traceback"] = traceback.format_exc(limit=20)
             self._save_manifest(source, relative, paths, manifest)
-            append_event(
+            self._append_event(
                 paths["events"], "job_failed", error=manifest["error"]
             )
             return "failed"
 
     def run(self) -> dict[str, int]:
+        self.processed_manifest_paths.clear()
+        self.per_job_publication_reports.clear()
         discovery_stats: dict[str, int] = {}
         if self.config.existing_transcripts_only:
             files, discovery_stats = _existing_transcript_discovery(
@@ -2082,7 +2232,11 @@ class PipelineRunner:
         if self.config.limit is not None:
             files = files[: max(0, self.config.limit)]
         if self.config.publish_source_docx:
-            validate_source_docx_target_collisions(files, self.config.input_path)
+            validate_source_docx_target_collisions(
+                files,
+                self.config.input_path,
+                include_whisper_docx=not self.config.existing_transcripts_only,
+            )
         self.selected_manifest_paths = tuple(
             artifact_paths(
                 artifact_directory(
@@ -2149,8 +2303,58 @@ class PipelineRunner:
                 counts["cancelled"] += 1
                 print("Pipeline cancelled; completed checkpoints are preserved.")
                 break
+            manifest_path = artifact_paths(
+                artifact_directory(
+                    source,
+                    self.config.input_path,
+                    self.config.output_root,
+                )
+            )["manifest"]
+            self.processed_manifest_paths.append(manifest_path)
             counts[status] = counts.get(status, 0) + 1
             print(f"  -> {status}")
+            if (
+                self.config.publish_source_docx
+                and self.config.limit is None
+                and status in FINAL_STATUSES | {"skipped"}
+            ):
+                single_counts = {
+                    "discovered": 1,
+                    "queued": 0,
+                    "skipped": int(status == "skipped"),
+                    "verified": int(status == "verified"),
+                    "needs_review": int(status == "needs_review"),
+                    "failed": 0,
+                    "cancelled": 0,
+                }
+                try:
+                    report = publish_source_docx_batch(
+                        self.config,
+                        single_counts,
+                        manifest_paths=(manifest_path,),
+                        cancel_check=None,
+                    )
+                    if report is not None:
+                        self.per_job_publication_reports.append(report)
+                        operations = report.get("operations", {})
+                        changed = sum(
+                            int(operations.get(name, 0) or 0)
+                            for name in ("create", "replace")
+                        )
+                        counts["publication_published"] = counts.get(
+                            "publication_published", 0
+                        ) + changed
+                        print(
+                            f"  -> published sibling Word output(s): {changed} changed"
+                        )
+                except Exception as exc:
+                    counts["publication_failed"] = counts.get(
+                        "publication_failed", 0
+                    ) + 1
+                    print(
+                        "  -> sibling Word publication failed safely: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
             if status == "cancelled":
                 print("Pipeline cancelled; completed checkpoints are preserved.")
                 break
@@ -2171,6 +2375,7 @@ class PipelineRunner:
             "existing_docx_mode": self.config.existing_docx_mode,
             "replace_before_date": self.config.replace_before_date,
             "existing_transcripts_only": self.config.existing_transcripts_only,
+            "retain_troubleshooting_artifacts": self.config.retain_troubleshooting_artifacts,
             "counts": counts,
         }
         if publication is not None:
@@ -2249,19 +2454,17 @@ def publish_source_docx_batch(
     generated_root = Path(config.output_root).resolve()
     scope_root = source_publication_scope(input_path)
     publication_time = now or datetime.now().astimezone()
-    timestamp = publication_time.strftime("%Y%m%d-%H%M%S")
     run_id = publication_time.strftime("%Y%m%d-%H%M%S-%f")
-    backup_root = scope_root.parent / (
-        f"{input_path.name} - Legacy DOCX Backup - {timestamp}"
-    )
+    backup_root = generated_root / "publication-backups" / run_id
     report_path = generated_root / SOURCE_DOCX_PUBLICATION_REPORT
     immutable_report_path = (
         generated_root / f"source-docx-publication-{run_id}.json"
     )
     report: dict[str, Any] = {
-        "report_version": 1,
+        "report_version": 2,
         "run_id": run_id,
         "pipeline_version": PIPELINE_VERSION,
+        "approval_state": "pending_human_review",
         "started_at": utc_now(),
         "input": str(input_path),
         "scope_root": str(scope_root),
@@ -2295,11 +2498,37 @@ def publish_source_docx_batch(
             return False
         return True
 
-    blockers = [
-        name
-        for name in ("failed", "cancelled", "needs_review")
-        if counts.get(name, 0)
-    ]
+    if cancel_check is not None and cancel_check():
+        report.update(
+            {
+                "status": "suppressed",
+                "blocking_conditions": ["cancel_requested"],
+                "planned": 0,
+                "published": [],
+                "finished_at": utc_now(),
+            }
+        )
+        write_report_snapshot()
+        raise PipelineCancelledError("source publication cancelled before planning")
+
+    candidate_manifests = (
+        tuple(Path(path) for path in manifest_paths)
+        if manifest_paths is not None
+        else tuple(generated_root.rglob("manifest.json"))
+    )
+    eligible_manifests: list[Path] = []
+    excluded_statuses: dict[str, int] = {}
+    for manifest_path in candidate_manifests:
+        status = read_json(manifest_path).get("status")
+        if status in FINAL_STATUSES:
+            eligible_manifests.append(manifest_path)
+        else:
+            key = str(status or "missing")
+            excluded_statuses[key] = excluded_statuses.get(key, 0) + 1
+    report["eligible_manifests"] = len(eligible_manifests)
+    report["excluded_manifest_statuses"] = excluded_statuses
+
+    blockers: list[str] = []
     if counts.get("queued", 0):
         blockers.append("queued")
     if config.dry_run:
@@ -2308,11 +2537,8 @@ def publish_source_docx_batch(
         blockers.append("cleanup_disabled")
     if config.limit is not None:
         blockers.append("limited_run")
-    if not counts.get("discovered", 0):
-        blockers.append("no_recordings")
-    completed = counts.get("verified", 0) + counts.get("skipped", 0)
-    if completed != counts.get("discovered", 0):
-        blockers.append("incomplete_run")
+    if not eligible_manifests:
+        blockers.append("no_completed_review_documents")
     if blockers:
         report.update(
             {
@@ -2334,14 +2560,11 @@ def publish_source_docx_batch(
         )
 
         raise_if_cancelled(cancel_check, phase="source publication planning")
-        if manifest_paths is None:
-            plan = plan_legacy_docx_replacements(generated_root, scope_root)
-        else:
-            plan = plan_legacy_docx_replacements(
-                generated_root,
-                scope_root,
-                manifest_paths=manifest_paths,
-            )
+        plan = plan_legacy_docx_replacements(
+            generated_root,
+            scope_root,
+            manifest_paths=eligible_manifests,
+        )
         operations = {"create": 0, "replace": 0}
         for item in plan.items:
             operations[item.operation] = operations.get(item.operation, 0) + 1
@@ -2496,6 +2719,14 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
             "files beside the source recordings with retained backups"
         ),
     )
+    parser.add_argument(
+        "--no-troubleshooting-logs",
+        action="store_true",
+        help=(
+            "Do not create the optional per-job run.jsonl event log; hash-bound "
+            "resume and provenance metadata are always retained"
+        ),
+    )
     parser.add_argument("--limit", type=int, help="Process only the first N files (for a trial run)")
     return parser.parse_args(argv)
 
@@ -2531,8 +2762,15 @@ def execute_pipeline(
                 publication = publish_source_docx_batch(
                     config,
                     counts,
-                    manifest_paths=getattr(runner, "selected_manifest_paths", None),
-                    cancel_check=cancel_check,
+                    manifest_paths=tuple(
+                        getattr(runner, "processed_manifest_paths", ())
+                    ),
+                    # A graceful stop still publishes jobs which completed before
+                    # the interruption. Incomplete/cancelled manifests are filtered
+                    # out by the publisher and remain resumable.
+                    cancel_check=(
+                        None if counts.get("cancelled", 0) else cancel_check
+                    ),
                 )
             except PipelineCancelledError:
                 counts["cancelled"] = max(1, counts.get("cancelled", 0))
@@ -2542,12 +2780,12 @@ def execute_pipeline(
                     publication={
                         "status": "suppressed",
                         "blocking_conditions": ["cancel_requested"],
-                        "error": "source DOCX publication cancelled before commit",
+                        "error": "sibling Word publication cancelled before commit",
                     },
                 )
                 print(
-                    "Source DOCX publication cancelled before commit; no source "
-                    "DOCX file was changed."
+                    "Sibling Word publication cancelled before commit; source "
+                    "documents remain unchanged."
                 )
                 return 1
             except Exception as exc:
@@ -2560,7 +2798,7 @@ def execute_pipeline(
                     },
                 )
                 print(
-                    f"Source DOCX publication failed: {type(exc).__name__}: {exc}",
+                    f"Sibling Word publication failed: {type(exc).__name__}: {exc}",
                     file=sys.stderr,
                 )
                 return 1
@@ -2577,15 +2815,17 @@ def execute_pipeline(
                     if isinstance(operations, dict)
                     else 0
                 )
-                counts["publication_published"] = changed
+                counts["publication_published"] = counts.get(
+                    "publication_published", 0
+                ) + changed
                 print(
-                    f"Source DOCX publication verified {publication.get('planned', 0):,} "
+                    f"Sibling Word publication verified {publication.get('planned', 0):,} "
                     f"file(s): {changed:,} changed, {unchanged:,} already current."
                 )
             elif publication:
                 counts["publication_suppressed"] = 1
                 blockers = ", ".join(publication.get("blocking_conditions", ()))
-                print(f"Source DOCX publication suppressed: {blockers}")
+                print(f"Sibling Word publication suppressed: {blockers}")
             runner._write_summary(counts, publication=publication)
     finally:
         runner.close()
@@ -2630,6 +2870,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         existing_docx_mode=args.existing_docx_mode,
         replace_before_date=args.replace_before_date,
         existing_transcripts_only=args.existing_transcripts_only,
+        retain_troubleshooting_artifacts=not args.no_troubleshooting_logs,
         limit=args.limit,
     )
     return execute_pipeline(config)

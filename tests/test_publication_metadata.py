@@ -268,6 +268,7 @@ class PublicationRendererTests(unittest.TestCase):
                 "The lecture concludes here.\n\n"
                 "Processed by speech-to-text from a digitised tape recording "
                 "originally taken from MW on 22 January 1985.\n"
+                "Needs human review.\n"
                 "Cleaned up at: 2026-08-05 10:30"
             ),
             "The lecture concludes here.",
@@ -292,6 +293,7 @@ class PublicationRendererTests(unittest.TestCase):
                     metadata={"model": "must not appear", "device": "must not appear"},
                     use_australian_spelling=False,
                     output_path=output,
+                    needs_human_review=True,
                 )
 
         document = _FakeDocument.instances[0]
@@ -307,13 +309,15 @@ class PublicationRendererTests(unittest.TestCase):
         self.assertEqual(document.paragraphs[2].paragraph_format.space_after, 8 * 12_700)
         self.assertEqual(document.paragraphs[2].paragraph_format.line_spacing, 1.333)
         self.assertEqual(document.paragraphs[0].runs[0].font.size, 30 * 12_700)
-        self.assertEqual(document.paragraphs[-1].runs[0].font.size, 9 * 12_700)
-        self.assertTrue(document.paragraphs[-1].runs[0].font.italic)
+        self.assertEqual(document.paragraphs[-2].runs[0].font.size, 9 * 12_700)
+        self.assertTrue(document.paragraphs[-2].runs[0].font.italic)
         self.assertEqual(
-            texts[-1],
+            texts[-2],
             "Processed by speech-to-text from a digitised tape recording "
             "originally recorded in person by MW on 22 January 1985.",
         )
+        self.assertEqual(texts[-1], "Needs human review.")
+        self.assertTrue(document.paragraphs[-1].runs[0].bold)
         self.assertEqual(document.sections[0].page_width, int(8.5 * 914_400))
         self.assertEqual(document.sections[0].left_margin, 914_400)
         self.assertEqual(document.styles["Normal"].font.name, "Calibri")

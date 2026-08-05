@@ -13,6 +13,7 @@ from archive_pipeline import (
     SOURCE_DOCX_PUBLICATION_REPORT,
     artifact_directory,
     artifact_paths,
+    compact_stt_metadata,
     discover_audio,
     execute_pipeline,
     main as pipeline_main,
@@ -94,7 +95,11 @@ class ArchivePipelineTests(unittest.TestCase):
 
         self.assertFalse(config.publish_source_docx)
         self.assertFalse(config.existing_transcripts_only)
+        self.assertTrue(config.retain_troubleshooting_artifacts)
         self.assertFalse(parse_args(["archive"]).publish_source_docx)
+        self.assertTrue(
+            parse_args(["archive", "--no-troubleshooting-logs"]).no_troubleshooting_logs
+        )
         self.assertTrue(
             parse_args(["archive", "--publish-source-docx"]).publish_source_docx
         )
@@ -104,7 +109,53 @@ class ArchivePipelineTests(unittest.TestCase):
             "--skip-stt",
         ):
             with self.subTest(flag=flag):
-                self.assertTrue(parse_args(["archive", flag]).existing_transcripts_only)
+                self.assertTrue(
+                    parse_args(["archive", flag]).existing_transcripts_only
+                )
+
+    def test_off_mode_compacts_terminology_bodies_to_digests(self):
+        terminology = {
+            "selector_version": "faster-whisper-hotwords-v1",
+            "token_budget": 223,
+            "applied": True,
+            "reason": "selected",
+            "hotwords": "esotericism enneagram",
+            "selected_terms": ["esotericism", "enneagram"],
+            "dropped_terms": ["a", "b"],
+        }
+
+        compact = compact_stt_metadata(
+            {"terminology": terminology},
+            retain_troubleshooting_artifacts=False,
+        )["terminology"]
+
+        for key in ("hotwords", "selected_terms", "dropped_terms"):
+            self.assertNotIn(key, compact)
+            self.assertEqual(len(compact[f"{key}_sha256"]), 64)
+        self.assertEqual(compact["selected_terms_count"], 2)
+        self.assertEqual(compact["dropped_terms_count"], 2)
+        self.assertEqual(compact["selector_version"], terminology["selector_version"])
+
+    def test_off_mode_suppresses_optional_event_log_but_keeps_runner_state(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source_root = root / "archive"
+            output_root = root / "output"
+            source_root.mkdir()
+            runner = PipelineRunner(
+                PipelineConfig(
+                    input_path=source_root,
+                    output_root=output_root,
+                    retain_troubleshooting_artifacts=False,
+                )
+            )
+            try:
+                event_log = output_root / "job" / "run.jsonl"
+                runner._append_event(event_log, "test_event", proof_sha256="abc123")
+                self.assertFalse(event_log.exists())
+                self.assertTrue((output_root / "pipeline.sqlite3").exists())
+            finally:
+                runner.close()
 
     def test_before_mode_rejects_missing_malformed_and_impossible_dates(self):
         invalid_dates = (
@@ -226,7 +277,44 @@ class ArchivePipelineTests(unittest.TestCase):
             message = str(caught.exception)
             self.assertIn(str(mp3.resolve()), message)
             self.assertIn(str(wav.resolve()), message)
-            self.assertIn(str(mp3.with_suffix(".docx").resolve()), message)
+            self.assertIn(
+                str(mp3.with_name("lecture - GLM Review.docx").resolve()),
+                message,
+            )
+
+    def test_fresh_stt_rejects_raw_whisper_review_cross_role_collision(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source_root = root / "archive"
+            output_root = root / "output"
+            source_root.mkdir()
+            ordinary = source_root / "lecture.mp3"
+            review_named = source_root / "lecture - GLM Review.wav"
+            ordinary.write_bytes(b"synthetic-audio-placeholder")
+            review_named.write_bytes(b"synthetic-audio-placeholder")
+            runner = PipelineRunner(
+                PipelineConfig(
+                    input_path=source_root,
+                    output_root=output_root,
+                    cleanup_enabled=False,
+                    publish_source_docx=True,
+                )
+            )
+            try:
+                with mock.patch.object(runner, "process_one") as process_one:
+                    with self.assertRaisesRegex(
+                        ValueError, "source-adjacent DOCX target collisions"
+                    ) as caught:
+                        runner.run()
+                process_one.assert_not_called()
+            finally:
+                runner.close()
+
+            message = str(caught.exception)
+            collision = ordinary.with_name("lecture - GLM Review.docx").resolve()
+            self.assertIn(str(collision), message)
+            self.assertIn(f"GLM review: {ordinary.resolve()}", message)
+            self.assertIn(f"raw Whisper: {review_named.resolve()}", message)
 
     def test_collision_validation_uses_the_already_filtered_selected_set(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -288,7 +376,7 @@ class ArchivePipelineTests(unittest.TestCase):
             self.assertEqual([], skipped)
             self.assertEqual([], before)
 
-    def test_execute_pipeline_passes_only_selected_manifests_to_publication(self):
+    def test_dry_run_has_no_processed_manifests_eligible_for_publication(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             source_root = root / "archive"
@@ -325,11 +413,7 @@ class ArchivePipelineTests(unittest.TestCase):
             self.assertEqual(called_counts["queued"], 1)
             self.assertEqual(
                 publish_batch.call_args.kwargs["manifest_paths"],
-                (
-                    artifact_paths(
-                        artifact_directory(selected, source_root, output_root)
-                    )["manifest"],
-                ),
+                (),
             )
             summary = json.loads(
                 (output_root / "last-run-summary.json").read_text(encoding="utf-8")
@@ -349,6 +433,7 @@ class ArchivePipelineTests(unittest.TestCase):
         runner = mock.Mock()
         runner.run.return_value = counts
         runner.selected_manifest_paths = (Path("output/job/manifest.json"),)
+        runner.processed_manifest_paths = [Path("output/job/manifest.json")]
 
         with mock.patch(
             "archive_pipeline.PipelineRunner", return_value=runner
@@ -378,6 +463,7 @@ class ArchivePipelineTests(unittest.TestCase):
         runner = mock.Mock()
         runner.run.return_value = counts
         runner.selected_manifest_paths = (Path("output/job/manifest.json"),)
+        runner.processed_manifest_paths = [Path("output/job/manifest.json")]
 
         with mock.patch(
             "archive_pipeline.PipelineRunner", return_value=runner
@@ -394,6 +480,43 @@ class ArchivePipelineTests(unittest.TestCase):
         publication = runner._write_summary.call_args.kwargs["publication"]
         self.assertEqual("suppressed", publication["status"])
         self.assertEqual(["cancel_requested"], publication["blocking_conditions"])
+        runner.close.assert_called_once_with()
+
+    def test_cancelled_run_excludes_unvisited_stale_manifest_from_final_publication(self):
+        config = PipelineConfig(
+            input_path=Path("archive"),
+            output_root=Path("output"),
+            publish_source_docx=True,
+        )
+        counts = self.clean_counts(discovered=2)
+        counts["verified"] = 1
+        counts["cancelled"] = 1
+        completed = Path("output/completed/manifest.json")
+        stale_unvisited = Path("output/unvisited/manifest.json")
+        runner = mock.Mock()
+        runner.run.return_value = counts
+        runner.selected_manifest_paths = (completed, stale_unvisited)
+        runner.processed_manifest_paths = [completed]
+
+        with mock.patch(
+            "archive_pipeline.PipelineRunner", return_value=runner
+        ), mock.patch(
+            "archive_pipeline.publish_source_docx_batch",
+            return_value={
+                "status": "published",
+                "planned": 1,
+                "operations": {"create": 0, "replace": 0, "noop": 1},
+            },
+        ) as publish_batch, mock.patch("builtins.print"):
+            exit_code = execute_pipeline(config)
+
+        self.assertEqual(1, exit_code)
+        self.assertEqual(
+            publish_batch.call_args.kwargs["manifest_paths"], (completed,)
+        )
+        self.assertNotIn(
+            stale_unvisited, publish_batch.call_args.kwargs["manifest_paths"]
+        )
         runner.close.assert_called_once_with()
 
     def test_cancellation_stops_before_next_file_and_preserves_completed_checkpoint(self):
@@ -473,6 +596,64 @@ class ArchivePipelineTests(unittest.TestCase):
             self.assertEqual(first_manifest["status"], "verified")
             self.assertFalse(second_paths["manifest"].exists())
 
+    def test_completed_job_is_published_before_a_later_batch_interruption(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source_root = root / "archive"
+            output_root = root / "output"
+            source_root.mkdir()
+            first = source_root / "01 first.mp3"
+            second = source_root / "02 second.mp3"
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            cancelled = {"value": False}
+            runner = PipelineRunner(
+                PipelineConfig(
+                    input_path=source_root,
+                    output_root=output_root,
+                    publish_source_docx=True,
+                ),
+                cancel_check=lambda: cancelled["value"],
+            )
+            runner.cleanup_client = FakeCleanupClient()
+
+            def finish_first(source):
+                manifest = artifact_paths(
+                    artifact_directory(source, source_root, output_root)
+                )["manifest"]
+                manifest.parent.mkdir(parents=True, exist_ok=True)
+                manifest.write_text(
+                    json.dumps({"status": "verified"}), encoding="utf-8"
+                )
+                cancelled["value"] = True
+                return "verified"
+
+            runner.process_one = finish_first
+            report = {
+                "status": "published",
+                "operations": {"create": 1, "replace": 0, "noop": 0},
+            }
+            try:
+                with mock.patch(
+                    "archive_pipeline.publish_source_docx_batch",
+                    return_value=report,
+                ) as publish:
+                    counts = runner.run()
+            finally:
+                runner.close()
+
+            self.assertEqual(counts["verified"], 1)
+            self.assertEqual(counts["cancelled"], 1)
+            publish.assert_called_once()
+            self.assertEqual(
+                publish.call_args.kwargs["manifest_paths"],
+                (
+                    artifact_paths(
+                        artifact_directory(first, source_root, output_root)
+                    )["manifest"],
+                ),
+            )
+
     def test_stage_cancellation_after_transcription_preserves_raw_checkpoint(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -502,7 +683,10 @@ class ArchivePipelineTests(unittest.TestCase):
             self.assertTrue(paths["raw_text"].is_file())
             self.assertTrue(paths["segments"].is_file())
             self.assertEqual(runner.cleanup_client.calls, 0)
-            self.assertEqual(runner.render_calls, [])
+            self.assertEqual(
+                runner.render_calls,
+                [paths["whisper_docx"]],
+            )
 
     def test_cleanup_preflight_receives_callback_and_stops_before_first_file(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -553,7 +737,10 @@ class ArchivePipelineTests(unittest.TestCase):
             self.assertEqual(manifest["status"], "cancelled")
             self.assertIn("test cleanup stop", manifest["error"])
             self.assertTrue(paths["raw_text"].is_file())
-            self.assertEqual(runner.render_calls, [])
+            self.assertEqual(
+                runner.render_calls,
+                [paths["whisper_docx"]],
+            )
 
     def test_publication_cancellation_stops_before_planning_or_commit(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -566,6 +753,11 @@ class ArchivePipelineTests(unittest.TestCase):
                 input_path=source_root,
                 output_root=output_root,
                 publish_source_docx=True,
+            )
+            manifest_path = output_root / "job" / "manifest.json"
+            manifest_path.parent.mkdir()
+            manifest_path.write_text(
+                json.dumps({"status": "verified"}), encoding="utf-8"
             )
 
             with mock.patch(
@@ -726,6 +918,11 @@ class ArchivePipelineTests(unittest.TestCase):
                 output_root=output_root,
                 publish_source_docx=True,
             )
+            manifest_path = output_root / "job" / "manifest.json"
+            manifest_path.parent.mkdir()
+            manifest_path.write_text(
+                json.dumps({"status": "verified"}), encoding="utf-8"
+            )
             plan = SimpleNamespace(
                 items=(
                     SimpleNamespace(operation="create"),
@@ -761,12 +958,14 @@ class ArchivePipelineTests(unittest.TestCase):
                 )
 
             expected_backup = (
-                source_root.resolve().parent
-                / "archive - Legacy DOCX Backup - 20260805-143045"
+                output_root.resolve()
+                / "publication-backups"
+                / "20260805-143045-000000"
             )
             planner.assert_called_once_with(
                 output_root.resolve(),
                 source_root.resolve(),
+                manifest_paths=[output_root.resolve() / "job" / "manifest.json"],
             )
             apply_batch.assert_called_once_with(
                 plan,
@@ -806,6 +1005,7 @@ class ArchivePipelineTests(unittest.TestCase):
             ) as publish_batch, mock.patch("builtins.print"):
                 runner = runner_type.return_value
                 runner.selected_manifest_paths = selected_manifests
+                runner.processed_manifest_paths = list(selected_manifests)
                 runner.run.side_effect = lambda: events.append("run") or counts
                 publish_batch.side_effect = (
                     lambda _config, _counts, **_kwargs: events.append("publish")
@@ -831,14 +1031,19 @@ class ArchivePipelineTests(unittest.TestCase):
             )
             runner.close.assert_called_once_with()
 
-    def test_failed_cancelled_or_review_run_suppresses_whole_publication_batch(self):
-        for blocking_status in ("failed", "cancelled", "needs_review"):
+    def test_failed_or_cancelled_job_is_not_published(self):
+        for blocking_status in ("failed", "cancelled"):
             with self.subTest(blocking_status=blocking_status), tempfile.TemporaryDirectory() as folder:
                 root = Path(folder)
                 source_root = root / "archive"
                 output_root = root / "generated"
                 source_root.mkdir()
                 output_root.mkdir()
+                manifest_path = output_root / "job" / "manifest.json"
+                manifest_path.parent.mkdir()
+                manifest_path.write_text(
+                    json.dumps({"status": blocking_status}), encoding="utf-8"
+                )
                 config = PipelineConfig(
                     input_path=source_root,
                     output_root=output_root,
@@ -858,7 +1063,50 @@ class ArchivePipelineTests(unittest.TestCase):
                 planner.assert_not_called()
                 apply_batch.assert_not_called()
                 self.assertEqual(report["status"], "suppressed")
-                self.assertIn(blocking_status, report["blocking_conditions"])
+                self.assertIn(
+                    "no_completed_review_documents", report["blocking_conditions"]
+                )
+
+    def test_needs_review_job_is_published_for_human_checking(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source_root = root / "archive"
+            output_root = root / "generated"
+            source_root.mkdir()
+            manifest_path = output_root / "job" / "manifest.json"
+            manifest_path.parent.mkdir(parents=True)
+            manifest_path.write_text(
+                json.dumps({"status": "needs_review"}), encoding="utf-8"
+            )
+            config = PipelineConfig(
+                input_path=source_root,
+                output_root=output_root,
+                publish_source_docx=True,
+            )
+            plan = SimpleNamespace(
+                items=(SimpleNamespace(operation="create"),),
+                plan_sha256="b" * 64,
+                to_dict=lambda: {"count": 1, "plan_sha256": "b" * 64},
+            )
+            target = source_root / "lecture - GLM Review.docx"
+            with mock.patch(
+                "legacy_docx_replace.plan_legacy_docx_replacements",
+                return_value=plan,
+            ) as planner, mock.patch(
+                "legacy_docx_replace.apply_legacy_docx_replacements",
+                return_value=(target,),
+            ):
+                counts = self.clean_counts(discovered=1)
+                counts["verified"] = 0
+                counts["needs_review"] = 1
+                report = publish_source_docx_batch(config, counts)
+
+            self.assertEqual(report["status"], "published")
+            planner.assert_called_once_with(
+                output_root.resolve(),
+                source_root.resolve(),
+                manifest_paths=[output_root.resolve() / "job" / "manifest.json"],
+            )
 
     def test_dry_run_suppresses_source_publication(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -1097,7 +1345,7 @@ class ArchivePipelineTests(unittest.TestCase):
             finally:
                 runner.close()
 
-    def test_changed_glossary_reuses_stt_but_reruns_cleanup(self):
+    def test_changed_glossary_invalidates_hotword_bound_stt_and_cleanup(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             runner, source, transcribe_calls = self._runner(root)
@@ -1106,7 +1354,9 @@ class ArchivePipelineTests(unittest.TestCase):
                 self.assertEqual(runner.cleanup_client.calls, 1)
                 runner.cleanup_client.glossary_sha256 = "updated-glossary"
                 self.assertEqual(runner.process_one(source), "verified")
-                self.assertEqual(len(transcribe_calls), 1)
+                # The pinned glossary also drives Whisper hotwords, so a glossary
+                # version change deliberately invalidates the raw STT signature.
+                self.assertEqual(len(transcribe_calls), 2)
                 self.assertEqual(runner.cleanup_client.calls, 2)
             finally:
                 runner.close()

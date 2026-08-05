@@ -1,9 +1,10 @@
-"""Explicit, rollback-safe replacement of legacy transcript DOCX files.
+"""Rollback-safe publication of Whisper and GLM-review DOCX siblings.
 
 The command is a two-step operation: inspect the plan first, then repeat with
 ``--confirm-replace --expect N``.  Targets are confined to one caller-supplied
 scope root.  Every original is copied to a new backup tree before any target is
-atomically replaced; backups are retained after success or failure.
+atomically replaced; backups are retained after success or failure. Existing
+source transcripts are never used as GLM review targets.
 """
 
 from __future__ import annotations
@@ -151,8 +152,8 @@ def _require_publishable_cleanup(manifest: dict[str, Any], manifest_path: Path) 
         raise ReplacementError(f"manifest cleanup record is missing: {manifest_path}")
     if cleanup.get("enabled") is not True:
         raise ReplacementError(f"cleanup was not enabled: {manifest_path}")
-    if cleanup.get("needs_review") is not False:
-        raise ReplacementError(f"cleanup is unreviewed or needs review: {manifest_path}")
+    if type(cleanup.get("needs_review")) is not bool:
+        raise ReplacementError(f"cleanup review state is invalid: {manifest_path}")
     model = cleanup.get("model")
     if not isinstance(model, str) or not model.strip():
         raise ReplacementError(f"cleanup model is missing: {manifest_path}")
@@ -470,13 +471,22 @@ def plan_legacy_docx_replacements(
             raise ReplacementError(f"invalid manifest {manifest_path}: {exc}") from exc
         if not isinstance(manifest, dict):
             raise ReplacementError(f"manifest is not a JSON object: {manifest_path}")
-        if manifest.get("status") != "verified":
+        if manifest.get("status") not in {"verified", "needs_review"}:
             raise ReplacementError(
-                f"refusing non-verified transcript ({manifest.get('status')!r}): {manifest_path}"
+                f"refusing incomplete transcript ({manifest.get('status')!r}): {manifest_path}"
+            )
+        if manifest.get("approval_state") != "pending_human_review":
+            raise ReplacementError(
+                f"manifest lacks pending human-review state: {manifest_path}"
             )
         qa = manifest.get("qa")
-        if not isinstance(qa, dict) or qa.get("status") != "passed":
-            raise ReplacementError(f"refusing transcript without passed QA: {manifest_path}")
+        if not isinstance(qa, dict) or qa.get("status") not in {
+            "passed",
+            "needs_review",
+        }:
+            raise ReplacementError(
+                f"refusing transcript without a final QA state: {manifest_path}"
+            )
         imported_input = _require_publishable_raw_input(
             manifest, manifest_path, generated_root
         )
@@ -495,7 +505,9 @@ def plan_legacy_docx_replacements(
             )
         legacy_source = legacy_source_candidate.resolve()
 
-        target_relative = source_relative.with_suffix(".docx")
+        from archive_pipeline import glm_review_relative_path
+
+        target_relative = glm_review_relative_path(source_relative)
         target_candidate = legacy_root / target_relative
         if not _is_within(target_candidate, legacy_root):
             raise ReplacementError(f"target escapes the dedicated scope: {target_candidate}")
@@ -521,6 +533,11 @@ def plan_legacy_docx_replacements(
             raise ReplacementError(f"generated DOCX escapes its output root: {generated}")
         validate_docx(generated)
         generated_hash = _sha256_file(generated)
+        render = manifest.get("render")
+        if not isinstance(render, dict) or render.get("output_sha256") != generated_hash:
+            raise ReplacementError(
+                f"generated DOCX does not match the render hash chain: {manifest_path}"
+            )
 
         if imported_input is not None:
             if source_relative.suffix.casefold() != ".docx":
@@ -528,37 +545,41 @@ def plan_legacy_docx_replacements(
                     f"imported transcript source is not a DOCX path: {manifest_path}"
                 )
             imported_path_value = imported_input.get("path")
-            if (
-                not isinstance(imported_path_value, str)
-                or _normal_path(Path(imported_path_value)) != _normal_path(target)
-            ):
+            if not isinstance(imported_path_value, str) or _normal_path(
+                Path(imported_path_value)
+            ) != _normal_path(legacy_source):
                 raise ReplacementError(
-                    f"imported DOCX path does not match publication target: {manifest_path}"
+                    f"imported DOCX path does not match its source transcript: {manifest_path}"
                 )
-            if not target.is_file() or target.is_symlink():
+            if not legacy_source.is_file() or legacy_source.is_symlink():
                 raise ReplacementError(
-                    f"imported-DOCX publication cannot create a missing target: {target}"
+                    f"imported source DOCX is missing or invalid: {legacy_source}"
                 )
-            render = manifest.get("render")
-            if not isinstance(render, dict) or render.get("output_sha256") != generated_hash:
+            if _sha256_file(legacy_source).casefold() != str(
+                imported_input.get("container_sha256", "")
+            ).casefold():
                 raise ReplacementError(
-                    f"generated DOCX does not match the render hash chain: {manifest_path}"
+                    "source DOCX changed after import; refusing to publish from "
+                    f"stale preserved text: {legacy_source}"
                 )
-            current_target_hash = _sha256_file(target).casefold()
-            allowed_target_hashes = {
-                str(imported_input.get("container_sha256", "")).casefold()
-            }
-            # Immutable successful batch reports are the explicit authority for
-            # replacing a previously published polished version on a later uplift.
+
+        if target.is_file():
+            # Only a byte hash recorded in an immutable publication journal may
+            # authorise replacement of a prior human-review copy. A manually
+            # edited review document is left untouched and fails closed.
             from archive_pipeline import immutable_publication_hashes
 
-            allowed_target_hashes.update(
-                immutable_publication_hashes(generated_root, manifest_path, target)
+            current_target_hash = _sha256_file(target).casefold()
+            allowed_target_hashes = immutable_publication_hashes(
+                generated_root, manifest_path, target
             )
-            if current_target_hash not in allowed_target_hashes:
+            if (
+                current_target_hash != generated_hash.casefold()
+                and current_target_hash not in allowed_target_hashes
+            ):
                 raise ReplacementError(
-                    "source DOCX changed after import and is not a proven prior "
-                    f"publication: {target}"
+                    "GLM Review target exists but is not a proven prior publication "
+                    f"or was manually changed: {target}"
                 )
 
         target_key = _normal_path(target)
@@ -579,6 +600,70 @@ def plan_legacy_docx_replacements(
                 original_sha256=_sha256_file(target) if target.is_file() else None,
             )
         )
+
+        if imported_input is None:
+            whisper_value = artifacts.get("whisper_docx") if isinstance(
+                artifacts, dict
+            ) else None
+            if not isinstance(whisper_value, str) or not whisper_value.strip():
+                raise ReplacementError(
+                    f"fresh STT manifest lacks its preserved Whisper DOCX: {manifest_path}"
+                )
+            whisper_candidate = Path(whisper_value)
+            if not whisper_candidate.is_absolute():
+                whisper_candidate = manifest_path.parent / whisper_candidate
+            if whisper_candidate.is_symlink():
+                raise ReplacementError(
+                    f"generated Whisper DOCX is a symlink: {whisper_candidate}"
+                )
+            whisper_generated = whisper_candidate.resolve()
+            if not _is_within(whisper_generated, generated_root):
+                raise ReplacementError(
+                    f"generated Whisper DOCX escapes output root: {whisper_generated}"
+                )
+            validate_docx(whisper_generated)
+            whisper_hash = _sha256_file(whisper_generated)
+            if manifest.get("stt", {}).get("whisper_docx_sha256") != whisper_hash:
+                raise ReplacementError(
+                    f"generated Whisper DOCX hash is invalid: {manifest_path}"
+                )
+            whisper_relative = source_relative.with_suffix(".docx")
+            whisper_target_candidate = legacy_root / whisper_relative
+            if not _is_within(whisper_target_candidate, legacy_root):
+                raise ReplacementError(
+                    f"Whisper DOCX target escapes scope: {whisper_target_candidate}"
+                )
+            if whisper_target_candidate.is_symlink():
+                raise ReplacementError(
+                    f"Whisper DOCX target is a symlink: {whisper_target_candidate}"
+                )
+            if whisper_target_candidate.exists() and not whisper_target_candidate.is_file():
+                raise ReplacementError(
+                    f"Whisper DOCX target is not a file: {whisper_target_candidate}"
+                )
+            whisper_target = whisper_target_candidate.resolve()
+            whisper_key = _normal_path(whisper_target)
+            if whisper_key in seen_targets:
+                raise ReplacementError(
+                    "multiple source formats map to one Whisper DOCX target: "
+                    f"{seen_targets[whisper_key]} and {manifest_path} -> {whisper_target}"
+                )
+            whisper_original_hash = (
+                _sha256_file(whisper_target) if whisper_target.is_file() else None
+            )
+            if whisper_original_hash != whisper_hash:
+                seen_targets[whisper_key] = manifest_path
+                items.append(
+                    LegacyDocxReplacement(
+                        manifest=manifest_path.resolve(),
+                        generated=whisper_generated,
+                        source=legacy_source,
+                        target=whisper_target,
+                        target_relative=whisper_relative,
+                        generated_sha256=whisper_hash,
+                        original_sha256=whisper_original_hash,
+                    )
+                )
 
     return LegacyReplacementPlan(generated_root, legacy_root, tuple(items))
 
@@ -663,7 +748,12 @@ def apply_legacy_docx_replacements(
         raise ReplacementError("expected_scope_root does not exactly match the planned scope")
     backup_root = Path(backup_root).resolve()
     _require_disjoint(backup_root, plan.scope_root, "backup and legacy roots")
-    _require_disjoint(backup_root, plan.generated_root, "backup and generated roots")
+    if not _is_within(backup_root, plan.generated_root) or _normal_path(
+        backup_root
+    ) == _normal_path(plan.generated_root):
+        raise ReplacementError(
+            "backup root must be a dedicated child of the generated workspace"
+        )
 
     # Revalidate the whole batch before creating a backup directory or touching a target.
     for item in plan.items:
