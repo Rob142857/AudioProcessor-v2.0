@@ -14,6 +14,7 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -22,7 +23,18 @@ import traceback
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Optional
+from typing import Any, Callable, Iterable, Iterator, Optional
+
+from console_compat import configure_safe_stdio
+from pipeline_control import PipelineCancelledError, raise_if_cancelled
+from stt_coverage import (
+    assess_stt_coverage,
+    coverage_record_is_passed,
+    finite_seconds,
+)
+
+
+configure_safe_stdio()
 
 
 PIPELINE_VERSION = "3.0.0"
@@ -30,6 +42,7 @@ DEFAULT_CLEANUP_ENDPOINT = (
     "https://pg.objectiveartefacts.com.au/api/tooling/cleanup-chunk"
 )
 DEFAULT_CLEANUP_MODEL = "@cf/zai-org/glm-4.7-flash"
+DEFAULT_CLEANUP_PROFILE = "semantic-conservative-v3"
 SUPPORTED_AUDIO_EXTENSIONS = frozenset(
     {
         ".aac",
@@ -52,6 +65,8 @@ SUPPORTED_AUDIO_EXTENSIONS = frozenset(
     }
 )
 FINAL_STATUSES = frozenset({"verified", "needs_review"})
+EXISTING_DOCX_MODES = frozenset({"skip", "all", "before"})
+SOURCE_DOCX_PUBLICATION_REPORT = "source-docx-publication-report.json"
 
 # Values which can materially change recognition, preprocessing, or prompt
 # bias.  They form part of the per-source STT request signature so a changed
@@ -179,25 +194,151 @@ def _is_relative_to(path: Path, parent: Path) -> bool:
         return False
 
 
-def discover_audio(input_path: Path, output_root: Path) -> list[Path]:
+def source_publication_scope(input_path: Path) -> Path:
+    """Return the explicit archive root within which publication may occur."""
+
+    input_path = Path(input_path).resolve()
+    return input_path if input_path.is_dir() else input_path.parent
+
+
+def require_disjoint_publication_roots(input_path: Path, output_root: Path) -> Path:
+    """Fail before processing if generated artifacts overlap the source scope."""
+
+    resolved_input = Path(input_path).resolve()
+    if not resolved_input.exists():
+        raise FileNotFoundError(f"Input does not exist: {resolved_input}")
+    scope_root = source_publication_scope(input_path)
+    generated_root = Path(output_root).resolve()
+    scope_key = os.path.normcase(os.path.abspath(str(scope_root)))
+    generated_key = os.path.normcase(os.path.abspath(str(generated_root)))
+    try:
+        overlap = os.path.commonpath((scope_key, generated_key)) in {
+            scope_key,
+            generated_key,
+        }
+    except ValueError:
+        overlap = False
+    if overlap:
+        raise ValueError(
+            "source DOCX publication requires input scope and output root to be "
+            f"separate, non-nested directories: {scope_root} ; {generated_root}"
+        )
+    if resolved_input.is_file() and generated_root.exists():
+        if not generated_root.is_dir():
+            raise ValueError(
+                f"single-file publication output is not a directory: {generated_root}"
+            )
+        if next(generated_root.iterdir(), None) is not None:
+            manifests = sorted(generated_root.rglob("manifest.json"))
+            same_source_resume = len(manifests) == 1
+            if same_source_resume:
+                recorded_path = read_json(manifests[0]).get("source", {}).get("path")
+                if not isinstance(recorded_path, str) or not recorded_path.strip():
+                    same_source_resume = False
+                else:
+                    same_source_resume = (
+                        os.path.normcase(
+                            os.path.abspath(str(Path(recorded_path).resolve()))
+                        )
+                        == os.path.normcase(os.path.abspath(str(resolved_input)))
+                    )
+            if not same_source_resume:
+                raise ValueError(
+                    "single-file source DOCX publication requires a new output "
+                    "root or an existing dedicated output containing only that "
+                    f"same source manifest: {generated_root}"
+                )
+    return scope_root
+
+
+def validate_existing_docx_policy(
+    mode: str = "all",
+    replace_before_date: Optional[str] = None,
+) -> Optional[datetime]:
+    if mode not in EXISTING_DOCX_MODES:
+        raise ValueError(f"invalid existing-DOCX mode: {mode!r}")
+    if mode != "before":
+        return None
+    if not isinstance(replace_before_date, str) or not re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}", replace_before_date
+    ):
+        raise ValueError("replace-before mode requires a YYYY-MM-DD date")
+    try:
+        return datetime.strptime(replace_before_date, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError("replace-before date must use YYYY-MM-DD") from exc
+
+
+def should_process_existing_docx(
+    source: Path,
+    mode: str = "all",
+    replace_before_date: Optional[str] = None,
+) -> bool:
+    """Apply the GUI/CLI source-adjacent DOCX selection policy.
+
+    The policy only decides which recordings enter the resume-safe pipeline;
+    it never deletes an existing document.  Publication remains a separate,
+    verified, backup-protected post-run transaction.
+    """
+
+    cutoff = validate_existing_docx_policy(mode, replace_before_date)
+    target = Path(source).with_suffix(".docx")
+    if not target.is_file():
+        return True
+    if mode == "all":
+        return True
+    if mode == "skip":
+        return False
+    assert cutoff is not None
+    modified = datetime.fromtimestamp(target.stat().st_mtime)
+    return modified < cutoff
+
+
+def discover_audio(
+    input_path: Path,
+    output_root: Path,
+    *,
+    recursive: bool = True,
+    existing_docx_mode: str = "all",
+    replace_before_date: Optional[str] = None,
+) -> list[Path]:
     """Return deterministic, collision-preserving audio discovery results."""
     input_path = input_path.resolve()
     output_root = output_root.resolve()
+    # Fail invalid selection input even when the folder is empty, and before
+    # callers mistake a policy error for a legitimate zero-result selection.
+    validate_existing_docx_policy(existing_docx_mode, replace_before_date)
     if input_path.is_file():
         if input_path.suffix.lower() not in SUPPORTED_AUDIO_EXTENSIONS:
             raise ValueError(f"Unsupported audio/video extension: {input_path.suffix}")
-        return [input_path]
+        return (
+            [input_path]
+            if should_process_existing_docx(
+                input_path,
+                existing_docx_mode,
+                replace_before_date,
+            )
+            else []
+        )
     if not input_path.is_dir():
         raise FileNotFoundError(f"Input does not exist: {input_path}")
 
     files: list[Path] = []
-    for candidate in input_path.rglob("*"):
+    candidates = input_path.rglob("*") if recursive else input_path.iterdir()
+    for candidate in candidates:
         if not candidate.is_file():
             continue
         resolved = candidate.resolve()
         if _is_relative_to(resolved, output_root):
             continue
-        if candidate.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS:
+        if (
+            candidate.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS
+            and should_process_existing_docx(
+                resolved,
+                existing_docx_mode,
+                replace_before_date,
+            )
+        ):
             files.append(resolved)
     return sorted(files, key=lambda item: str(item).casefold())
 
@@ -205,6 +346,53 @@ def discover_audio(input_path: Path, output_root: Path) -> list[Path]:
 def source_relative_path(source: Path, input_path: Path) -> Path:
     root = input_path if input_path.is_dir() else input_path.parent
     return source.resolve().relative_to(root.resolve())
+
+
+def validate_source_docx_target_collisions(
+    sources: Iterable[Path],
+    input_path: Path,
+) -> None:
+    """Reject selected recordings which would publish to the same DOCX path.
+
+    Artifact directories include the source extension and are collision-safe,
+    but source-adjacent publication intentionally replaces that extension with
+    ``.docx``.  Detect ambiguous multi-format sources before transcription so a
+    long run cannot finish only to discover that publication is impossible.
+    """
+
+    scope_root = source_publication_scope(input_path)
+    grouped: dict[str, tuple[Path, list[Path]]] = {}
+    for source_value in sources:
+        source = Path(source_value).resolve()
+        relative = source_relative_path(source, input_path)
+        target = (scope_root / relative).with_suffix(".docx")
+        key = os.path.normcase(os.path.abspath(str(target)))
+        if key not in grouped:
+            grouped[key] = (target, [])
+        grouped[key][1].append(source)
+
+    collisions = [
+        (target, source_paths)
+        for target, source_paths in grouped.values()
+        if len(source_paths) > 1
+    ]
+    if not collisions:
+        return
+
+    details: list[str] = []
+    for target, source_paths in sorted(
+        collisions, key=lambda item: str(item[0]).casefold()
+    ):
+        details.append(f"target: {target}")
+        details.extend(
+            f"  source: {source}"
+            for source in sorted(source_paths, key=lambda path: str(path).casefold())
+        )
+    raise ValueError(
+        "selected recordings contain source-adjacent DOCX target collisions; "
+        "choose one source recording from each group before running:\n"
+        + "\n".join(details)
+    )
 
 
 def artifact_directory(source: Path, input_path: Path, output_root: Path) -> Path:
@@ -228,6 +416,7 @@ def artifact_paths(job_directory: Path) -> dict[str, Path]:
         "cleanup": job_directory / "cleanup.json",
         "cleanup_chunks": job_directory / "cleanup-chunks",
         "qa": job_directory / "qa.json",
+        "publication": job_directory / "publication.json",
         "docx": job_directory / "final.docx",
     }
 
@@ -245,6 +434,17 @@ def _seconds(value: Any) -> float:
         return max(0.0, float(value))
     except (TypeError, ValueError):
         return 0.0
+
+
+def probe_audio_duration_seconds(source: Path) -> float | None:
+    """Best-effort source-duration probe for upgrading resumable manifests."""
+
+    try:
+        from transcribe import get_media_duration
+
+        return finite_seconds(get_media_duration(str(source)), positive=True)
+    except Exception:
+        return None
 
 
 def normalize_segments(value: Any) -> list[dict[str, Any]]:
@@ -335,6 +535,7 @@ def validate_artifacts(
     *,
     requested_stt_model: Optional[str] = None,
     actual_stt_model: Optional[str] = None,
+    audio_duration_seconds: Any = None,
 ) -> dict[str, Any]:
     reasons: list[str] = []
     raw_words = len(raw_text.split())
@@ -363,6 +564,8 @@ def validate_artifacts(
         previous_start = start
     if timestamp_errors:
         reasons.append(f"{timestamp_errors} non-monotonic/invalid timestamp segment(s)")
+    stt_coverage = assess_stt_coverage(segments, audio_duration_seconds)
+    reasons.extend(stt_coverage["reasons"])
     if cleanup_needs_review:
         reasons.append("cleanup service marked one or more chunks for review")
     if requested_stt_model and actual_stt_model:
@@ -386,6 +589,7 @@ def validate_artifacts(
         "cleaned_words": cleaned_words,
         "cleaned_to_raw_ratio": ratio,
         "segments": len(segments),
+        "stt_coverage": stt_coverage,
         "checked_at": utc_now(),
     }
 
@@ -404,6 +608,10 @@ class PipelineConfig:
     render_only: bool = False
     retry_review: bool = False
     dry_run: bool = False
+    publish_source_docx: bool = False
+    recursive: bool = True
+    existing_docx_mode: str = "all"
+    replace_before_date: Optional[str] = None
     limit: Optional[int] = None
 
     @property
@@ -415,7 +623,7 @@ class PipelineConfig:
                     "enabled": self.cleanup_enabled,
                     "endpoint": self.cleanup_endpoint,
                     "model": self.cleanup_model,
-                    "profile": "verbatim-conservative",
+                    "profile": DEFAULT_CLEANUP_PROFILE,
                 }
             )
         )
@@ -427,6 +635,7 @@ class PipelineConfig:
                 {
                     "pipeline": PIPELINE_VERSION,
                     "format": "docx",
+                    "publication_renderer": "narrative-proposal-semantic-v3",
                     "australian_semantic_substitution": False,
                 }
             )
@@ -507,17 +716,37 @@ class JobIndex:
 
 
 class PipelineRunner:
-    def __init__(self, config: PipelineConfig):
+    def __init__(
+        self,
+        config: PipelineConfig,
+        *,
+        cancel_check: Optional[Callable[[], bool]] = None,
+    ):
         self.config = config
+        # Validate selection policy before creating any runner state.
+        validate_existing_docx_policy(
+            self.config.existing_docx_mode,
+            self.config.replace_before_date,
+        )
+        if self.config.publish_source_docx:
+            require_disjoint_publication_roots(
+                self.config.input_path,
+                self.config.output_root,
+            )
         self.config.output_root.mkdir(parents=True, exist_ok=True)
         self.index = JobIndex(self.config.output_root / "pipeline.sqlite3")
         self.cleanup_client: Any = None
+        self.cancel_check = cancel_check or (lambda: False)
+        self.selected_manifest_paths: tuple[Path, ...] = ()
         self.stt_runtime_versions = {
             package: installed_version(package) for package in STT_RUNTIME_PACKAGES
         }
 
     def close(self) -> None:
         self.index.close()
+
+    def _check_cancelled(self, phase: str) -> None:
+        raise_if_cancelled(self.cancel_check, phase=phase)
 
     def _get_cleanup_client(self) -> Any:
         if self.cleanup_client is None:
@@ -533,9 +762,29 @@ class PipelineRunner:
             )
         return self.cleanup_client
 
+    def _effective_initial_prompt(self, source: Path) -> tuple[str, str]:
+        """Return a short, factual Whisper context prompt and its provenance."""
+
+        configured = os.environ.get("TRANSCRIBE_INITIAL_PROMPT", "").strip()
+        if configured:
+            return configured, "environment"
+
+        from publication_metadata import infer_publication_metadata
+
+        publication = infer_publication_metadata(
+            source,
+            source_relative_path(source, self.config.input_path),
+        )
+        values = [publication.artist, publication.title, publication.genre]
+        prompt = "; ".join(dict.fromkeys(value for value in values if value))
+        return prompt, "publication-metadata"
+
     def _stt_request_signature(self, source: Path) -> str:
         """Fingerprint every known input which can affect the raw transcript."""
         prompt_files: list[dict[str, Any]] = []
+        effective_initial_prompt, initial_prompt_source = (
+            self._effective_initial_prompt(source)
+        )
 
         configured_prompt_file = os.environ.get(
             "TRANSCRIBE_AWKWARD_FILE", ""
@@ -577,8 +826,9 @@ class PipelineRunner:
                 os.environ.get("TRANSCRIBE_AWKWARD_TERMS", "")
             ),
             "initial_prompt_sha256": sha256_text(
-                os.environ.get("TRANSCRIBE_INITIAL_PROMPT", "")
+                effective_initial_prompt
             ),
+            "initial_prompt_source": initial_prompt_source,
             "files": prompt_files,
         }
         return sha256_text(
@@ -721,12 +971,23 @@ class PipelineRunner:
         os.environ.setdefault("TRANSCRIBE_USE_DATASET", "0")
         from transcribe_optimised import transcribe_file_simple_auto
 
-        result = transcribe_file_simple_auto(
-            str(source),
-            threads_override=self.config.threads,
-            return_details=True,
-            write_docx=False,
-        )
+        original_prompt = os.environ.get("TRANSCRIBE_INITIAL_PROMPT")
+        if not (original_prompt or "").strip():
+            effective_prompt, _source = self._effective_initial_prompt(source)
+            if effective_prompt:
+                os.environ["TRANSCRIBE_INITIAL_PROMPT"] = effective_prompt
+        try:
+            result = transcribe_file_simple_auto(
+                str(source),
+                threads_override=self.config.threads,
+                return_details=True,
+                write_docx=False,
+            )
+        finally:
+            if original_prompt is None:
+                os.environ.pop("TRANSCRIBE_INITIAL_PROMPT", None)
+            else:
+                os.environ["TRANSCRIBE_INITIAL_PROMPT"] = original_prompt
         if not isinstance(result, dict):
             raise RuntimeError("transcription engine did not return structured details")
         return result
@@ -746,6 +1007,9 @@ class PipelineRunner:
             metadata=metadata,
             use_australian_spelling=False,
             output_path=output_path,
+            relative_source_path=source_relative_path(
+                source, self.config.input_path
+            ),
         )
         rendered = Path(rendered)
         if not rendered.is_file() or rendered.stat().st_size < 1_000:
@@ -770,7 +1034,11 @@ class PipelineRunner:
         glossary_error: Optional[Exception] = None
         if self.config.cleanup_enabled and not self.config.render_only:
             try:
-                glossary_sha256 = self._get_cleanup_client().ensure_glossary().sha256
+                self._check_cancelled("cleanup glossary validation")
+                glossary_sha256 = self._get_cleanup_client().ensure_glossary(
+                    cancel_check=self.cancel_check
+                ).sha256
+                self._check_cancelled("cleanup glossary validation")
             except Exception as exc:
                 # Record this as a normal job failure below rather than losing
                 # provenance before a manifest exists.
@@ -782,6 +1050,11 @@ class PipelineRunner:
             and not self.config.render_only
             and glossary_error is None
             and manifest.get("status") in FINAL_STATUSES
+            and coverage_record_is_passed(
+                manifest.get("qa", {}).get("stt_coverage")
+                if isinstance(manifest.get("qa"), dict)
+                else None
+            )
             and not (
                 self.config.retry_review
                 and manifest.get("status") == "needs_review"
@@ -834,6 +1107,7 @@ class PipelineRunner:
         append_event(paths["events"], "job_started", attempt=manifest["attempts"])
 
         try:
+            self._check_cancelled("job start")
             if glossary_error is not None:
                 raise glossary_error
             if self._raw_is_reusable(
@@ -951,6 +1225,7 @@ class PipelineRunner:
                     segments=len(segments),
                 )
 
+            self._check_cancelled("between transcription and cleanup")
             raw_sha256 = sha256_text(raw_text)
             cleanup_needs_review = False
             cleanup_metadata: dict[str, Any]
@@ -959,6 +1234,7 @@ class PipelineRunner:
                 cleanup_metadata = {
                     "enabled": False,
                     "model": None,
+                    "profile": None,
                     "input_sha256": raw_sha256,
                     "output_sha256": raw_sha256,
                     "signature": self.config.cleanup_signature,
@@ -991,6 +1267,7 @@ class PipelineRunner:
                 cleanup_needs_review = bool(cleanup_metadata.get("needs_review"))
                 append_event(paths["events"], "cleanup_reused")
             else:
+                self._check_cancelled("cleanup")
                 manifest["stage"] = "cleaning"
                 self._save_manifest(source, relative, paths, manifest)
                 append_event(paths["events"], "cleanup_started")
@@ -1004,6 +1281,7 @@ class PipelineRunner:
                         or self.config.retry_review
                         or self.config.force
                     ),
+                    cancel_check=self.cancel_check,
                 )
                 cleaned_text = str(cleanup_result.text)
                 if not cleaned_text.strip():
@@ -1021,6 +1299,7 @@ class PipelineRunner:
                 ]
                 cleanup_metadata = {
                     "model": cleanup_result.model,
+                    "profile": DEFAULT_CLEANUP_PROFILE,
                     "glossary_sha256": cleanup_result.glossary_sha256,
                     "glossary_count": cleanup_result.glossary_count,
                     "chunk_count": len(cleanup_result.chunks),
@@ -1079,6 +1358,7 @@ class PipelineRunner:
             manifest["stage"] = "clean_complete"
             self._save_manifest(source, relative, paths, manifest)
 
+            self._check_cancelled("between cleanup and render")
             clean_sha256 = sha256_text(cleaned_text)
             if not self._render_is_reusable(manifest, clean_sha256, paths):
                 manifest["stage"] = "rendering"
@@ -1108,6 +1388,21 @@ class PipelineRunner:
                     paths["events"], "render_completed", artifact_path=str(rendered)
                 )
 
+            self._check_cancelled("between render and verification")
+            stt_record = manifest.get("stt", {})
+            stt_metadata = stt_record.get("metadata", {})
+            if not isinstance(stt_metadata, dict):
+                stt_metadata = {}
+            audio_duration_seconds = finite_seconds(
+                stt_metadata.get("audio_duration_seconds"), positive=True
+            )
+            if audio_duration_seconds is None:
+                audio_duration_seconds = probe_audio_duration_seconds(source)
+                if audio_duration_seconds is not None:
+                    stt_metadata = dict(stt_metadata)
+                    stt_metadata["audio_duration_seconds"] = audio_duration_seconds
+                    manifest["stt"]["metadata"] = stt_metadata
+
             qa = validate_artifacts(
                 raw_text,
                 cleaned_text,
@@ -1115,6 +1410,7 @@ class PipelineRunner:
                 cleanup_needs_review,
                 requested_stt_model=manifest.get("stt", {}).get("requested_model"),
                 actual_stt_model=manifest.get("stt", {}).get("actual_model"),
+                audio_duration_seconds=audio_duration_seconds,
             )
             atomic_write_json(paths["qa"], qa)
             manifest["qa"] = qa
@@ -1122,6 +1418,59 @@ class PipelineRunner:
             manifest["status"] = (
                 "needs_review" if qa["status"] == "needs_review" else "verified"
             )
+            self._check_cancelled("publication metadata")
+            from publication_metadata import infer_publication_metadata
+
+            publication = infer_publication_metadata(
+                source,
+                relative,
+            )
+            publication_record = {
+                "schema_version": 1,
+                "pipeline_version": PIPELINE_VERSION,
+                "generated_at": utc_now(),
+                "document_state": manifest["status"],
+                # Database/vector publication remains an explicit later action.
+                "search_ingestion_state": "not_published",
+                "metadata_precedence": "embedded-tags > relative-path > filename",
+                "metadata": {
+                    **publication.to_dict(),
+                    "speaker": publication.artist,
+                    "recorder_code": publication.source_type,
+                    "nature": publication.genre or "Lecture",
+                },
+                "source": {
+                    "path": str(source),
+                    "relative_path": relative.as_posix(),
+                    "sha256": manifest.get("source", {}).get("sha256"),
+                },
+                "content": {
+                    "sha256": clean_sha256,
+                    "words": len(cleaned_text.split()),
+                },
+                "models": {
+                    "speech_to_text": manifest.get("stt", {}).get("actual_model"),
+                    "cleanup": cleanup_metadata.get("model"),
+                    "cleanup_profile": cleanup_metadata.get("profile"),
+                },
+                "glossary": {
+                    "sha256": cleanup_metadata.get("glossary_sha256"),
+                    "editable_terms": cleanup_metadata.get("glossary_count", 0),
+                    "terms_considered_min": cleanup_metadata.get(
+                        "grounding_glossary_terms_min"
+                    ),
+                    "terms_considered_max": cleanup_metadata.get(
+                        "grounding_glossary_terms_max"
+                    ),
+                },
+                "document": {
+                    "path": manifest.get("artifacts", {}).get("docx"),
+                    "sha256": manifest.get("render", {}).get("output_sha256"),
+                },
+            }
+            atomic_write_json(paths["publication"], publication_record)
+            manifest["publication"] = publication_record
+            manifest["artifacts"]["publication"] = str(paths["publication"])
             manifest["stage"] = manifest["status"]
             self._save_manifest(source, relative, paths, manifest)
             append_event(paths["events"], "job_finished", status=manifest["status"])
@@ -1133,7 +1482,21 @@ class PipelineRunner:
             self._save_manifest(source, relative, paths, manifest)
             append_event(paths["events"], "job_cancelled")
             raise
+        except PipelineCancelledError as exc:
+            manifest["status"] = "cancelled"
+            manifest["stage"] = "cancelled"
+            manifest["error"] = f"{exc}; completed checkpoints preserved"
+            self._save_manifest(source, relative, paths, manifest)
+            append_event(paths["events"], "job_cancelled")
+            return "cancelled"
         except Exception as exc:
+            if self.cancel_check() or "stop requested" in str(exc).casefold():
+                manifest["status"] = "cancelled"
+                manifest["stage"] = "cancelled"
+                manifest["error"] = "cancelled by user; completed checkpoints preserved"
+                self._save_manifest(source, relative, paths, manifest)
+                append_event(paths["events"], "job_cancelled")
+                return "cancelled"
             manifest["status"] = "failed"
             manifest["stage"] = "failed"
             manifest["error"] = f"{type(exc).__name__}: {exc}"
@@ -1145,9 +1508,27 @@ class PipelineRunner:
             return "failed"
 
     def run(self) -> dict[str, int]:
-        files = discover_audio(self.config.input_path, self.config.output_root)
+        files = discover_audio(
+            self.config.input_path,
+            self.config.output_root,
+            recursive=self.config.recursive,
+            existing_docx_mode=self.config.existing_docx_mode,
+            replace_before_date=self.config.replace_before_date,
+        )
         if self.config.limit is not None:
             files = files[: max(0, self.config.limit)]
+        if self.config.publish_source_docx:
+            validate_source_docx_target_collisions(files, self.config.input_path)
+        self.selected_manifest_paths = tuple(
+            artifact_paths(
+                artifact_directory(
+                    source,
+                    self.config.input_path,
+                    self.config.output_root,
+                )
+            )["manifest"]
+            for source in files
+        )
         counts = {
             "discovered": len(files),
             "queued": 0,
@@ -1165,8 +1546,22 @@ class PipelineRunner:
             return counts
         if files and self.config.cleanup_enabled and not self.config.render_only:
             print("Validating protected cleanup access and pinning the glossary...")
-            self._get_cleanup_client().ensure_glossary()
+            try:
+                self._check_cancelled("cleanup glossary validation")
+                self._get_cleanup_client().ensure_glossary(
+                    cancel_check=self.cancel_check
+                )
+                self._check_cancelled("cleanup glossary validation")
+            except PipelineCancelledError:
+                counts["cancelled"] += 1
+                self._write_summary(counts)
+                print("Pipeline cancelled; completed checkpoints are preserved.")
+                return counts
         for index, source in enumerate(files, 1):
+            if self.cancel_check():
+                counts["cancelled"] += 1
+                print("Pipeline cancelled; completed checkpoints are preserved.")
+                break
             print(f"[{index:,}/{len(files):,}] {source}")
             try:
                 status = self.process_one(source)
@@ -1176,19 +1571,42 @@ class PipelineRunner:
                 break
             counts[status] = counts.get(status, 0) + 1
             print(f"  -> {status}")
+            if status == "cancelled":
+                print("Pipeline cancelled; completed checkpoints are preserved.")
+                break
         self._write_summary(counts)
         return counts
 
-    def _write_summary(self, counts: dict[str, int]) -> None:
+    def _write_summary(
+        self,
+        counts: dict[str, int],
+        *,
+        publication: Optional[dict[str, Any]] = None,
+    ) -> None:
+        summary: dict[str, Any] = {
+            "pipeline_version": PIPELINE_VERSION,
+            "finished_at": utc_now(),
+            "input": str(self.config.input_path),
+            "output": str(self.config.output_root),
+            "existing_docx_mode": self.config.existing_docx_mode,
+            "replace_before_date": self.config.replace_before_date,
+            "counts": counts,
+        }
+        if publication is not None:
+            summary["source_docx_publication"] = {
+                key: publication.get(key)
+                for key in (
+                    "status",
+                    "planned",
+                    "blocking_conditions",
+                    "error",
+                    "run_id",
+                )
+                if publication.get(key) is not None
+            }
         atomic_write_json(
             self.config.output_root / "last-run-summary.json",
-            {
-                "pipeline_version": PIPELINE_VERSION,
-                "finished_at": utc_now(),
-                "input": str(self.config.input_path),
-                "output": str(self.config.output_root),
-                "counts": counts,
-            },
+            summary,
         )
         cursor = self.index.connection.execute(
             """
@@ -1225,6 +1643,157 @@ class PipelineRunner:
         except BaseException:
             temporary.unlink(missing_ok=True)
             raise
+
+
+def publish_source_docx_batch(
+    config: PipelineConfig,
+    counts: dict[str, int],
+    *,
+    manifest_paths: Optional[Iterable[Path]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
+    now: Optional[datetime] = None,
+) -> Optional[dict[str, Any]]:
+    """Publish one confirmed, rollback-safe batch beside the source recordings.
+
+    Publication is deliberately separate from ``PipelineRunner.run`` so library
+    callers retain a non-mutating default.  When requested, failed, cancelled,
+    review-required, and dry runs produce an audit report but never start a
+    replacement transaction.
+    """
+
+    if not config.publish_source_docx:
+        return None
+
+    input_path = Path(config.input_path).resolve()
+    generated_root = Path(config.output_root).resolve()
+    scope_root = source_publication_scope(input_path)
+    publication_time = now or datetime.now().astimezone()
+    timestamp = publication_time.strftime("%Y%m%d-%H%M%S")
+    run_id = publication_time.strftime("%Y%m%d-%H%M%S-%f")
+    backup_root = scope_root.parent / (
+        f"{input_path.name} - Legacy DOCX Backup - {timestamp}"
+    )
+    report_path = generated_root / SOURCE_DOCX_PUBLICATION_REPORT
+    immutable_report_path = (
+        generated_root / f"source-docx-publication-{run_id}.json"
+    )
+    report: dict[str, Any] = {
+        "report_version": 1,
+        "run_id": run_id,
+        "pipeline_version": PIPELINE_VERSION,
+        "started_at": utc_now(),
+        "input": str(input_path),
+        "scope_root": str(scope_root),
+        "generated_root": str(generated_root),
+        "backup_root": str(backup_root),
+        "counts": dict(counts),
+    }
+
+    def write_final_report() -> None:
+        atomic_write_json(immutable_report_path, report)
+        atomic_write_json(report_path, report)
+
+    blockers = [
+        name
+        for name in ("failed", "cancelled", "needs_review")
+        if counts.get(name, 0)
+    ]
+    if counts.get("queued", 0):
+        blockers.append("queued")
+    if config.dry_run:
+        blockers.append("dry_run")
+    if not config.cleanup_enabled:
+        blockers.append("cleanup_disabled")
+    if config.limit is not None:
+        blockers.append("limited_run")
+    if not counts.get("discovered", 0):
+        blockers.append("no_recordings")
+    completed = counts.get("verified", 0) + counts.get("skipped", 0)
+    if completed != counts.get("discovered", 0):
+        blockers.append("incomplete_run")
+    if blockers:
+        report.update(
+            {
+                "status": "suppressed",
+                "blocking_conditions": blockers,
+                "planned": 0,
+                "published": [],
+                "finished_at": utc_now(),
+            }
+        )
+        write_final_report()
+        return report
+
+    try:
+        from legacy_docx_replace import (
+            apply_legacy_docx_replacements,
+            plan_legacy_docx_replacements,
+        )
+
+        raise_if_cancelled(cancel_check, phase="source publication planning")
+        if manifest_paths is None:
+            plan = plan_legacy_docx_replacements(generated_root, scope_root)
+        else:
+            plan = plan_legacy_docx_replacements(
+                generated_root,
+                scope_root,
+                manifest_paths=manifest_paths,
+            )
+        operations = {"create": 0, "replace": 0}
+        for item in plan.items:
+            operations[item.operation] = operations.get(item.operation, 0) + 1
+        report.update(
+            {
+                "status": "planned",
+                "plan_sha256": plan.plan_sha256,
+                "planned": len(plan.items),
+                "operations": operations,
+                "plan": plan.to_dict(),
+                "published": [],
+            }
+        )
+        atomic_write_json(report_path, report)
+        raise_if_cancelled(cancel_check, phase="source publication commit")
+        published = apply_legacy_docx_replacements(
+            plan,
+            expected_scope_root=scope_root,
+            backup_root=backup_root,
+            confirm=True,
+            expected_count=len(plan.items),
+        )
+        report.update(
+            {
+                "status": "published",
+                "published": [str(path) for path in published],
+                "finished_at": utc_now(),
+            }
+        )
+        write_final_report()
+        return report
+    except PipelineCancelledError as exc:
+        report.setdefault("planned", 0)
+        report.update(
+            {
+                "status": "suppressed",
+                "blocking_conditions": ["cancel_requested"],
+                "error": str(exc),
+                "published": [],
+                "finished_at": utc_now(),
+            }
+        )
+        write_final_report()
+        raise
+    except Exception as exc:
+        report.update(
+            {
+                "status": "failed",
+                "error": f"{type(exc).__name__}: {exc}",
+                "published": [],
+                "finished_at": utc_now(),
+            }
+        )
+        write_final_report()
+        raise
 
 
 def default_output_root(input_path: Path) -> Path:
@@ -1276,8 +1845,121 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--force", action="store_true", help="Re-run all requested stages")
     parser.add_argument("--dry-run", action="store_true", help="Discover and count without processing")
+    parser.add_argument(
+        "--no-recursive",
+        action="store_true",
+        help="Only process recordings directly inside the selected folder",
+    )
+    parser.add_argument(
+        "--existing-docx-mode",
+        choices=sorted(EXISTING_DOCX_MODES),
+        default="all",
+        help=(
+            "Select recordings by the source-adjacent Word transcript: "
+            "skip existing, process all, or replace only documents before a date"
+        ),
+    )
+    parser.add_argument(
+        "--replace-before-date",
+        help="Cutoff for --existing-docx-mode before, in YYYY-MM-DD form",
+    )
+    parser.add_argument(
+        "--publish-source-docx",
+        action="store_true",
+        help=(
+            "After a completely verified run, atomically create or replace DOCX "
+            "files beside the source recordings with retained backups"
+        ),
+    )
     parser.add_argument("--limit", type=int, help="Process only the first N files (for a trial run)")
     return parser.parse_args(argv)
+
+
+def execute_pipeline(
+    config: PipelineConfig,
+    *,
+    cancel_check: Optional[Callable[[], bool]] = None,
+) -> int:
+    """Execute a configured run for both the CLI and desktop GUI."""
+
+    try:
+        runner = PipelineRunner(config, cancel_check=cancel_check)
+    except Exception as exc:
+        print(
+            f"Pipeline preflight failed: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        try:
+            counts = runner.run()
+        except Exception as exc:
+            print(
+                f"Pipeline preflight failed: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+        if config.publish_source_docx:
+            if cancel_check is not None and cancel_check():
+                counts["cancelled"] = max(1, counts.get("cancelled", 0))
+            try:
+                publication = publish_source_docx_batch(
+                    config,
+                    counts,
+                    manifest_paths=getattr(runner, "selected_manifest_paths", None),
+                    cancel_check=cancel_check,
+                )
+            except PipelineCancelledError:
+                counts["cancelled"] = max(1, counts.get("cancelled", 0))
+                counts["publication_suppressed"] = 1
+                runner._write_summary(
+                    counts,
+                    publication={
+                        "status": "suppressed",
+                        "blocking_conditions": ["cancel_requested"],
+                        "error": "source DOCX publication cancelled before commit",
+                    },
+                )
+                print(
+                    "Source DOCX publication cancelled before commit; no source "
+                    "DOCX file was changed."
+                )
+                return 1
+            except Exception as exc:
+                counts["publication_failed"] = 1
+                runner._write_summary(
+                    counts,
+                    publication={
+                        "status": "failed",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                )
+                print(
+                    f"Source DOCX publication failed: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+                return 1
+            if publication and publication.get("status") == "published":
+                counts["publication_published"] = int(
+                    publication.get("planned", 0) or 0
+                )
+                print(
+                    f"Published {publication.get('planned', 0):,} source-adjacent "
+                    "DOCX file(s)."
+                )
+            elif publication:
+                counts["publication_suppressed"] = 1
+                blockers = ", ".join(publication.get("blocking_conditions", ()))
+                print(f"Source DOCX publication suppressed: {blockers}")
+            runner._write_summary(counts, publication=publication)
+    finally:
+        runner.close()
+    print(stable_json(counts))
+    if counts.get("failed") or counts.get("cancelled"):
+        return 1
+    if counts.get("needs_review"):
+        return 3
+    return 0
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -1308,26 +1990,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         render_only=args.render_only,
         retry_review=args.retry_review,
         dry_run=args.dry_run,
+        publish_source_docx=args.publish_source_docx,
+        recursive=not args.no_recursive,
+        existing_docx_mode=args.existing_docx_mode,
+        replace_before_date=args.replace_before_date,
         limit=args.limit,
     )
-    runner = PipelineRunner(config)
-    try:
-        try:
-            counts = runner.run()
-        except Exception as exc:
-            print(
-                f"Pipeline preflight failed: {type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
-            return 1
-    finally:
-        runner.close()
-    print(stable_json(counts))
-    if counts.get("failed") or counts.get("cancelled"):
-        return 1
-    if counts.get("needs_review"):
-        return 3
-    return 0
+    return execute_pipeline(config)
 
 
 if __name__ == "__main__":

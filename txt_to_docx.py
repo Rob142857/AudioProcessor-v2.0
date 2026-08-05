@@ -10,12 +10,131 @@ from docx import Document  # type: ignore
 from docx.enum.text import WD_ALIGN_PARAGRAPH  # type: ignore
 from docx.shared import RGBColor  # type: ignore
 
+from console_compat import configure_safe_stdio
+from publication_metadata import (
+    PublicationMetadata,
+    format_publication_date,
+    infer_publication_metadata,
+)
+
+
+configure_safe_stdio()
+
 try:
     from australian_spelling import normalize_text
     AUSTRALIAN_SPELLING_AVAILABLE = True
 except ImportError:
     AUSTRALIAN_SPELLING_AVAILABLE = False
     def normalize_text(text, **kwargs): return text
+
+
+EMU_PER_INCH = 914_400
+EMU_PER_POINT = 12_700
+TITLE_COLOUR = RGBColor(32, 55, 72)       # #203748
+MUTED_COLOUR = RGBColor(96, 105, 112)     # restrained publication metadata
+BODY_COLOUR = RGBColor(28, 31, 34)
+
+
+def _set_font(run, *, size: float, color=None, bold=None, italic=None) -> None:
+    run.font.name = "Calibri"
+    run.font.size = int(size * EMU_PER_POINT)
+    if color is not None:
+        run.font.color.rgb = color
+    if bold is not None:
+        run.bold = bold
+    if italic is not None:
+        run.font.italic = italic
+
+
+def _set_paragraph_rhythm(
+    paragraph,
+    *,
+    before: float = 0,
+    after: float = 8,
+    line_spacing: float = 1.333,
+) -> None:
+    paragraph.paragraph_format.space_before = int(before * EMU_PER_POINT)
+    paragraph.paragraph_format.space_after = int(after * EMU_PER_POINT)
+    paragraph.paragraph_format.line_spacing = line_spacing
+
+
+def _configure_publication_document(doc: Document) -> None:
+    """Apply the narrative_proposal preset and compact editorial override."""
+
+    for section in getattr(doc, "sections", ()):
+        section.page_width = int(8.5 * EMU_PER_INCH)
+        section.page_height = int(11 * EMU_PER_INCH)
+        section.top_margin = EMU_PER_INCH
+        section.right_margin = EMU_PER_INCH
+        section.bottom_margin = EMU_PER_INCH
+        section.left_margin = EMU_PER_INCH
+        section.header_distance = int(0.492 * EMU_PER_INCH)
+        section.footer_distance = int(0.492 * EMU_PER_INCH)
+
+    styles = getattr(doc, "styles", None)
+    if styles is None:
+        return
+    normal = styles["Normal"]
+    normal.font.name = "Calibri"
+    normal.font.size = 11 * EMU_PER_POINT
+    normal.font.color.rgb = BODY_COLOUR
+    normal.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+    normal.paragraph_format.space_before = 0
+    normal.paragraph_format.space_after = 8 * EMU_PER_POINT
+    normal.paragraph_format.line_spacing = 1.333
+
+    heading_tokens = {
+        "Heading 1": (16, RGBColor(46, 116, 181), 18, 10),
+        "Heading 2": (13, RGBColor(46, 116, 181), 12, 6),
+        "Heading 3": (12, RGBColor(31, 77, 120), 8, 4),
+    }
+    for name, (size, colour, before, after) in heading_tokens.items():
+        style = styles[name]
+        style.font.name = "Calibri"
+        style.font.size = size * EMU_PER_POINT
+        style.font.color.rgb = colour
+        style.paragraph_format.space_before = before * EMU_PER_POINT
+        style.paragraph_format.space_after = after * EMU_PER_POINT
+
+
+_WORKFLOW_LINE_RE = re.compile(
+    r"^(?:"
+    r"(?:cleaned\s+up\s+at|processed\s+at|generated\s+at)(?:\s*:|\s+)|"
+    r"processed\s+by\s+speech[- ]to[- ]text\s+from\s+a\s+digitised\s+tape\s+recording\s+"
+    r"originally\s+(?:taken\s+from|recorded\s+in\s+person\s+by)\b|"
+    r"(?:model|device|processing\s+time|audio\s+preprocessing|"
+    r"pipeline(?:\s+version)?|cleanup\s+model|transcription\s+information)\s*:"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def strip_workflow_metadata(body: str) -> str:
+    """Remove old trailing processing/provenance notes without editing lecture prose."""
+
+    lines = body.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    marker_index = None
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.casefold() == "transcription information":
+            marker_index = index
+    if marker_index is not None and marker_index >= max(0, len(lines) - 20):
+        lines = lines[:marker_index]
+
+    while lines:
+        stripped = lines[-1].strip()
+        if not stripped:
+            lines.pop()
+            continue
+        if (
+            _WORKFLOW_LINE_RE.match(stripped)
+            or stripped.casefold() == "(this information can be deleted if not needed)"
+            or re.fullmatch(r"[_=-]{8,}", stripped)
+        ):
+            lines.pop()
+            continue
+        break
+    return "\n".join(lines).strip()
 
 
 def _save_docx_atomically(doc: Document, out_path: Path) -> Path:
@@ -180,7 +299,12 @@ def load_body_text(txt_path: Path) -> str:
 
 
 def add_paragraphs_from_text(doc: Document, body: str) -> None:
-    """Add justified paragraphs to a Document, preserving blank-line paragraph breaks."""
+    """Add justified paragraphs, preserving only editorial blank-line breaks.
+
+    Paragraph boundaries are decided by the cleanup editor from changes in
+    meaning and rhetorical function.  The renderer must not manufacture
+    regular-length paragraphs merely to make the page look balanced.
+    """
     # Split on blank lines (one or more empty/whitespace-only lines)
     blocks = re.split(r"\n\s*\n", body)
     for block in blocks:
@@ -189,6 +313,51 @@ def add_paragraphs_from_text(doc: Document, body: str) -> None:
             continue
         para = doc.add_paragraph(block)
         para.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+        _set_paragraph_rhythm(para)
+
+
+def _add_publication_opening(doc: Document, publication: PublicationMetadata) -> None:
+    """Compact editorial_cover override: polished opening, body still on page one."""
+
+    title_paragraph = doc.add_paragraph()
+    title_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _set_paragraph_rhythm(title_paragraph, after=6, line_spacing=1.0)
+    title_paragraph.paragraph_format.keep_with_next = True
+    title_run = title_paragraph.add_run(publication.title)
+    _set_font(title_run, size=30, color=TITLE_COLOUR, bold=False)
+
+    metadata_values = [publication.artist]
+    if publication.lecture_date:
+        metadata_values.append(format_publication_date(publication.lecture_date))
+    if publication.source_type:
+        metadata_values.append(publication.source_type)
+    metadata_paragraph = doc.add_paragraph()
+    metadata_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _set_paragraph_rhythm(metadata_paragraph, after=14, line_spacing=1.0)
+    metadata_paragraph.paragraph_format.keep_with_next = True
+    metadata_run = metadata_paragraph.add_run(" | ".join(metadata_values))
+    _set_font(metadata_run, size=10, color=MUTED_COLOUR)
+
+
+def _add_provenance_postscript(doc: Document, publication: PublicationMetadata) -> None:
+    paragraph = doc.add_paragraph()
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _set_paragraph_rhythm(paragraph, before=12, after=0, line_spacing=1.0)
+    run = paragraph.add_run(publication.postscript)
+    _set_font(run, size=9, color=MUTED_COLOUR, italic=True)
+
+
+def _set_core_properties(doc: Document, publication: PublicationMetadata) -> None:
+    properties = getattr(doc, "core_properties", None)
+    if properties is None:
+        return
+    properties.title = publication.title
+    properties.author = publication.artist
+    properties.subject = (
+        f"{publication.source_type} lecture transcript"
+        if publication.source_type
+        else "Lecture transcript"
+    )
 
 
 def convert_txt_to_docx(txt_path: Path, year: Optional[int] = None) -> Path:
@@ -208,45 +377,15 @@ def convert_txt_to_docx(txt_path: Path, year: Optional[int] = None) -> Path:
         else:
             year = infer_year_from_ancestors(txt_path.parent)
 
-    # Infer date from filename MMDD
-    d = infer_date_from_filename(txt_path.name, year)
-    if d:
-        weekday = d.strftime("%A")
-        month_name = d.strftime("%B")
-        date_line = f"{weekday}, {d.day} {month_name} {d.year}"
-    else:
-        # Use YEAR- prefix when date cannot be determined
-        title_base = make_title_from_filename(txt_path.name)
-        date_line = f"YEAR-{title_base}"
-
-    # Build title and body
-    title = make_title_from_filename(txt_path.name)
     body = load_body_text(txt_path)
-
-    # Create DOCX
-    doc = Document()
-
-    # Title
-    heading = doc.add_heading(title, level=0)
-    heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-    # Date line
-    p_date = doc.add_paragraph(date_line)
-    p_date.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-    # Author line
-    p_author = doc.add_paragraph("by Dr Philip Groves")
-    p_author.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-    # Blank line before body
-    doc.add_paragraph("")
-
-    # Body paragraphs
-    add_paragraphs_from_text(doc, body)
-
-    # Output path: same folder, .docx extension
-    out_path = txt_path.with_suffix(".docx")
-    return _save_docx_atomically(doc, out_path)
+    source_path = get_source_path_from_header(txt_path) or txt_path
+    return convert_txt_to_docx_from_text(
+        body,
+        source_path,
+        year=year,
+        use_australian_spelling=False,
+        output_path=txt_path.with_suffix(".docx"),
+    )
 
 
 def convert_txt_to_docx_from_text(
@@ -257,6 +396,8 @@ def convert_txt_to_docx_from_text(
     use_australian_spelling: bool = True,
     *,
     output_path: Optional[Path] = None,
+    relative_source_path: Optional[Path] = None,
+    publication_metadata: Optional[PublicationMetadata] = None,
 ) -> Path:
     """Convert transcript text directly to an atomically written DOCX.
     
@@ -264,9 +405,11 @@ def convert_txt_to_docx_from_text(
         body_text: The formatted transcript text to include in the document
         source_audio_path: Path to the original audio/video file, used for title/date inference
         year: Optional year override for date inference
-        metadata: Optional dict with transcription metadata (model, device, time_taken, preprocessing)
+        metadata: Deprecated workflow metadata, retained for call compatibility and not published
         use_australian_spelling: Whether to convert to Australian spelling (default: True)
         output_path: Optional explicit DOCX destination (defaults to next to the source)
+        relative_source_path: Optional archive-relative path used for metadata inference
+        publication_metadata: Optional explicit publication fields, bypassing inference
     
     Returns:
         Path to the created DOCX file
@@ -285,93 +428,22 @@ def convert_txt_to_docx_from_text(
         norm_word_count = len(body_text.split())
         print(f"📊 After normalization: {norm_char_count} characters, {norm_word_count} words")
     
-    # Infer year from the directory structure if not provided explicitly.
-    if year is None:
-        year = infer_year_from_ancestors(source_audio_path.parent)
+    # The renderer intentionally ignores model/device/timing metadata.  Those
+    # details remain in the pipeline manifest, not in the publication artifact.
+    _ = metadata
+    body_text = strip_workflow_metadata(body_text)
+    publication = publication_metadata or infer_publication_metadata(
+        source_audio_path,
+        relative_source_path,
+        year=year,
+    )
 
-    # Infer date from filename MMDD (using source audio filename)
-    d = infer_date_from_filename(source_audio_path.name, year)
-    
-    # Extract lecture number from filename
-    lecture_num = extract_lecture_number(source_audio_path.name)
-    
-    # Build title from source audio filename
-    title = make_title_from_filename(source_audio_path.name)
-    
-    # Build standardized subtitle with lecture number and date
-    if d and lecture_num:
-        # Full format: "Lecture XX given on DDth of Month YYYY by Dr Philip W Groves"
-        day_suffix = "th"
-        if d.day in [1, 21, 31]: day_suffix = "st"
-        elif d.day in [2, 22]: day_suffix = "nd"
-        elif d.day in [3, 23]: day_suffix = "rd"
-        subtitle = f"Lecture {lecture_num} given on {d.day}{day_suffix} of {d.strftime('%B')} {d.year} by Dr Philip W Groves"
-    elif d:
-        # Date only format
-        weekday = d.strftime("%A")
-        month_name = d.strftime("%B")
-        subtitle = f"{weekday}, {d.day} {month_name} {d.year}\nby Dr Philip W Groves"
-    elif lecture_num:
-        # Lecture number only
-        subtitle = f"Lecture {lecture_num} by Dr Philip W Groves"
-    else:
-        # Fallback: use YEAR- prefix or just author
-        subtitle = "by Dr Philip W Groves"
-
-    # Create DOCX
     doc = Document()
-
-    # Title
-    heading = doc.add_heading(title, level=0)
-    heading.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-    # Subtitle with lecture info
-    p_subtitle = doc.add_paragraph(subtitle)
-    p_subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    
-    # Add "Transcript:" line
-    p_transcript = doc.add_paragraph("Transcript:")
-    p_transcript.alignment = WD_ALIGN_PARAGRAPH.CENTER
-
-    # Blank line before body
-    doc.add_paragraph("")
-
-    # Body paragraphs
+    _configure_publication_document(doc)
+    _set_core_properties(doc, publication)
+    _add_publication_opening(doc, publication)
     add_paragraphs_from_text(doc, body_text)
-    
-    # Add metadata footer if provided
-    if metadata:
-        # Add spacing before metadata
-        doc.add_paragraph("")
-        doc.add_paragraph("")
-        
-        # Add horizontal line separator
-        separator = doc.add_paragraph("_" * 80)
-        separator.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        
-        # Add metadata section
-        meta_header = doc.add_paragraph("Transcription Information")
-        meta_header.runs[0].bold = True
-        meta_header.runs[0].font.size = 10 * 12700  # 10pt in EMUs
-        
-        # Add metadata details
-        details = [
-            f"Model: {metadata.get('model', 'Unknown')}",
-            f"Device: {metadata.get('device', 'Unknown')}",
-            f"Processing Time: {metadata.get('time_taken', 'Unknown')}",
-            f"Audio Preprocessing: {metadata.get('preprocessing', 'None')}"
-        ]
-        
-        for detail in details:
-            p = doc.add_paragraph(detail)
-            p.runs[0].font.size = 9 * 12700  # 9pt
-            p.runs[0].font.italic = True
-        
-        # Add note about removal
-        note = doc.add_paragraph("(This information can be deleted if not needed)")
-        note.runs[0].font.size = 8 * 12700  # 8pt
-        note.runs[0].font.italic = True
-        note.runs[0].font.color.rgb = RGBColor(128, 128, 128)  # Gray color
+    _add_provenance_postscript(doc, publication)
 
     # Explicit output destinations let callers preserve a source-relative tree in
     # a separate output root. The default remains next to the source audio.

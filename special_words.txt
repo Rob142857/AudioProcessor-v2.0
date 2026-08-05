@@ -1,0 +1,55 @@
+# Compact Whisper vocabulary bias for Dr Philip Groves recordings.
+#
+# Whisper's initial-prompt window is small, so this is deliberately a high-value
+# shortlist. The complete editable + built-in glossary is considered later by
+# the protected GLM cleanup stage and is recorded in each job manifest.
+
+Dr Philip Groves
+Gurdjieff
+Ouspensky
+Maurice Nicoll
+Rodney Collin
+J. G. Bennett
+Fourth Way
+The Work
+self-remembering
+self-observation
+conscious shock
+voluntary suffering
+intentional suffering
+higher centres
+higher emotional centre
+higher intellectual centre
+moving centre
+instinctive centre
+emotional centre
+intellectual centre
+sex centre
+hydrogens
+octaves
+mi-fa interval
+si-do interval
+Law of Three
+Law of Seven
+Ray of Creation
+Lateral Octave
+the Absolute
+essence
+personality
+false personality
+buffers
+identification
+negative emotions
+Enneagram
+Hasnamuss
+Kundabuffer
+Beelzebub
+Ashiata Shiemash
+Swedenborg
+Rumi
+Sufism
+Tibetan Book of the Dead
+Bardo Thodol
+esotericism
+numinosity
+visualisation

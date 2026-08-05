@@ -17,7 +17,8 @@ import subprocess
 import sys
 import threading
 import warnings
-from typing import List, Optional
+from pathlib import Path
+from typing import Callable, List, Optional
 
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -96,13 +97,75 @@ def _save_settings(data: dict) -> bool:
 
 
 def _load_project(folder: str) -> dict:
-    return _load_settings().get("projects", {}).get(folder, {})
+    settings = _load_settings()
+    projects = settings.get("projects", {})
+    if not isinstance(projects, dict):
+        return {}
+    key = _project_key(folder)
+    direct = projects.get(key)
+    if isinstance(direct, dict):
+        return dict(direct)
+    # Read older settings whose keys used a different slash or case style.
+    for saved_path, value in projects.items():
+        if (
+            isinstance(saved_path, str)
+            and isinstance(value, dict)
+            and _project_key(saved_path) == key
+        ):
+            return dict(value)
+    return {}
 
 
 def _save_project(folder: str, proj: dict) -> None:
     all_s = _load_settings()
-    all_s.setdefault("projects", {})[folder] = proj
+    projects = all_s.get("projects")
+    if not isinstance(projects, dict):
+        projects = {}
+        all_s["projects"] = projects
+    key = _project_key(folder)
+    merged: dict = {}
+    for saved_path in list(projects):
+        value = projects.get(saved_path)
+        if isinstance(saved_path, str) and _project_key(saved_path) == key:
+            if isinstance(value, dict):
+                merged.update(value)
+            if saved_path != key:
+                del projects[saved_path]
+    merged.update(proj)
+    projects[key] = merged
     _save_settings(all_s)
+
+
+def _project_folder(path: str) -> str:
+    absolute = os.path.abspath(os.path.normpath(os.path.expanduser(path)))
+    return os.path.dirname(absolute) if os.path.isfile(absolute) else absolute
+
+
+def _project_key(path: str) -> str:
+    """Return one stable settings key for equivalent Windows path spellings."""
+
+    return os.path.normcase(_project_folder(path))
+
+
+def _validate_replace_policy(mode: str, cutoff_date: str) -> Optional[str]:
+    """Validate replacement selection and return its normalized cutoff."""
+
+    if mode not in {"skip", "all", "before"}:
+        raise ValueError("Existing-output selection is invalid.")
+    if mode != "before":
+        return None
+    value = str(cutoff_date or "").strip()
+    try:
+        parsed = datetime.datetime.strptime(value, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError(
+            "Replace-transcripts-before requires a valid date in YYYY-MM-DD format."
+        ) from exc
+    if parsed.strftime("%Y-%m-%d") != value:
+        raise ValueError(
+            "Replace-transcripts-before requires a valid date in YYYY-MM-DD format."
+        )
+    return value
 
 
 def _default_terms_file() -> Optional[str]:
@@ -160,21 +223,102 @@ def _run_batch(paths: List[str], q: queue.Queue,
     q.put(f"\nBatch complete -- {ok} succeeded, {fail} failed.\n")
 
 
+def _run_polished_pipeline(input_path: str, settings: dict, q: queue.Queue) -> int:
+    """Run the resumable Whisper -> GLM -> Word path used by the GUI."""
+
+    from archive_pipeline import PipelineConfig, default_output_root, execute_pipeline
+
+    source = Path(input_path).expanduser().resolve()
+    if source.is_file():
+        # Source publication treats the file's parent as its protected scope,
+        # so every file canary receives a dedicated output outside that scope.
+        extension = source.suffix.lower().lstrip(".") or "audio"
+        output_root = (
+            source.parent.parent
+            / f"{source.parent.name} - Polished Single Files"
+            / f"{source.stem}__{extension}"
+        )
+    else:
+        output_root = default_output_root(source)
+    cutoff = _validate_replace_policy(
+        str(settings.get("replace_mode", "skip")),
+        str(settings.get("replace_before_date", "")),
+    )
+    config = PipelineConfig(
+        input_path=source,
+        output_root=output_root,
+        stt_model=str(settings.get("whisper_model", "faster-whisper-large-v3")),
+        force=bool(settings.get("force_reprocess", False)),
+        publish_source_docx=True,
+        recursive=bool(settings.get("recursive", True)),
+        existing_docx_mode=str(settings.get("replace_mode", "skip")),
+        replace_before_date=cutoff,
+    )
+    q.put(f"Polished artifacts: {output_root}\n")
+    q.put(
+        "Pipeline: local Faster-Whisper -> protected GLM-4.7-Flash "
+        "-> polished Word\n"
+    )
+    return int(execute_pipeline(config, cancel_check=STOP_FLAG.is_set))
+
+
+def _run_polished_preflight(q: queue.Queue) -> bool:
+    """Fail before opening audio when the pinned production lane is incomplete."""
+
+    from pipeline_doctor import run_checks
+
+    q.put("Checking local GPU, document, and protected-cleanup prerequisites...\n")
+    checks = run_checks(cleanup_required=True, mode="full", require_gpu=True)
+    symbols = {"ok": "OK", "warning": "WARN", "error": "ERROR"}
+    for check in checks:
+        q.put(f"[{symbols.get(check.status, check.status):5}] {check.name}: {check.detail}\n")
+    errors = [check for check in checks if check.status == "error"]
+    if errors:
+        q.put("Preflight failed; no audio or existing transcript was changed.\n")
+        return False
+    q.put("Preflight passed.\n\n")
+    return True
+
+
+def _handle_window_close(
+    worker_state: dict,
+    *,
+    confirm_close: Callable[[], bool],
+    request_stop: Callable[[], None],
+    destroy: Callable[[], None],
+) -> str:
+    """Close immediately when idle, otherwise keep Tk alive for safe shutdown."""
+
+    if not worker_state.get("active"):
+        destroy()
+        return "closed"
+    if worker_state.get("close_pending"):
+        return "waiting"
+    if not confirm_close():
+        return "running"
+    # A Tk message box runs its own event loop.  The worker may have completed
+    # while the confirmation was open, in which case it is now safe to close.
+    if not worker_state.get("active"):
+        destroy()
+        return "closed"
+    worker_state["close_pending"] = True
+    request_stop()
+    return "stopping"
+
+
 # ── Output-skip logic ────────────────────────────────────────────────
 def _should_process(src: str, mode: str, cutoff_date: str) -> bool:
     """Return True if this file should be (re-)transcribed."""
+    normalized_cutoff = _validate_replace_policy(mode, cutoff_date)
     docx = os.path.splitext(src)[0] + ".docx"
     if not os.path.isfile(docx):
         return True  # no existing output
     if mode == "all":
         return True
     if mode == "before":
-        try:
-            cutoff = datetime.datetime.strptime(cutoff_date, "%Y-%m-%d")
-            mtime = datetime.datetime.fromtimestamp(os.path.getmtime(docx))
-            return mtime < cutoff
-        except Exception:
-            return True
+        cutoff = datetime.datetime.strptime(str(normalized_cutoff), "%Y-%m-%d")
+        mtime = datetime.datetime.fromtimestamp(os.path.getmtime(docx))
+        return mtime < cutoff
     # mode == "skip"
     return False
 
@@ -243,16 +387,26 @@ def launch_gui():
 
     # ── Load last-used project settings ──────────────────────────────
     last_settings = _load_settings()
-    last_folder = last_settings.get("last_folder", REPO_ROOT)
-    proj = _load_project(last_folder)
+    last_input = str(
+        last_settings.get("last_input")
+        or last_settings.get("last_folder")
+        or REPO_ROOT
+    )
+    if not os.path.exists(last_input):
+        last_input = REPO_ROOT
+    proj = _load_project(last_input)
 
-    def on_folder_selected(folder):
+    def on_source_selected(source):
         nonlocal proj
-        proj = _load_project(folder)
+        proj = _load_project(source)
         settings_panel.apply(proj)
 
     # ── Input panel ──────────────────────────────────────────────────
-    input_panel = InputPanel(outer, on_folder_selected=on_folder_selected)
+    input_panel = InputPanel(
+        outer,
+        on_source_selected=on_source_selected,
+        initial_path=last_input,
+    )
     input_panel.grid(row=1, column=0, sticky="ew", pady=(0, 10))
 
     # ── Settings panel ───────────────────────────────────────────────
@@ -264,6 +418,17 @@ def launch_gui():
     btn_bar.grid(row=3, column=0, sticky="w", pady=(0, 10))
 
     q: queue.Queue = queue.Queue()
+    worker_state = {"active": False, "close_pending": False}
+
+    def finish_worker():
+        worker_state["active"] = False
+        run_btn.configure(state="normal")
+        stop_btn.configure(state="disabled")
+        clear_btn.configure(state="normal")
+        download_btn.configure(state="normal")
+        access_btn.configure(state="normal")
+        if worker_state["close_pending"]:
+            root.destroy()
 
     def start():
         inp = input_panel.get_path()
@@ -271,10 +436,26 @@ def launch_gui():
             messagebox.showerror("No input",
                                  "Select a valid file or folder first.")
             return
+        snap = settings_panel.snapshot()
+        try:
+            normalized_cutoff = _validate_replace_policy(
+                str(snap.get("replace_mode", "skip")),
+                str(snap.get("replace_before_date", "")),
+            )
+        except ValueError as exc:
+            messagebox.showerror("Invalid replacement date", str(exc))
+            return
+        if normalized_cutoff is not None:
+            snap["replace_before_date"] = normalized_cutoff
+
         log.clear()
         log.append("Starting...\n")
         run_btn.configure(state="disabled")
         stop_btn.configure(state="normal")
+        clear_btn.configure(state="disabled")
+        download_btn.configure(state="disabled")
+        access_btn.configure(state="disabled")
+        worker_state["active"] = True
         STOP_FLAG.clear()
         # Also reset the engine's internal stop event
         try:
@@ -283,13 +464,12 @@ def launch_gui():
         except Exception:
             pass
 
-        snap = settings_panel.snapshot()
-
         # Persist project settings
-        folder = os.path.dirname(inp) if os.path.isfile(inp) else inp
+        folder = _project_folder(inp)
         _save_project(folder, snap)
         s = _load_settings()
         s["last_folder"] = folder
+        s["last_input"] = os.path.abspath(os.path.normpath(inp))
         _save_settings(s)
 
         def worker():
@@ -313,7 +493,25 @@ def launch_gui():
                 if terms:
                     os.environ["TRANSCRIBE_AWKWARD_FILE"] = terms
 
-                if os.path.isdir(inp):
+                if snap.get("polished_pipeline", 1):
+                    if not _run_polished_preflight(q):
+                        return
+                    exit_code = _run_polished_pipeline(inp, snap, q)
+                    if STOP_FLAG.is_set():
+                        q.put("\nStopped safely. Completed checkpoints were preserved.\n")
+                    elif exit_code == 0:
+                        q.put("\nPolished pipeline completed and verified.\n")
+                    elif exit_code == 3:
+                        q.put(
+                            "\nPipeline completed, but one or more documents need review; "
+                            "those source transcripts were not replaced.\n"
+                        )
+                    else:
+                        q.put(
+                            "\nPipeline stopped or failed. Run it again with the same "
+                            "folder to resume preserved checkpoints.\n"
+                        )
+                elif os.path.isdir(inp):
                     files = _collect_files(
                         inp,
                         recursive=bool(snap["recursive"]),
@@ -331,7 +529,8 @@ def launch_gui():
                         _run_single(inp, None, q)
                     else:
                         q.put("Output already exists (skipped).\n")
-                q.put("\nDone.\n")
+                if not snap.get("polished_pipeline", 1):
+                    q.put("\nDone.\n")
             except Exception as e:
                 # Clean message for user-initiated stops (no traceback)
                 if STOP_FLAG.is_set() or "Stop requested" in str(e):
@@ -341,8 +540,7 @@ def launch_gui():
                     q.put(f"Error: {e}\n{traceback.format_exc()}")
             finally:
                 sys.stdout, sys.stderr = old_out, old_err
-                root.after(0, lambda: run_btn.configure(state="normal"))
-                root.after(0, lambda: stop_btn.configure(state="disabled"))
+                root.after(0, finish_worker)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -355,7 +553,12 @@ def launch_gui():
         except Exception:
             pass
         stop_btn.configure(state="disabled")
-        log.append("\nStopping — forcing immediate halt...\n")
+        log.append(
+            "\nCancellation requested. The current operation or protected cleanup "
+            "chunk may take a little time to finish; completed checkpoints will "
+            "be preserved. A recording stopped during Whisper will restart from "
+            "its beginning on the next run.\n"
+        )
 
     def clear_cache():
         # Clear cached model objects (frees VRAM without requiring re-download)
@@ -381,20 +584,70 @@ def launch_gui():
             pass
         log.append("Model unloaded & GPU cache cleared.\n")
 
-    run_btn = _styled_btn(btn_bar, "  Start Transcription", start,
+    def configure_cleanup_access():
+        try:
+            subprocess.Popen(
+                [sys.executable, os.path.join(REPO_ROOT, "configure_cleanup_credentials_gui.py")],
+                cwd=REPO_ROOT,
+            )
+        except Exception as exc:
+            messagebox.showerror("Could not open cleanup access", str(exc))
+
+    run_btn = _styled_btn(btn_bar, "  Start Polished Pipeline", start,
                           font=FONT_LG, bg=ACCENT)
     run_btn.pack(side="left", padx=(0, 8))
     stop_btn = _styled_btn(btn_bar, "  Stop", stop, font=FONT_LG, bg=RED)
     stop_btn.pack(side="left", padx=(0, 8))
     stop_btn.configure(state="disabled")
-    _styled_btn(btn_bar, "Clear Cache", clear_cache,
-                font=FONT_LG, bg=AMBER).pack(side="left", padx=(0, 8))
-    _styled_btn(btn_bar, "Download Models", lambda: ModelPreloadDialog(root),
-                font=FONT_LG, bg="#6366f1").pack(side="left")
+    clear_btn = _styled_btn(btn_bar, "Clear Cache", clear_cache,
+                            font=FONT_LG, bg=AMBER)
+    clear_btn.pack(side="left", padx=(0, 8))
+    download_btn = _styled_btn(
+        btn_bar, "Download Models", lambda: ModelPreloadDialog(root),
+        font=FONT_LG, bg="#6366f1",
+    )
+    download_btn.pack(side="left", padx=(0, 8))
+    access_btn = _styled_btn(
+        btn_bar, "Cleanup Access", configure_cleanup_access,
+        font=FONT_LG, bg="#475569",
+    )
+    access_btn.pack(side="left")
+
+    def update_run_label(*_args):
+        run_btn.configure(
+            text=(
+                "  Start Polished Pipeline"
+                if settings_panel.pipeline_var.get()
+                else "  Start Local Transcription"
+            )
+        )
+
+    settings_panel.pipeline_var.trace_add("write", update_run_label)
+    update_run_label()
 
     # ── Log panel ────────────────────────────────────────────────────
     log = LogPanel(outer)
     log.grid(row=4, column=0, sticky="nsew", pady=(0, 0))
+
+    def on_window_close():
+        outcome = _handle_window_close(
+            worker_state,
+            confirm_close=lambda: messagebox.askyesno(
+                "Pipeline is still running",
+                "Request a safe stop and close after the current operation finishes?\n\n"
+                "The window must remain open until checkpointing or any active Word "
+                "publication transaction completes.",
+                parent=root,
+            ),
+            request_stop=stop,
+            destroy=root.destroy,
+        )
+        if outcome == "stopping":
+            log.append(
+                "The window will close automatically after the safe stop completes.\n"
+            )
+
+    root.protocol("WM_DELETE_WINDOW", on_window_close)
 
     # ── Queue poller ─────────────────────────────────────────────────
     def poll():

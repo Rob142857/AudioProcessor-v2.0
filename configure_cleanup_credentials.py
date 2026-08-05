@@ -11,9 +11,12 @@ from cleanup_client import (
     CREDENTIAL_CLIENT_ID_KEY,
     CREDENTIAL_CLIENT_SECRET_KEY,
     CREDENTIAL_SERVICE,
+    ACCESS_CLIENT_ID_HEADER,
+    ACCESS_CLIENT_SECRET_HEADER,
     CleanupClient,
     DEFAULT_ENDPOINT,
     DEFAULT_MODEL,
+    normalize_access_credential,
 )
 
 
@@ -49,11 +52,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("Saved Cloudflare Access credentials were removed.")
         return 0
 
-    client_id = input("Cloudflare Access client ID: ").strip()
-    client_secret = getpass("Cloudflare Access client secret: ").strip()
+    client_id = normalize_access_credential(
+        input("Cloudflare Access client ID: "), ACCESS_CLIENT_ID_HEADER
+    )
+    client_secret = normalize_access_credential(
+        getpass("Cloudflare Access client secret: "), ACCESS_CLIENT_SECRET_HEADER
+    )
     if not client_id or not client_secret:
         print("Both values are required; nothing was stored.")
         return 1
+
+    print("Secret received (value hidden). Validating protected access...")
 
     if not args.no_validate:
         endpoint = os.environ.get("PG_CLEANUP_ENDPOINT", DEFAULT_ENDPOINT)

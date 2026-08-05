@@ -1,33 +1,38 @@
 @echo off
-REM Simple launcher: activate venv and run GUI (assumes dependencies are installed)
+setlocal EnableExtensions DisableDelayedExpansion
+chcp 65001 >nul
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
+cd /d "%~dp0"
 
-if not exist ".venv\Scripts\Activate.bat" (
-  echo Error: Virtual environment not found. Run install.ps1 first.
-  pause
-  exit /b 1
-)
-
-echo Activating virtual environment...
-call .venv\Scripts\Activate.bat
-
-echo Checking for required packages...
-python -c "import sys; import whisper, psutil, docx; print('✓ All required packages found')" 2>nul
-if errorlevel 1 (
+set "AUDIOPROCESSOR_PYTHON=.venv\Scripts\python.exe"
+if not exist "%AUDIOPROCESSOR_PYTHON%" (
+  echo AudioProcessor's pinned local environment was not found.
   echo.
-  echo ❌ Required packages not found. Run install.ps1 first to install dependencies.
+  echo Run the reviewed installer first:
+  echo   .\install_geforce.ps1
   echo.
   pause
   exit /b 1
 )
 
-echo.
-echo � Launching Speech to Text Transcription Tool GUI...
-echo.
-python gui_transcribe.py --gui
+"%AUDIOPROCESSOR_PYTHON%" -c "import faster_whisper, keyring, psutil, torch, whisper; from docx import Document" 2>nul
+if errorlevel 1 (
+  echo AudioProcessor's pinned environment is incomplete.
+  echo.
+  echo Run:
+  echo   .\install_geforce.ps1
+  echo.
+  pause
+  exit /b 1
+)
+
+"%AUDIOPROCESSOR_PYTHON%" gui_transcribe.py --gui
 
 if errorlevel 1 (
   echo.
-  echo ❌ GUI failed to start. Check the error messages above.
+  echo The GUI failed to start. Check the error messages above.
   echo.
 )
 pause
+endlocal

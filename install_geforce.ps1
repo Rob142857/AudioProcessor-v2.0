@@ -1,181 +1,241 @@
 <#
 .SYNOPSIS
-    AudioProcessor v2.0 — One-liner bootstrap for Windows x64 + NVIDIA GeForce.
+    Pinned local setup for AudioProcessor on Windows x64 + GTX 1070 Ti.
 
 .DESCRIPTION
-    Downloads and sets up everything needed to run AudioProcessor on a GeForce GPU:
-      1. Checks / installs Python 3.11+
-      2. Checks / installs Git
-      3. Checks / installs FFmpeg
-      4. Clones the repository
-      5. Creates a virtual environment and installs dependencies
-      6. Installs PyTorch with CUDA 12.4 support
-      7. Pre-downloads the recommended Whisper models
-      8. Launches the GUI
+    Run this reviewed script from a local AudioProcessor checkout. It creates a
+    Python 3.12 x64 virtual environment, installs the proven Pascal-compatible
+    torch 2.6.0+cu124 lane before the pinned application requirements, runs
+    pip's dependency check, and executes the offline pipeline doctor.
 
-    Usage (one-liner from any PowerShell):
-      irm https://raw.githubusercontent.com/Rob142857/AudioProcessor-v2.0/main/install_geforce.ps1 | iex
+    The script does not clone or update Git repositories, install system
+    software, download Whisper models, change credentials, or start the GUI
+    unless -Launch is supplied.
+
+.PARAMETER RecreateVenv
+    Remove and recreate only this checkout's .venv when it is incompatible.
+
+.PARAMETER Launch
+    Launch gui_transcribe.py after every setup check passes.
+
+.EXAMPLE
+    .\install_geforce.ps1
+
+.EXAMPLE
+    .\install_geforce.ps1 -RecreateVenv -Launch
 
 .NOTES
-    Requires: Windows 10/11 x64, NVIDIA GeForce GPU with recent drivers, internet.
-    The script will NOT modify system Python — it uses a virtual environment.
+    Prerequisites: Windows 10/11 x64, Python 3.12 x64, an NVIDIA driver,
+    internet access for Python packages, and the bundled ffmpeg.exe in this
+    checkout. Python may be registered with py.exe or installed in the normal
+    per-user Python312 directory.
 #>
+
+[CmdletBinding()]
+param(
+    [switch]$RecreateVenv,
+    [switch]$Launch
+)
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
-$RepoURL  = "https://github.com/Rob142857/AudioProcessor-v2.0.git"
-$RepoName = "AudioProcessor-v2.0"
-$InstallDir = Join-Path $env:USERPROFILE $RepoName
+$PinnedPython = "3.12"
+$PinnedTorch = "2.6.0+cu124"
+$TorchIndex = "https://download.pytorch.org/whl/cu124"
+$PinnedPip = "26.2.1"
+$PinnedSetuptools = "83.0.0"
+$PinnedWheel = "0.47.0"
 
-# ── Helpers ──────────────────────────────────────────────────────────
-function Write-Step  { param([string]$Msg) Write-Host "`n==> $Msg" -ForegroundColor Cyan }
-function Write-Ok    { param([string]$Msg) Write-Host "    OK: $Msg" -ForegroundColor Green }
-function Write-Warn  { param([string]$Msg) Write-Host "    WARN: $Msg" -ForegroundColor Yellow }
-function Write-Fail  { param([string]$Msg) Write-Host "    FAIL: $Msg" -ForegroundColor Red }
+$ProjectRoot = $PSScriptRoot
+if ([string]::IsNullOrWhiteSpace($ProjectRoot)) {
+    throw "Run install_geforce.ps1 from a local AudioProcessor checkout."
+}
+$ProjectRoot = (Resolve-Path -LiteralPath $ProjectRoot).Path
+$RequirementsPath = Join-Path $ProjectRoot "requirements.txt"
+$DoctorPath = Join-Path $ProjectRoot "pipeline_doctor.py"
+$GuiPath = Join-Path $ProjectRoot "gui_transcribe.py"
+$VenvDir = Join-Path $ProjectRoot ".venv"
+$VenvPython = Join-Path $VenvDir "Scripts\python.exe"
 
-function Test-Command { param([string]$Name) $null -ne (Get-Command $Name -ErrorAction SilentlyContinue) }
+function Write-Step {
+    param([Parameter(Mandatory)][string]$Message)
+    Write-Host "`n==> $Message" -ForegroundColor Cyan
+}
 
-# ── 1. Python ────────────────────────────────────────────────────────
-Write-Step "Checking Python..."
-$py = $null
-foreach ($candidate in @("python", "python3", "py")) {
-    if (Test-Command $candidate) {
-        $ver = & $candidate --version 2>&1
-        if ($ver -match "(\d+)\.(\d+)") {
-            $major = [int]$Matches[1]; $minor = [int]$Matches[2]
-            if ($major -eq 3 -and $minor -ge 10) {
-                $py = $candidate
-                Write-Ok "$ver"
-                break
-            }
+function Write-Ok {
+    param([Parameter(Mandatory)][string]$Message)
+    Write-Host "    OK: $Message" -ForegroundColor Green
+}
+
+function Write-Warn {
+    param([Parameter(Mandatory)][string]$Message)
+    Write-Host "    WARN: $Message" -ForegroundColor Yellow
+}
+
+function Invoke-Native {
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$ArgumentList = @()
+    )
+    & $FilePath @ArgumentList
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        $rendered = ($ArgumentList -join " ")
+        throw "Native command failed ($exitCode): $FilePath $rendered"
+    }
+}
+
+function Get-PythonProbe {
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$PrefixArguments = @()
+    )
+    $probe = @(
+        "-c",
+        "import platform,struct; print(f'{platform.python_version()}|{struct.calcsize(`"P`") * 8}')"
+    )
+    return (Invoke-Native -FilePath $FilePath -ArgumentList ($PrefixArguments + $probe) | Select-Object -Last 1)
+}
+
+function Remove-LocalVenv {
+    $expectedVenv = [System.IO.Path]::GetFullPath((Join-Path $ProjectRoot ".venv"))
+    $resolvedVenv = [System.IO.Path]::GetFullPath($VenvDir)
+    if ($resolvedVenv -ne $expectedVenv -or (Split-Path -Parent $resolvedVenv) -ne $ProjectRoot) {
+        throw "Refusing to remove unexpected virtual environment path: $resolvedVenv"
+    }
+    $venvEntry = Get-Item -LiteralPath $VenvDir -Force
+    if (($venvEntry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Refusing to recursively remove a .venv reparse point: $resolvedVenv"
+    }
+    Write-Warn "Removing incompatible or incomplete $resolvedVenv"
+    Remove-Item -LiteralPath $resolvedVenv -Recurse -Force
+}
+
+if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
+    throw "This installer is for Windows only."
+}
+if (-not [System.Environment]::Is64BitOperatingSystem) {
+    throw "AudioProcessor requires 64-bit Windows."
+}
+foreach ($requiredFile in @($RequirementsPath, $DoctorPath, $GuiPath)) {
+    if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
+        throw "Required checkout file is missing: $requiredFile"
+    }
+}
+
+Write-Step "Locating Python $PinnedPython x64"
+$launcher = Get-Command "py.exe" -CommandType Application -ErrorAction SilentlyContinue
+$BasePythonFilePath = $null
+$BasePythonPrefixArguments = @()
+$baseProbe = $null
+
+if ($null -ne $launcher) {
+    try {
+        $candidateProbe = Get-PythonProbe -FilePath $launcher.Source -PrefixArguments @("-$PinnedPython")
+        if ($candidateProbe -match '^3\.12\.\d+\|64$') {
+            $BasePythonFilePath = $launcher.Source
+            $BasePythonPrefixArguments = @("-$PinnedPython")
+            $baseProbe = $candidateProbe
+            Write-Ok "Found Python through py -$PinnedPython"
+        } else {
+            Write-Warn "py -$PinnedPython resolved to '$candidateProbe'; trying the per-user installation"
         }
-    }
-}
-if (-not $py) {
-    Write-Warn "Python 3.10+ not found. Attempting install via winget..."
-    if (Test-Command "winget") {
-        winget install --id Python.Python.3.11 --accept-source-agreements --accept-package-agreements
-        # Refresh PATH
-        $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
-                     [System.Environment]::GetEnvironmentVariable("Path", "User")
-        if (Test-Command "python") { $py = "python"; Write-Ok "Python installed." }
-    }
-    if (-not $py) {
-        Write-Fail "Could not install Python automatically."
-        Write-Host "Please install Python 3.11 from https://www.python.org/downloads/ and re-run." -ForegroundColor Yellow
-        exit 1
+    } catch {
+        Write-Warn "py -$PinnedPython is unavailable; trying the per-user installation"
     }
 }
 
-# ── 2. Git ───────────────────────────────────────────────────────────
-Write-Step "Checking Git..."
-if (Test-Command "git") {
-    Write-Ok (git --version)
-} else {
-    Write-Warn "Git not found. Attempting install via winget..."
-    if (Test-Command "winget") {
-        winget install --id Git.Git --accept-source-agreements --accept-package-agreements
-        $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
-                     [System.Environment]::GetEnvironmentVariable("Path", "User")
+$perUserPython = $null
+if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+    $perUserPython = Join-Path $env:LOCALAPPDATA "Programs\Python\Python312\python.exe"
+}
+if ($null -eq $BasePythonFilePath -and $null -ne $perUserPython -and (Test-Path -LiteralPath $perUserPython -PathType Leaf)) {
+    try {
+        $candidateProbe = Get-PythonProbe -FilePath $perUserPython
+        if ($candidateProbe -match '^3\.12\.\d+\|64$') {
+            $BasePythonFilePath = $perUserPython
+            $BasePythonPrefixArguments = @()
+            $baseProbe = $candidateProbe
+            Write-Ok "Found per-user Python at $perUserPython"
+        }
+    } catch {
+        Write-Warn "Per-user Python exists but could not be executed: $perUserPython"
     }
-    if (-not (Test-Command "git")) {
-        Write-Fail "Could not install Git. Please install from https://git-scm.com/ and re-run."
-        exit 1
-    }
-    Write-Ok "Git installed."
 }
 
-# ── 3. FFmpeg ────────────────────────────────────────────────────────
-Write-Step "Checking FFmpeg..."
-if (Test-Command "ffmpeg") {
-    Write-Ok "ffmpeg found on PATH."
-} else {
-    Write-Warn "FFmpeg not found. Attempting install via winget..."
-    if (Test-Command "winget") {
-        winget install --id Gyan.FFmpeg --accept-source-agreements --accept-package-agreements
-        $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
-                     [System.Environment]::GetEnvironmentVariable("Path", "User")
+if ($null -eq $BasePythonFilePath) {
+    throw "Python 3.12 x64 was not found through py -3.12 or $perUserPython. Install Python 3.12 x64 from python.org, then rerun this local script."
+}
+Write-Ok "Python $($baseProbe -replace '\|', ' / ')-bit"
+
+if (Test-Path -LiteralPath $VenvPython -PathType Leaf) {
+    Write-Step "Validating existing virtual environment"
+    $venvCompatible = $false
+    try {
+        $venvProbe = Get-PythonProbe -FilePath $VenvPython
+        $venvCompatible = $venvProbe -match '^3\.12\.\d+\|64$'
+    } catch {
+        $venvProbe = "unusable"
     }
-    if (Test-Command "ffmpeg") {
-        Write-Ok "FFmpeg installed."
+    if (-not $venvCompatible) {
+        if (-not $RecreateVenv) {
+            throw ".venv is '$venvProbe'. Rerun with -RecreateVenv to replace only this checkout's environment."
+        }
+        Remove-LocalVenv
     } else {
-        Write-Warn "FFmpeg not on PATH. Transcription may fail without it."
-        Write-Host "    Install from https://ffmpeg.org/download.html or: winget install Gyan.FFmpeg" -ForegroundColor Yellow
+        Write-Ok "Existing .venv is Python $($venvProbe -replace '\|', ' / ')-bit"
     }
+} elseif ((Test-Path -LiteralPath $VenvDir) -and -not $RecreateVenv) {
+    throw ".venv exists but has no usable Python. Rerun with -RecreateVenv."
+} elseif (Test-Path -LiteralPath $VenvDir) {
+    Remove-LocalVenv
 }
 
-# ── 4. Clone repo ───────────────────────────────────────────────────
-Write-Step "Cloning AudioProcessor..."
-if (Test-Path (Join-Path $InstallDir ".git")) {
-    Write-Ok "Repository already exists at $InstallDir — pulling latest."
-    Push-Location $InstallDir
-    git pull --ff-only 2>&1 | Out-Null
-    Pop-Location
+if (-not (Test-Path -LiteralPath $VenvPython -PathType Leaf)) {
+    Write-Step "Creating Python $PinnedPython x64 virtual environment"
+    Invoke-Native -FilePath $BasePythonFilePath -ArgumentList ($BasePythonPrefixArguments + @("-m", "venv", $VenvDir))
+    Write-Ok "Created $VenvDir"
+}
+
+Write-Step "Installing pinned packaging tools"
+Invoke-Native -FilePath $VenvPython -ArgumentList @(
+    "-m", "pip", "install", "--disable-pip-version-check", "--upgrade",
+    "pip==$PinnedPip", "setuptools==$PinnedSetuptools", "wheel==$PinnedWheel"
+)
+Write-Ok "pip $PinnedPip, setuptools $PinnedSetuptools, wheel $PinnedWheel"
+
+Write-Step "Installing Pascal-compatible PyTorch before Whisper"
+Invoke-Native -FilePath $VenvPython -ArgumentList @(
+    "-m", "pip", "install", "--disable-pip-version-check", "--upgrade",
+    "torch==$PinnedTorch", "--index-url", $TorchIndex
+)
+Write-Ok "PyTorch $PinnedTorch from the official cu124 index"
+
+Write-Step "Installing pinned AudioProcessor requirements"
+Invoke-Native -FilePath $VenvPython -ArgumentList @(
+    "-m", "pip", "install", "--disable-pip-version-check", "--upgrade",
+    "--requirement", $RequirementsPath
+)
+Write-Ok "Pinned application requirements installed"
+
+Write-Step "Checking dependency consistency"
+Invoke-Native -FilePath $VenvPython -ArgumentList @("-m", "pip", "check")
+Write-Ok "No broken Python requirements"
+
+Write-Step "Running offline transcription environment doctor"
+Invoke-Native -FilePath $VenvPython -ArgumentList @(
+    $DoctorPath, "--mode", "transcribe", "--require-gpu", "--no-cleanup"
+)
+Write-Ok "Python, package, PyTorch CUDA, and CTranslate2 CUDA checks passed"
+
+Write-Warn "Setup does not download models or prove transcription quality. Run and review a real tape CUDA/int8 canary before archive-wide processing."
+
+if ($Launch) {
+    Write-Step "Launching AudioProcessor"
+    Invoke-Native -FilePath $VenvPython -ArgumentList @($GuiPath, "--gui")
 } else {
-    if (Test-Path $InstallDir) {
-        Write-Warn "$InstallDir exists but is not a git repo. Backing up and re-cloning."
-        Rename-Item $InstallDir "$InstallDir.bak_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
-    }
-    git clone $RepoURL $InstallDir
-    Write-Ok "Cloned to $InstallDir"
+    Write-Host ""
+    Write-Host "Environment setup complete. Launch with:" -ForegroundColor White
+    Write-Host "  & '$VenvPython' '$GuiPath' --gui" -ForegroundColor White
 }
-Set-Location $InstallDir
-
-# ── 5. Virtual environment ──────────────────────────────────────────
-Write-Step "Creating virtual environment..."
-$venvDir = Join-Path $InstallDir ".venv"
-if (-not (Test-Path (Join-Path $venvDir "Scripts" "python.exe"))) {
-    & $py -m venv $venvDir
-    Write-Ok "venv created."
-} else {
-    Write-Ok "venv already exists."
-}
-
-$venvPython = Join-Path $venvDir "Scripts" "python.exe"
-$venvPip    = Join-Path $venvDir "Scripts" "pip.exe"
-
-Write-Step "Upgrading pip..."
-& $venvPython -m pip install --upgrade pip --quiet 2>&1 | Out-Null
-Write-Ok "pip up to date."
-
-# ── 6. Install dependencies ─────────────────────────────────────────
-Write-Step "Installing requirements..."
-& $venvPip install -r (Join-Path $InstallDir "requirements.txt") --quiet 2>&1 | Out-Null
-Write-Ok "Requirements installed."
-
-Write-Step "Installing PyTorch with CUDA 12.4 support (GeForce)..."
-& $venvPip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124 --quiet 2>&1 | Out-Null
-Write-Ok "PyTorch (CUDA 12.4) installed."
-
-# ── 7. GPU check ────────────────────────────────────────────────────
-Write-Step "Verifying GPU..."
-$gpuCheck = & $venvPython -c "
-import torch
-if torch.cuda.is_available():
-    name = torch.cuda.get_device_name(0)
-    mem  = torch.cuda.get_device_properties(0).total_mem / (1024**3)
-    print(f'{name} ({mem:.1f} GB VRAM)')
-else:
-    print('NO_GPU')
-" 2>&1
-if ($gpuCheck -match "NO_GPU") {
-    Write-Warn "CUDA GPU not detected. PyTorch will fall back to CPU."
-    Write-Host "    Ensure NVIDIA drivers are installed: https://www.nvidia.com/Download/index.aspx" -ForegroundColor Yellow
-} else {
-    Write-Ok "GPU: $gpuCheck"
-}
-
-# ── 8. Preload models ───────────────────────────────────────────────
-Write-Step "Pre-downloading Whisper models (this may take a few minutes)..."
-& $venvPython (Join-Path $InstallDir "preload_models.py") 2>&1 | ForEach-Object { Write-Host "    $_" }
-Write-Ok "Models cached."
-
-# ── 9. Launch ────────────────────────────────────────────────────────
-Write-Step "Setup complete! Launching AudioProcessor..."
-Write-Host ""
-Write-Host "  Install location: $InstallDir" -ForegroundColor White
-Write-Host "  To run again:     cd '$InstallDir'; .\.venv\Scripts\Activate.ps1; python gui_transcribe.py" -ForegroundColor White
-Write-Host ""
-
-& $venvPython (Join-Path $InstallDir "gui_transcribe.py")

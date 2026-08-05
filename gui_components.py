@@ -42,15 +42,23 @@ def _styled_btn(parent, text, command, *, bg=ACCENT, fg="white", font=FONT_SM, *
 class InputPanel(tk.Frame):
     """File or folder picker with status line."""
 
-    def __init__(self, parent, on_folder_selected=None):
+    def __init__(
+        self,
+        parent,
+        on_folder_selected=None,
+        *,
+        on_source_selected=None,
+        initial_path: str = "",
+    ):
         super().__init__(parent, bg=CARD_BG)
-        self._on_folder_selected = on_folder_selected
+        # ``on_folder_selected`` is retained for callers of the original GUI.
+        self._on_source_selected = on_source_selected or on_folder_selected
         self.columnconfigure(1, weight=1)
 
         tk.Label(self, text="Audio / Video source:", bg=CARD_BG, fg=FG,
                  font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w", padx=16, pady=(14, 4))
 
-        self.path_var = tk.StringVar()
+        self.path_var = tk.StringVar(value=initial_path)
         tk.Entry(self, textvariable=self.path_var, font=FONT, relief="flat",
                  bg=ENTRY_BG, fg=ENTRY_FG, insertbackground=ENTRY_FG
                  ).grid(row=0, column=1, sticky="ew", padx=(8, 4), pady=(14, 4))
@@ -62,6 +70,8 @@ class InputPanel(tk.Frame):
 
         self.status = tk.Label(self, text="No source selected", bg=CARD_BG, fg=FG_DIM, font=FONT_SM)
         self.status.grid(row=1, column=0, columnspan=3, sticky="w", padx=16, pady=(0, 10))
+        if initial_path and os.path.exists(initial_path):
+            self._show_status(initial_path)
 
     # ── helpers ──
     def _browse_file(self):
@@ -73,16 +83,35 @@ class InputPanel(tk.Frame):
         p = filedialog.askopenfilename(title="Select audio / video file", filetypes=types)
         if p:
             self.path_var.set(p)
-            self.status.config(text=f"File: {os.path.basename(p)}", fg=GREEN)
+            self._show_status(p)
+            if self._on_source_selected:
+                self._on_source_selected(p)
 
     def _browse_folder(self):
         d = filedialog.askdirectory(title="Select folder for batch processing")
         if d:
             self.path_var.set(d)
-            n = sum(1 for f in os.listdir(d) if os.path.splitext(f)[1].lower() in SUPPORTED_EXTS)
-            self.status.config(text=f"Folder: {os.path.basename(d)}  ({n} files)", fg=GREEN)
-            if self._on_folder_selected:
-                self._on_folder_selected(d)
+            self._show_status(d)
+            if self._on_source_selected:
+                self._on_source_selected(d)
+
+    def _show_status(self, path: str) -> None:
+        if os.path.isfile(path):
+            self.status.config(text=f"File: {os.path.basename(path)}", fg=GREEN)
+            return
+        if os.path.isdir(path):
+            try:
+                n = sum(
+                    1
+                    for f in os.listdir(path)
+                    if os.path.splitext(f)[1].lower() in SUPPORTED_EXTS
+                )
+            except OSError:
+                n = 0
+            self.status.config(
+                text=f"Folder: {os.path.basename(path)}  ({n} files at this level)",
+                fg=GREEN,
+            )
 
     def get_path(self) -> str:
         return self.path_var.get().strip()
@@ -111,9 +140,61 @@ class SettingsPanel(tk.Frame):
         # Valid model keys for validation
         valid_models = {k for k, _ in self.MODEL_OPTIONS}
 
+        # Polished pipeline mode is deliberately the safe, default path.  The
+        # description is informational rather than an editable model selector:
+        # cleanup remains pinned by archive_pipeline.py.
+        mode_frame = tk.Frame(self, bg=CARD_BG)
+        mode_frame.grid(
+            row=row, column=0, columnspan=3, sticky="ew", padx=16, pady=(14, 4)
+        )
+        self.pipeline_var = tk.IntVar(value=int(bool(ps.get("polished_pipeline", 1))))
+        tk.Checkbutton(
+            mode_frame,
+            text="Polished archive pipeline",
+            variable=self.pipeline_var,
+            bg=CARD_BG,
+            fg=FG,
+            selectcolor=CARD_BG,
+            activebackground=CARD_BG,
+            font=("Segoe UI", 10, "bold"),
+            command=self._toggle_pipeline,
+        ).pack(side="left")
+        self.pipeline_flow = tk.Label(
+            self,
+            text=(
+                "Local Faster-Whisper  →  protected GLM-4.7-Flash cleanup  "
+                "→  polished Word"
+            ),
+            bg="#eff6ff",
+            fg="#1d4ed8",
+            font=FONT_SM,
+            anchor="w",
+            padx=10,
+            pady=6,
+        )
+        self.pipeline_flow.grid(
+            row=row + 1, column=0, columnspan=3, sticky="ew", padx=16, pady=(0, 6)
+        )
+        self.pipeline_note = tk.Label(
+            self,
+            text=(
+                "Completed recordings, stages, and GLM chunks resume after interruption; "
+                "a recording stopped during Whisper restarts from its beginning. Source "
+                "Word files change only after the selected run verifies, with backups."
+            ),
+            bg=CARD_BG,
+            fg=FG_DIM,
+            font=("Segoe UI", 8),
+            anchor="w",
+        )
+        self.pipeline_note.grid(
+            row=row + 2, column=0, columnspan=3, sticky="w", padx=18, pady=(0, 4)
+        )
+        row += 3
+
         # Model
         tk.Label(self, text="Model:", bg=CARD_BG, fg=FG,
-                 font=("Segoe UI", 10, "bold")).grid(row=row, column=0, sticky="w", padx=16, pady=(14, 6))
+                 font=("Segoe UI", 10, "bold")).grid(row=row, column=0, sticky="w", padx=16, pady=(4, 6))
         saved_model = ps.get("whisper_model", "faster-whisper-large-v3")
         if saved_model not in valid_models:
             saved_model = "faster-whisper-large-v3"  # reset stale/invalid model names
@@ -123,7 +204,7 @@ class SettingsPanel(tk.Frame):
         combo = ttk.Combobox(self, textvariable=self._display_var,
                              values=[v for _, v in self.MODEL_OPTIONS],
                              state="readonly", width=46, font=FONT_SM)
-        combo.grid(row=row, column=1, columnspan=2, sticky="w", padx=(8, 16), pady=(14, 6))
+        combo.grid(row=row, column=1, columnspan=2, sticky="w", padx=(8, 16), pady=(4, 6))
         combo.bind("<<ComboboxSelected>>", self._on_model_change)
 
         # ── Row: Recursive + Quality ──
@@ -131,7 +212,7 @@ class SettingsPanel(tk.Frame):
         chk_frame = tk.Frame(self, bg=CARD_BG)
         chk_frame.grid(row=row, column=0, columnspan=3, sticky="w", padx=16, pady=(4, 2))
 
-        self.recursive_var = tk.IntVar(value=ps.get("recursive", 0))
+        self.recursive_var = tk.IntVar(value=ps.get("recursive", 1))
         tk.Checkbutton(chk_frame, text="Recursive (include subfolders)", variable=self.recursive_var,
                        bg=CARD_BG, fg=FG, selectcolor=CARD_BG, activebackground=CARD_BG,
                        font=FONT_SM).pack(side="left", padx=(0, 24))
@@ -148,7 +229,11 @@ class SettingsPanel(tk.Frame):
 
         self.replace_var = tk.StringVar(value=ps.get("replace_mode", "skip"))  # skip | all | before
         tk.Label(repl_frame, text="Existing outputs:", bg=CARD_BG, fg=FG, font=FONT_SM).pack(side="left", padx=(0, 6))
-        for val, label in [("skip", "Skip"), ("all", "Replace all"), ("before", "Replace if before…")]:
+        for val, label in [
+            ("skip", "Skip existing"),
+            ("all", "Replace all"),
+            ("before", "Replace transcripts before…"),
+        ]:
             tk.Radiobutton(repl_frame, text=label, variable=self.replace_var, value=val,
                            bg=CARD_BG, fg=FG, selectcolor=CARD_BG, activebackground=CARD_BG,
                            font=FONT_SM, command=self._toggle_date).pack(side="left", padx=(0, 10))
@@ -166,9 +251,30 @@ class SettingsPanel(tk.Frame):
 
         self._toggle_date()  # initial visibility
 
+        # Force is intentionally separate from the source-DOCX selection
+        # policy.  Ordinarily the polished pipeline resumes valid checkpoints.
+        row += 1
+        advanced_frame = tk.Frame(self, bg=CARD_BG)
+        advanced_frame.grid(
+            row=row, column=0, columnspan=3, sticky="w", padx=16, pady=(2, 4)
+        )
+        self.force_var = tk.IntVar(value=int(bool(ps.get("force_reprocess", 0))))
+        self.force_check = tk.Checkbutton(
+            advanced_frame,
+            text="Reprocess from audio even when verified checkpoints exist (slow)",
+            variable=self.force_var,
+            bg=CARD_BG,
+            fg=FG_DIM,
+            selectcolor=CARD_BG,
+            activebackground=CARD_BG,
+            font=FONT_SM,
+        )
+        self.force_check.pack(side="left")
+
         # Bottom padding
         row += 1
         tk.Frame(self, bg=CARD_BG, height=10).grid(row=row, column=0)
+        self._toggle_pipeline()
 
     # ── helpers ──
     def _on_model_change(self, _evt=None):
@@ -186,6 +292,23 @@ class SettingsPanel(tk.Frame):
         else:
             self._date_frame.grid_remove()
 
+    def _toggle_pipeline(self):
+        enabled = bool(self.pipeline_var.get())
+        self.pipeline_flow.configure(
+            fg="#1d4ed8" if enabled else FG_DIM,
+            text=(
+                "Local Faster-Whisper  →  protected GLM-4.7-Flash cleanup  "
+                "→  polished Word"
+                if enabled
+                else "Local transcription only (legacy mode; no protected cleanup)"
+            ),
+        )
+        self.force_check.configure(state="normal" if enabled else "disabled")
+        if enabled:
+            self.pipeline_note.grid()
+        else:
+            self.pipeline_note.grid_remove()
+
     def apply(self, ps: dict) -> None:
         """Apply a project-settings dict to the panel widgets."""
         valid_models = {k for k, _ in self.MODEL_OPTIONS}
@@ -195,20 +318,25 @@ class SettingsPanel(tk.Frame):
             saved_model = "faster-whisper-large-v3"  # reset stale/invalid model names
         self.model_var.set(saved_model)
         self._display_var.set(display_map.get(saved_model, self.MODEL_OPTIONS[0][1]))
-        self.recursive_var.set(ps.get("recursive", 0))
+        self.pipeline_var.set(int(bool(ps.get("polished_pipeline", 1))))
+        self.recursive_var.set(ps.get("recursive", 1))
         self.quality_var.set(ps.get("quality_mode", 1))
         self.replace_var.set(ps.get("replace_mode", "skip"))
         self.date_var.set(ps.get("replace_before_date", datetime.date.today().isoformat()))
+        self.force_var.set(int(bool(ps.get("force_reprocess", 0))))
         self._toggle_date()
+        self._toggle_pipeline()
 
     def snapshot(self) -> dict:
         """Return current settings as a dict for persistence."""
         return {
+            "polished_pipeline": self.pipeline_var.get(),
             "whisper_model": self.model_var.get(),
             "recursive": self.recursive_var.get(),
             "quality_mode": self.quality_var.get(),
             "replace_mode": self.replace_var.get(),
             "replace_before_date": self.date_var.get(),
+            "force_reprocess": self.force_var.get(),
         }
 
 

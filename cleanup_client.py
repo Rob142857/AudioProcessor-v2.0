@@ -24,15 +24,21 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from pipeline_control import CancelCheck, raise_if_cancelled
+
 
 DEFAULT_ENDPOINT = "https://pg.objectiveartefacts.com.au/api/tooling/cleanup-chunk"
 DEFAULT_MODEL = "@cf/zai-org/glm-4.7-flash"
+DEFAULT_CLEANUP_PROFILE = "semantic-conservative-v3"
 DEFAULT_TARGET_WORDS = 800
 DEFAULT_MAX_CHARS = 18_000
-CHECKPOINT_VERSION = 1
+CHECKPOINT_VERSION = 4
+CANCEL_BACKOFF_POLL_SECONDS = 0.1
 CREDENTIAL_SERVICE = "AudioProcessor Cloudflare Access"
 CREDENTIAL_CLIENT_ID_KEY = "client-id"
 CREDENTIAL_CLIENT_SECRET_KEY = "client-secret"
+ACCESS_CLIENT_ID_HEADER = "CF-Access-Client-Id"
+ACCESS_CLIENT_SECRET_HEADER = "CF-Access-Client-Secret"
 
 _NONSPACE_RE = re.compile(r"\S+")
 _PREFERRED_BREAK_RE = re.compile(
@@ -74,16 +80,28 @@ class CleanupHTTPError(CleanupClientError):
         self.status = status
 
 
+def normalize_access_credential(value: str, header_name: str) -> str:
+    """Accept a raw Access value or Cloudflare's copied ``Header: value`` form."""
+
+    cleaned = str(value or "").strip()
+    prefix = f"{header_name}:"
+    if cleaned.casefold().startswith(prefix.casefold()):
+        cleaned = cleaned[len(prefix) :].strip()
+    return cleaned
+
+
 def _keyring_credentials() -> tuple[str, str] | None:
     """Read the optional OS credential store without exposing values to logs."""
     try:
         import keyring  # type: ignore
 
-        client_id = keyring.get_password(
-            CREDENTIAL_SERVICE, CREDENTIAL_CLIENT_ID_KEY
+        client_id = normalize_access_credential(
+            keyring.get_password(CREDENTIAL_SERVICE, CREDENTIAL_CLIENT_ID_KEY) or "",
+            ACCESS_CLIENT_ID_HEADER,
         )
-        client_secret = keyring.get_password(
-            CREDENTIAL_SERVICE, CREDENTIAL_CLIENT_SECRET_KEY
+        client_secret = normalize_access_credential(
+            keyring.get_password(CREDENTIAL_SERVICE, CREDENTIAL_CLIENT_SECRET_KEY) or "",
+            ACCESS_CLIENT_SECRET_HEADER,
         )
     except Exception:
         return None
@@ -94,8 +112,12 @@ def _keyring_credentials() -> tuple[str, str] | None:
 
 def resolve_access_credentials() -> tuple[str, str, str]:
     """Resolve a complete Access token pair from env or the OS credential store."""
-    client_id = os.environ.get("CF_ACCESS_CLIENT_ID", "").strip()
-    client_secret = os.environ.get("CF_ACCESS_CLIENT_SECRET", "").strip()
+    client_id = normalize_access_credential(
+        os.environ.get("CF_ACCESS_CLIENT_ID", ""), ACCESS_CLIENT_ID_HEADER
+    )
+    client_secret = normalize_access_credential(
+        os.environ.get("CF_ACCESS_CLIENT_SECRET", ""), ACCESS_CLIENT_SECRET_HEADER
+    )
     if client_id or client_secret:
         if not (client_id and client_secret):
             raise CleanupConfigurationError(
@@ -272,7 +294,10 @@ def chunk_text(
 
         bounded = text[start:end]
         bounded_words = list(_NONSPACE_RE.finditer(bounded))
-        if len(bounded_words) >= 4:
+        # Prefer a natural boundary only when another chunk is actually
+        # required.  Otherwise the last internal sentence break would create
+        # a needless tiny tail chunk for ordinary short inputs.
+        if end < len(text) and len(bounded_words) >= 4:
             minimum_word = max(1, int(len(bounded_words) * 0.75))
             minimum_position = bounded_words[minimum_word - 1].end()
             preferred = [
@@ -415,16 +440,26 @@ class CleanupClient:
     def glossary_terms(self) -> tuple[str, ...]:
         return self._glossary.terms if self._glossary else ()
 
-    def ensure_glossary(self) -> GlossarySnapshot:
+    def ensure_glossary(
+        self,
+        *,
+        cancel_check: CancelCheck | None = None,
+    ) -> GlossarySnapshot:
         """Fetch and cache the immutable glossary snapshot for this client."""
 
+        raise_if_cancelled(cancel_check, phase="cleanup glossary fetch")
         if self._glossary is not None:
             return self._glossary
         if not self.pin_glossary:
             self._glossary = GlossarySnapshot((), None, 0, False)
             return self._glossary
 
-        response = self._request("GET", self.terms_endpoint, body=None)
+        response = self._request(
+            "GET",
+            self.terms_endpoint,
+            body=None,
+            cancel_check=cancel_check,
+        )
         try:
             raw = response.body.decode("utf-8-sig")
         except UnicodeDecodeError as exc:
@@ -450,6 +485,7 @@ class CleanupClient:
             count=len(terms),
             pinned=True,
         )
+        raise_if_cancelled(cancel_check, phase="cleanup glossary fetch")
         return self._glossary
 
     def cleanup_text(
@@ -458,12 +494,15 @@ class CleanupClient:
         checkpoint_dir: Path | None = None,
         *,
         reuse_checkpoints: bool = True,
+        cancel_check: CancelCheck | None = None,
     ) -> CleanupResult:
-        """Clean *text* sequentially, optionally resuming valid checkpoints."""
+        """Clean *text* sequentially, with resumable cooperative cancellation."""
 
         if not isinstance(text, str):
             raise TypeError("text must be a string")
-        glossary = self.ensure_glossary()
+        raise_if_cancelled(cancel_check, phase="cleanup glossary fetch")
+        glossary = self.ensure_glossary(cancel_check=cancel_check)
+        raise_if_cancelled(cancel_check, phase="cleanup glossary fetch")
         input_sha256 = _sha256_text(text)
         source_chunks = chunk_text(
             text, target_words=self.target_words, max_chars=self.max_chars
@@ -479,6 +518,11 @@ class CleanupClient:
 
         preceding_text = ""
         for source_chunk in source_chunks:
+            phase = f"cleanup chunk {source_chunk.index + 1} of {total_chunks}"
+            raise_if_cancelled(cancel_check, phase=phase)
+            preceding_context = _tail_words(
+                preceding_text, self.preceding_context_words
+            )
             checkpoint_path = (
                 run_dir
                 / f"chunk-{source_chunk.index + 1:05d}-of-{total_chunks:05d}.json"
@@ -493,6 +537,7 @@ class CleanupClient:
                     chunk=source_chunk,
                     total_chunks=total_chunks,
                     glossary=glossary,
+                    preceding_context=preceding_context,
                 )
                 if checkpoint_warning:
                     warnings.append(checkpoint_warning)
@@ -516,14 +561,12 @@ class CleanupClient:
                         usage=None,
                     )
                 else:
-                    context = _tail_words(
-                        preceding_text, self.preceding_context_words
-                    )
                     result = self._clean_chunk(
                         source_chunk,
                         total_chunks=total_chunks,
-                        preceding_context=context,
+                        preceding_context=preceding_context,
                         glossary=glossary,
+                        cancel_check=cancel_check,
                     )
                 if checkpoint_path is not None:
                     self._write_checkpoint(
@@ -531,10 +574,14 @@ class CleanupClient:
                         result,
                         input_sha256=input_sha256,
                         glossary=glossary,
+                        preceding_context=preceding_context,
                     )
 
             results.append(result)
             preceding_text = _merge_corrected(results)
+            # A successful remote response is checkpointed before honouring a
+            # stop, so resumption never repeats completed billable work.
+            raise_if_cancelled(cancel_check, phase=phase)
 
         cleaned_text = _merge_corrected(results)
         review_needed = any(result.needs_review for result in results)
@@ -579,6 +626,7 @@ class CleanupClient:
         total_chunks: int,
         preceding_context: str,
         glossary: GlossarySnapshot,
+        cancel_check: CancelCheck | None = None,
     ) -> CleanupChunkResult:
         payload: dict[str, Any] = {
             "text": chunk.text,
@@ -591,12 +639,14 @@ class CleanupClient:
         # Pin a concrete model just as we pin the glossary.  Relying on the
         # service's mutable default could otherwise change engines mid-archive.
         payload["model"] = self.model
+        payload["cleanupProfile"] = DEFAULT_CLEANUP_PROFILE
 
         response = self._request(
             "POST",
             self.endpoint,
             body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
             content_type="application/json; charset=utf-8",
+            cancel_check=cancel_check,
         )
         try:
             decoded = json.loads(response.body.decode("utf-8"))
@@ -625,6 +675,13 @@ class CleanupClient:
                 f"cleanup chunk {chunk.index + 1} used {model!r}, not the pinned "
                 f"model {self.model!r}"
             )
+        cleanup_profile = decoded.get("cleanup_profile")
+        if cleanup_profile != DEFAULT_CLEANUP_PROFILE:
+            raise CleanupProtocolError(
+                f"cleanup chunk {chunk.index + 1} used profile "
+                f"{cleanup_profile!r}, not the pinned profile "
+                f"{DEFAULT_CLEANUP_PROFILE!r}"
+            )
         return CleanupChunkResult(
             index=chunk.index,
             total_chunks=total_chunks,
@@ -643,6 +700,7 @@ class CleanupClient:
         *,
         body: bytes | None,
         content_type: str | None = None,
+        cancel_check: CancelCheck | None = None,
     ) -> HttpResponse:
         headers = {
             "Accept": "application/json, text/plain;q=0.9",
@@ -655,27 +713,45 @@ class CleanupClient:
 
         last_network_error: BaseException | None = None
         for attempt in range(self.max_attempts):
+            phase = f"{method} request attempt {attempt + 1} of {self.max_attempts}"
+            raise_if_cancelled(cancel_check, phase=phase)
             try:
                 response = self._transport(method, url, headers, body, self.timeout)
             except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
                 last_network_error = exc
+                raise_if_cancelled(cancel_check, phase=phase)
                 if attempt + 1 >= self.max_attempts:
                     break
-                self._wait_before_retry(attempt, None)
+                self._wait_before_retry(
+                    attempt,
+                    None,
+                    cancel_check=cancel_check,
+                    phase=phase,
+                )
                 continue
 
             if _looks_like_access_response(response):
+                raise_if_cancelled(cancel_check, phase=phase)
                 raise CleanupAccessError(
                     "Cloudflare Access returned an HTML login/interstitial page; "
                     "check CF_ACCESS_CLIENT_ID, CF_ACCESS_CLIENT_SECRET and the "
                     "Access service-token policy"
                 )
             if 200 <= response.status < 300:
+                # The caller performs the post-success cancellation check after
+                # parsing and, for cleanup chunks, durably writing the response
+                # checkpoint. Failed/retry attempts are checked immediately here.
                 return response
 
+            raise_if_cancelled(cancel_check, phase=phase)
             retryable = response.status == 429 or 500 <= response.status <= 599
             if retryable and attempt + 1 < self.max_attempts:
-                self._wait_before_retry(attempt, _header(response.headers, "Retry-After"))
+                self._wait_before_retry(
+                    attempt,
+                    _header(response.headers, "Retry-After"),
+                    cancel_check=cancel_check,
+                    phase=phase,
+                )
                 continue
             message = _response_error_message(response.body)
             raise CleanupHTTPError(response.status, message)
@@ -686,12 +762,31 @@ class CleanupClient:
             f"{last_network_error}"
         ) from last_network_error
 
-    def _wait_before_retry(self, attempt: int, retry_after: str | None) -> None:
+    def _wait_before_retry(
+        self,
+        attempt: int,
+        retry_after: str | None,
+        *,
+        cancel_check: CancelCheck | None = None,
+        phase: str = "cleanup retry backoff",
+    ) -> None:
         delay = _parse_retry_after(retry_after, self._clock())
         if delay is None:
             delay = self.retry_base_delay * (2**attempt)
-        if delay > 0:
+        if delay <= 0:
+            raise_if_cancelled(cancel_check, phase=phase)
+            return
+        if cancel_check is None:
             self._sleep(delay)
+            return
+
+        remaining = delay
+        while remaining > 0:
+            raise_if_cancelled(cancel_check, phase=phase)
+            interval = min(CANCEL_BACKOFF_POLL_SECONDS, remaining)
+            self._sleep(interval)
+            remaining -= interval
+            raise_if_cancelled(cancel_check, phase=phase)
 
     def _load_checkpoint(
         self,
@@ -701,6 +796,7 @@ class CleanupClient:
         chunk: TextChunk,
         total_chunks: int,
         glossary: GlossarySnapshot,
+        preceding_context: str,
     ) -> tuple[CleanupChunkResult | None, str | None]:
         if not path.exists():
             return None, None
@@ -714,6 +810,8 @@ class CleanupClient:
                 "total_chunks": total_chunks,
                 "endpoint": self.endpoint,
                 "requested_model": self.model,
+                "cleanup_profile": DEFAULT_CLEANUP_PROFILE,
+                "preceding_context_sha256": _sha256_text(preceding_context),
                 "glossary_sha256": glossary.sha256,
                 "glossary_count": glossary.count,
             }
@@ -754,6 +852,7 @@ class CleanupClient:
         *,
         input_sha256: str,
         glossary: GlossarySnapshot,
+        preceding_context: str,
     ) -> None:
         data = {
             "checkpoint_version": CHECKPOINT_VERSION,
@@ -763,6 +862,8 @@ class CleanupClient:
             "total_chunks": result.total_chunks,
             "endpoint": self.endpoint,
             "requested_model": self.model,
+            "cleanup_profile": DEFAULT_CLEANUP_PROFILE,
+            "preceding_context_sha256": _sha256_text(preceding_context),
             "glossary_sha256": glossary.sha256,
             "glossary_count": glossary.count,
             "response": {
@@ -927,6 +1028,8 @@ def _parse_retry_after(value: str | None, now: float) -> float | None:
 
 
 __all__ = [
+    "ACCESS_CLIENT_ID_HEADER",
+    "ACCESS_CLIENT_SECRET_HEADER",
     "CleanupAccessError",
     "CleanupChunkResult",
     "CleanupClient",
@@ -945,5 +1048,6 @@ __all__ = [
     "HttpResponse",
     "TextChunk",
     "chunk_text",
+    "normalize_access_credential",
     "resolve_access_credentials",
 ]

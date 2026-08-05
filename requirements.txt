@@ -1,20 +1,23 @@
+# Pinned application lane for Python 3.12 x64 + GTX 1070 Ti (Pascal).
+# PyTorch is installed first and separately by install_geforce.ps1 from the
+# official cu124 wheel index.
+
 # ── Core transcription ──────────────────────────────────────────────
-openai-whisper>=20250625
-faster-whisper>=1.2.1
+openai-whisper==20250625
+faster-whisper==1.2.1
+ctranslate2==4.8.1
 
 # ── Output ──────────────────────────────────────────────────────────
-python-docx>=1.2.0                      # DOCX output generation
-moviepy>=2.2.1                          # Audio/video loading for extraction
+python-docx==1.2.0                      # DOCX output generation
+moviepy==2.2.1                          # Audio/video loading for extraction
 
 # ── System / progress ──────────────────────────────────────────────
-psutil>=7.2.0
-tqdm>=4.67.0
-keyring>=25.6.0                         # Windows Credential Manager integration
+psutil==7.2.0
+tqdm==4.67.1
+keyring==25.6.0                         # Windows Credential Manager integration
 
 # ── PyTorch: install separately for your GPU ───────────────────────
-# Your GTX 1070 Ti has CUDA 12.4 support via the installed torch 2.6.0+cu124.
-# To reinstall / upgrade:
-#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
-#
-# CPU-only:
-#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# Proven GTX 1070 Ti lane: torch 2.6.0+cu124. Do not install the default
+# PyTorch wheel on Pascal: newer CUDA lanes may omit compute capability 6.1.
+# Exact reinstall command:
+#   python -m pip install torch==2.6.0+cu124 --index-url https://download.pytorch.org/whl/cu124

@@ -26,6 +26,11 @@ import multiprocessing
 import threading
 from typing import Any, cast, Optional, Dict
 
+from console_compat import configure_safe_stdio
+
+
+configure_safe_stdio()
+
 # === WINDOWS CONSOLE SUPPRESSION ===
 # On Windows, subprocess calls to console programs (nvidia-smi, ffmpeg) open
 # a visible CMD window unless CREATE_NO_WINDOW is passed.
@@ -51,6 +56,19 @@ def request_stop():
 def clear_stop():
     """Reset the stop flag (call before starting a new transcription)."""
     _STOP_EVENT.clear()
+
+
+def _join_inference_thread_after_stop(
+    inference_thread: threading.Thread,
+    *,
+    poll_interval: float = 0.25,
+) -> None:
+    """Wait until an interrupted decoder has released its model/GPU resources."""
+
+    interval = max(0.01, float(poll_interval))
+    while inference_thread.is_alive():
+        inference_thread.join(timeout=interval)
+
 
 class _StopRequested(Exception):
     """Raised internally when a stop is requested mid-transcription."""
@@ -719,49 +737,26 @@ def _collapse_repetitions(text: str, max_repeats: int = 10) -> str:
 
 
 def _remove_prompt_artifacts(text: str) -> str:
-    """Remove prompt text artifacts that sometimes appear in transcriptions.
-    
-    Whisper can accidentally transcribe the initial_prompt as actual speech,
-    especially the punctuation primer or instruction phrases.
+    """Conservatively normalize spacing without deleting spoken phrases.
+
+    The former implementation removed exact hard-coded primer sentences.  Once
+    those words plausibly occur in the recording, textual matching cannot tell
+    genuine speech from prompt leakage, so phrase deletion is unsafe.
     """
     try:
-        # 1) Remove the punctuation primer passage (or substrings of it)
-        _PRIMER_FRAGMENTS = [
-            # Full primer (may appear verbatim at start or end)
-            r"Now,?\s*as you know,?\s*we'?re looking at the biological basis or the biological "
-            r"manifestation of spiritual things,?\s*and this is something that requires careful "
-            r"attention because we need to understand how the invisible world of spirit connects "
-            r"with the visible world of matter\.?\s*",
-            # Shorter tail fragments that can leak at segment boundaries
-            r"the invisible world of spirit connects with the visible world of matter\.?\s*",
-            r"we'?re looking at the biological basis or the biological manifestation of spiritual things[,\.\s]*",
-        ]
-        for frag in _PRIMER_FRAGMENTS:
-            text = re.sub(frag, '', text, flags=re.IGNORECASE)
-
-        # 2) Remove old-style instruction prompt phrases
-        artifact_phrases = [
-            r'Maintain capitalization[,\s]*',
-            r'maintain capitalization[,\s]*',
-            r'Maintain capitalization or overuse these terms[,\.\s]*',
-            r'Do not force,?\s*repeat,?\s*or overuse these terms[,\.\s]*',
-            r'otherwise ignore them[,\.\s]*',
-        ]
-        for phrase_pattern in artifact_phrases:
-            text = re.sub(phrase_pattern, '', text, flags=re.IGNORECASE)
-        
-        # Clean up multiple spaces, commas, and periods left behind
-        text = re.sub(r'\s+', ' ', text)
-        text = re.sub(r',\s*,+', ',', text)
-        text = re.sub(r'\.\s*\.+', '.', text)
-        text = re.sub(r'^\s*[,\.]+\s*', '', text)  # Remove leading punctuation
-        
-        # Clean up paragraphs that became empty or whitespace-only
-        lines = text.split('\n')
-        lines = [line.strip() for line in lines if line.strip() and not re.match(r'^[,\.\s]+$', line.strip())]
-        text = '\n'.join(lines)
-        
-        return text.strip()
+        text = text.replace('\r\n', '\n').replace('\r', '\n')
+        normalized_lines = []
+        for line in text.split('\n'):
+            line = re.sub(r'[\t ]+', ' ', line).strip()
+            line = re.sub(r',(?:\s*,)+', ',', line)
+            line = re.sub(r'\.(?:\s+\.)+', '.', line)
+            line = re.sub(r'\s+([,.!?;:])', r'\1', line)
+            if re.fullmatch(r'[,\.\s]+', line):
+                line = ''
+            normalized_lines.append(line)
+        normalized = '\n'.join(normalized_lines)
+        normalized = re.sub(r'\n{3,}', '\n\n', normalized)
+        return normalized.strip()
     except Exception:
         return text
 
@@ -1360,7 +1355,9 @@ def transcribe_with_dataset_optimization(input_path: str, output_dir=None, threa
     if not output_dir:
         output_dir = os.path.dirname(os.path.abspath(input_path))
 
-    duration = get_media_duration(working_input_path)
+    # Coverage QA compares the final timestamp to the original recording, not
+    # the temporary copy which adds 1.2-1.5 seconds of protective padding.
+    duration = get_media_duration(input_path)
     if duration:
         print(f"⏱️  Duration: {format_duration(duration)}")
 
@@ -1461,26 +1458,9 @@ def transcribe_with_dataset_optimization(input_path: str, output_dir=None, threa
         print(f"📚 Loaded {len(awkward_terms)} domain terms from special_words.txt")
         print(f"   Terms: {', '.join(awkward_terms[:10])}{'...' if len(awkward_terms) > 10 else ''}")
     
-    # PUNCTUATION PRIMING: Add a properly punctuated sample to prime Whisper's style
-    # Whisper uses initial_prompt as "previous context" - it mimics the punctuation style it sees
-    # This is NOT an instruction prompt - it's a SAMPLE of well-punctuated text
-    quality_mode_for_prompt = os.environ.get("TRANSCRIBE_QUALITY_MODE", "").strip() in ("1", "true", "True")
-    if quality_mode_for_prompt:
-        # Prime with authentic lecture-style text using LONGER sentences to encourage longer output
-        # Whisper mimics this punctuation pattern - longer samples = longer sentence output
-        # NOTE: Keep this concise - Whisper's initial_prompt is limited to ~224 tokens (~500-600 chars)
-        punctuation_primer = (
-            "Now, as you know, we're looking at the biological basis or the biological manifestation "
-            "of spiritual things, and this is something that requires careful attention because we need "
-            "to understand how the invisible world of spirit connects with the visible world of matter. "
-        )
-        # PUNCTUATION PRIMER FIRST - it's most important for sentence quality
-        # Domain terms come after to help with vocabulary recognition
-        if initial_prompt:
-            initial_prompt = f"{punctuation_primer} {initial_prompt}"
-        else:
-            initial_prompt = punctuation_primer
-        print("🎯 Punctuation priming enabled for quality mode")
+    # Do not seed Whisper with invented lecture prose. It can leak into output
+    # and consumes the limited prompt budget. Use only factual vocabulary and
+    # caller-supplied metadata below.
     
     # Combine with GUI-provided context hint if available (prepended for visibility)
     gui_prompt = os.environ.get("TRANSCRIBE_INITIAL_PROMPT", "").strip()
@@ -1494,8 +1474,8 @@ def transcribe_with_dataset_optimization(input_path: str, output_dir=None, threa
         preview = initial_prompt[:100]
         print(f"🧩 Using domain terms bias (initial_prompt): '{preview}...'")
     
-    # CRITICAL: Truncate to Whisper's effective limit (~600 chars / 224 tokens)
-    # The punctuation primer at the START is most important, domain terms can be truncated
+    # CRITICAL: Truncate to Whisper's effective limit (~600 chars / 224 tokens).
+    # Factual recording metadata is placed first; lower-priority terms may be truncated.
     if initial_prompt and len(initial_prompt) > 600:
         initial_prompt = initial_prompt[:597].rstrip() + "..."
         print(f"⚠️  Initial prompt truncated to 600 chars (Whisper token limit)")
@@ -2516,26 +2496,9 @@ def transcribe_file_simple_auto(
         print(f"📚 Loaded {len(awkward_terms)} domain terms from special_words.txt")
         print(f"   Terms: {', '.join(awkward_terms[:10])}{'...' if len(awkward_terms) > 10 else ''}")
     
-    # PUNCTUATION PRIMING: Add a properly punctuated sample to prime Whisper's style
-    # Whisper uses initial_prompt as "previous context" - it mimics the punctuation style it sees
-    # This is NOT an instruction prompt - it's a SAMPLE of well-punctuated text
-    quality_mode_for_prompt = os.environ.get("TRANSCRIBE_QUALITY_MODE", "").strip() in ("1", "true", "True")
-    if quality_mode_for_prompt:
-        # Prime with authentic lecture-style text using LONGER sentences to encourage longer output
-        # Whisper mimics this punctuation pattern - longer samples = longer sentence output
-        # NOTE: Keep this concise - Whisper's initial_prompt is limited to ~224 tokens (~500-600 chars)
-        punctuation_primer = (
-            "Now, as you know, we're looking at the biological basis or the biological manifestation "
-            "of spiritual things, and this is something that requires careful attention because we need "
-            "to understand how the invisible world of spirit connects with the visible world of matter. "
-        )
-        # PUNCTUATION PRIMER FIRST - it's most important for sentence quality
-        # Domain terms come after to help with vocabulary recognition
-        if initial_prompt:
-            initial_prompt = f"{punctuation_primer} {initial_prompt}"
-        else:
-            initial_prompt = punctuation_primer
-        print("🎯 Punctuation priming enabled for quality mode")
+    # Do not seed Whisper with invented lecture prose. It can leak into output
+    # and consumes the limited prompt budget. Use only factual vocabulary and
+    # caller-supplied metadata below.
     
     # Combine with GUI-provided context hint if available (prepended for visibility)
     gui_prompt = os.environ.get("TRANSCRIBE_INITIAL_PROMPT", "").strip()
@@ -2549,8 +2512,8 @@ def transcribe_file_simple_auto(
         preview = initial_prompt[:100]
         print(f"🧩 Using domain terms bias (initial_prompt): '{preview}...'")
     
-    # CRITICAL: Truncate to Whisper's effective limit (~600 chars / 224 tokens)
-    # The punctuation primer at the START is most important, domain terms can be truncated
+    # CRITICAL: Truncate to Whisper's effective limit (~600 chars / 224 tokens).
+    # Factual recording metadata is placed first; lower-priority terms may be truncated.
     if initial_prompt and len(initial_prompt) > 600:
         initial_prompt = initial_prompt[:597].rstrip() + "..."
         print(f"⚠️  Initial prompt truncated to 600 chars (Whisper token limit)")
@@ -3304,7 +3267,9 @@ def transcribe_file_simple_auto(
         finally:
             transcription_complete = True
 
-    transcribe_thread = threading.Thread(target=_run_transcribe, daemon=True)
+    # This must not be a fire-and-forget daemon.  On cancellation the caller
+    # waits for it to release the cached model/GPU before the GUI is re-enabled.
+    transcribe_thread = threading.Thread(target=_run_transcribe, daemon=False)
     transcribe_thread.start()
 
     start_watch = time.time()
@@ -3317,10 +3282,15 @@ def transcribe_file_simple_auto(
     status_interval = 10  # Update status every 10 seconds
 
     while not transcription_complete:
-        # Check for external stop request so we don't block forever
+        # A decode backend may only notice cancellation between generated
+        # segments (and native Whisper may finish its current decode first).
+        # Never return while that worker can still own the shared cached model.
         if _STOP_EVENT.is_set():
-            print("\n\u26d4 Stop requested — abandoning transcription wait")
-            # The daemon thread will die when the function returns
+            print(
+                "\n\u26d4 Stop requested — waiting for the active inference "
+                "worker to release the model/GPU"
+            )
+            _join_inference_thread_after_stop(transcribe_thread)
             raise _StopRequested("Stop requested by user")
         time.sleep(2)
         elapsed = time.time() - start_watch
@@ -3369,7 +3339,15 @@ def transcribe_file_simple_auto(
                 except:
                     print(f"⏳ Transcribing: {time_str}")
 
+    # The worker may have completed between the loop condition and the stop
+    # check.  Honour the user's request even in that race, after it has exited.
+    if _STOP_EVENT.is_set():
+        _join_inference_thread_after_stop(transcribe_thread)
+        raise _StopRequested("Stop requested by user")
+
     # No timeout fallback - transcription completes naturally
+    if isinstance(transcription_error, _StopRequested):
+        raise transcription_error
     if transcription_error:
         raise Exception(f"Transcription failed: {transcription_error}")
 
@@ -3583,6 +3561,7 @@ def transcribe_file_simple_auto(
         'device': device_name,
         'time_taken': format_duration(elapsed),
         'elapsed_seconds': elapsed,
+        'audio_duration_seconds': float(duration) if duration else None,
         'preprocessing': "Vintage tape preset" if preprocessing_used else "None",
         'quality': quality_stats,
     }

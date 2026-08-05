@@ -1,6 +1,6 @@
 # Unified archival transcription pipeline
 
-Status: bridge implementation complete; live one-file canary pending a tested Python environment and a dedicated Cloudflare Access service token.
+Status: bridge implementation complete. The pinned Python/CUDA environment and a real 81.7-second tape canary have passed on the GTX 1070 Ti using Faster-Whisper tiny with CUDA/INT8. Review a representative large-v3 canary before the unrestricted archive run.
 
 ## What is now wired together
 
@@ -17,7 +17,7 @@ recording
   -> final DOCX + manifest + status report
 ```
 
-The source archive and its existing DOCX files are never overwritten. By default, generated artifacts go into a separate sibling folder named `<archive> - Polished`.
+Generated artifacts always go into a separate output folder; intermediate work never overwrites the source archive. A folder batch defaults to the sibling `<archive> - Polished` directory. The normal one-click launcher additionally requests a guarded post-run publication batch, described below, which can replace source-adjacent legacy DOCX files only after complete verification and backup.
 
 Every recording receives a collision-proof directory containing:
 
@@ -50,10 +50,43 @@ Use a dedicated Cloudflare Access service token whose policy is limited to the t
 
 For an unattended process, `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` may instead be supplied together in that process's environment; they override the credential store. Use `configure_cleanup_credentials.py --clear` to remove the saved pair.
 
+The desktop GUI is launched with `run.bat`. Its **Polished archive pipeline**
+switch is on by default and shows the fixed route: local Faster-Whisper →
+protected GLM-4.7-Flash cleanup → polished Word. It uses the same manifests,
+checksums, cleanup credentials, separate polished output root, verification,
+backup, and guarded source-DOCX publisher as the command-line runner.
+Folder runs use the stable sibling `<archive> - Polished` output. A GUI
+single-file canary automatically uses its own dedicated directory under the
+sibling `<source-folder> - Polished Single Files` tree, keeping generated work
+outside the guarded source scope and making a restart unambiguous.
+
+The three existing-output policies select recordings by the source-adjacent
+DOCX: missing only, all, or missing plus documents whose local modification
+time is before a strict `YYYY-MM-DD` date. Invalid dates stop before audio is
+opened. This selection is independent of the advanced **Reprocess from audio**
+checkbox: with that checkbox off, an interrupted run reuses every valid raw,
+cleanup, and render checkpoint. The GUI Stop button requests cancellation from
+both the pipeline and active Whisper engine. Completed recordings, completed
+stages, and completed GLM chunks resume; Whisper does not checkpoint partial
+decoding within one recording, so the current recording restarts from its
+beginning if it is stopped during Whisper. The current operation or protected
+cleanup chunk may take a little time to finish, after which publication is
+suppressed and the same folder can be run again to resume.
+Closing the GUI while work is active uses the same safe-stop path and keeps the
+window alive until the worker and any atomic Word publication transaction have
+finished; it never abandons the publisher merely because the close button was
+pressed.
+
+Before transcription starts, a publication run also groups the already
+selected recordings by their eventual source-adjacent `.docx` target. If two
+formats or files would map to the same Word filename, the run stops immediately
+and lists every conflicting source path. The tool never guesses which recording
+is authoritative; select one source from each reported group before retrying.
+
 With no arguments, the runner opens a folder chooser. For a safe first canary:
 
 ```powershell
-./run_full_pipeline.bat "C:\path\to\sample recordings" --limit 1
+./run_full_pipeline.bat "C:\path\to\sample recordings" --limit 1 --no-publish-source-docx
 ```
 
 Useful controls:
@@ -65,7 +98,34 @@ Useful controls:
 - `--render-only` rebuilds DOCX from existing cleaned text.
 - `--retry-review` retries only work which previously reached `needs_review`.
 - `--force` deliberately reruns all selected stages.
+- `--no-publish-source-docx` is a launcher-only opt-out which leaves final DOCX files solely in the polished output tree.
 - Ctrl+C stops between files; completed checkpoints remain reusable.
+
+The batch launcher enables UTF-8 console/Python I/O, selects the doctor mode which matches the requested work, and requires CUDA for any run that transcribes audio. Cleanup-only and render-only runs do not require the GPU; dry runs use the inventory-only doctor mode.
+
+### Safe source-adjacent publication
+
+The launcher adds `--publish-source-docx` by default. Publication is one post-run transaction, never a per-recording side effect. For the normal archive-folder workflow, each target mirrors the audio's input-relative path and changes its extension to `.docx`.
+
+Single-file publication is intentionally supported for a reviewed canary. Its guarded source scope is the input file's parent directory, so always pass a new, dedicated `--output` directory which contains only that canary's generated manifest and artifacts. Do not reuse a shared `Polished Transcripts` directory for this purpose. Folder batches remain the normal archive workflow.
+
+```powershell
+.\run_full_pipeline.bat "C:\path\to\recordings\one-tape.wav" --output "C:\path\to\fresh-canary-output"
+```
+
+The publisher proceeds only when every discovered job is newly verified or an already-verified skip and every manifest reports passed QA. It refuses publication after `needs_review`, failure, cancellation, `--dry-run`, or `--limit` runs. Use `--no-publish-source-docx` for limited trials; omit it only when deliberately exercising the guarded single-file publication canary above.
+
+Each published document ends with a single restrained provenance note in this form: `Processed by speech-to-text from a digitised tape recording originally recorded in person by MW on 22 January 1985.` Old cleanup timestamps, model/device details, and earlier generated provenance text are removed during rendering rather than appearing in the publication.
+
+Transcript completeness is a hard verification and publication gate. There must be at least one text-bearing STT segment with a valid end timestamp, the source audio duration must be known, and the final segment must reach the end within the greater of 2 seconds or 5% of the recording duration, capped at 120 seconds. This is the documented trailing-silence tolerance; a longer gap is sent to review instead of being assumed silent. Publication re-reads the hashed segment artifact and repeats this check. It also requires both recorded glossary-grounding minimum and maximum counts to be integers at least as large as the pinned glossary count.
+
+Before changing any existing target, it copies and verifies the original in a new sibling tree outside both the archive and polished output:
+
+```text
+<input-name> - Legacy DOCX Backup - <UTC run-id>/
+```
+
+Replacements are staged and committed atomically as one guarded batch. A mid-commit failure rolls back changed targets; verified backups are retained after success or failure. New source-adjacent DOCX targets have no prior file to back up. The latest publication or suppression result is recorded as `source-docx-publication-report.json` in the polished output root.
 
 The service token is never written to settings, logs, manifests, or checkpoint files. The client refuses insecure non-local HTTP endpoints and Access login redirects/HTML, and validates access once before creating per-recording work.
 
@@ -77,7 +137,7 @@ The read-only archive inventory on 5 August 2026 found:
 - 2,260 recordings recognised by the old extension list.
 - 6 AIFF recordings that the old recursive runner silently omitted.
 - 9 locations where two audio formats have the same stem and therefore target the same legacy DOCX path.
-- 2,259 existing DOCX files, which are intentionally preserved.
+- 2,259 existing DOCX files. Artifact generation preserves them; launcher publication replaces only fully verified targets after retaining originals in the timestamped backup tree.
 
 The dry-run completed against the real archive and found all 2,278 recordings without modifying the archive.
 
@@ -145,8 +205,8 @@ Queues are optional later for burst backpressure. Queue messages should contain 
 
 That migration requires new Cloudflare resources and an explicit publish/approval policy, so it should be a separate controlled deployment rather than an implicit side effect of this local-tool change.
 
-## Known environment gate on this machine
+## Validated environment on this machine
 
-The clone currently resolves to Python 3.13.3 with no local `.venv` and no installed PyTorch, Faster-Whisper, OpenAI Whisper, python-docx, or psutil packages. The bundled FFmpeg works and the NVIDIA GTX 1070 Ti is visible.
+The supported lane is Python 3.12 x64, PyTorch 2.6.0+cu124, Faster-Whisper 1.2.1, and CTranslate2 4.8.1. The doctor has verified CUDA 12.4, the GTX 1070 Ti's compute capability 6.1, `sm_61` wheel support, pinned cuBLAS/cuDNN loading, one CTranslate2 CUDA device, and Pascal-safe INT8/INT8-Float32. `nvidia-smi` may display CUDA 13.0 because that is the driver's maximum API capability; it is not the runtime selected by this environment.
 
-Use Python 3.11 or 3.12 for the first reproducible environment. The current Faster-Whisper documentation requires CUDA 12 cuBLAS and cuDNN 9 for its newest CTranslate2 releases; the CUDA version displayed by `nvidia-smi` is a driver capability, not proof that the needed runtime DLLs are installed. Do not begin the archive-wide job until `pipeline_doctor.py` passes and a one-file canary has been reviewed.
+Run the reviewed local `install_geforce.ps1`. It first tries `py -3.12`, then `%LOCALAPPDATA%\Programs\Python\Python312\python.exe`, and creates `.venv` with whichever exact Python 3.12 x64 interpreter passes its probe. Do not begin the archive-wide job until `pipeline_doctor.py --mode full --require-gpu` passes and a representative real-tape large-v3 canary has been reviewed.

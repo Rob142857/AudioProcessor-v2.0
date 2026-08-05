@@ -16,6 +16,7 @@ __pycache__/
 !README.md
 !awkward_words.txt
 !awkward_words.md
+!special_words.txt
 
 # Audio / Video (generated or large files)
 *.mp3
@@ -58,3 +59,6 @@ env_report.json
 .transcribe_settings.json
 .transcribe_settings.json.tmp
 .transcribe_settings.json.invalid-backup
+
+# Local Cloudflare tooling state (may contain account metadata)
+.wrangler/

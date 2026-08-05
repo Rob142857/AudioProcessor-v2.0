@@ -10,12 +10,19 @@ import urllib.error
 from unittest.mock import patch
 
 from cleanup_client import (
+    ACCESS_CLIENT_ID_HEADER,
+    ACCESS_CLIENT_SECRET_HEADER,
     CleanupAccessError,
     CleanupClient,
     CleanupConfigurationError,
+    CleanupProtocolError,
+    CHECKPOINT_VERSION,
+    DEFAULT_CLEANUP_PROFILE,
     HttpResponse,
     chunk_text,
+    normalize_access_credential,
 )
+from pipeline_control import PipelineCancelledError
 
 
 def response(status: int, body: str, **headers: str) -> HttpResponse:
@@ -31,6 +38,7 @@ def cleanup_response(
             {
                 "corrected": corrected,
                 "model": model,
+                "cleanup_profile": DEFAULT_CLEANUP_PROFILE,
                 "quality": {
                     "status": status,
                     "reasons": [] if status == "passed" else ["manual check"],
@@ -70,7 +78,38 @@ class ScriptedTransport:
         return item
 
 
+class CredentialInputTests(unittest.TestCase):
+    def test_accepts_cloudflare_copied_header_lines(self):
+        self.assertEqual(
+            "example.access",
+            normalize_access_credential(
+                "CF-Access-Client-Id: example.access", ACCESS_CLIENT_ID_HEADER
+            ),
+        )
+        self.assertEqual(
+            "secret-value",
+            normalize_access_credential(
+                "cf-access-client-secret: secret-value",
+                ACCESS_CLIENT_SECRET_HEADER,
+            ),
+        )
+
+    def test_preserves_raw_values(self):
+        self.assertEqual(
+            "example.access",
+            normalize_access_credential("  example.access  ", ACCESS_CLIENT_ID_HEADER),
+        )
+
+
 class ChunkingTests(unittest.TestCase):
+    def test_short_text_remains_one_chunk(self):
+        text = "First sentence. Second sentence. Final sentence."
+
+        chunks = chunk_text(text)
+
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0].text, text)
+
     def test_chunking_is_lossless_and_respects_both_limits(self):
         paragraphs = []
         for paragraph in range(24):
@@ -155,6 +194,8 @@ class CleanupClientTests(unittest.TestCase):
             first_payload["model"], "@cf/zai-org/glm-4.7-flash"
         )
         self.assertEqual(second_payload["model"], first_payload["model"])
+        self.assertEqual(first_payload["cleanupProfile"], DEFAULT_CLEANUP_PROFILE)
+        self.assertEqual(second_payload["cleanupProfile"], DEFAULT_CLEANUP_PROFILE)
         self.assertNotIn("glossary", first_payload)
         self.assertEqual(first_payload["precedingContext"], "")
         self.assertEqual(second_payload["precedingContext"], "One two three.")
@@ -180,6 +221,18 @@ class CleanupClientTests(unittest.TestCase):
             )
             self.assertNotIn("client-id", checkpoint_text)
             self.assertNotIn("client-secret", checkpoint_text)
+            checkpoint_records = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in sorted(input_directory.glob("chunk-*.json"))
+            ]
+            self.assertEqual(CHECKPOINT_VERSION, 4)
+            self.assertTrue(
+                all(
+                    record["checkpoint_version"] == CHECKPOINT_VERSION
+                    and len(record["preceding_context_sha256"]) == 64
+                    for record in checkpoint_records
+                )
+            )
 
             second_transport = ScriptedTransport([terms])
             second = self.make_client(second_transport, target_words=3).cleanup_text(
@@ -204,6 +257,171 @@ class CleanupClientTests(unittest.TestCase):
             self.assertEqual(len(forced_transport.calls), 3)
             self.assertTrue(all(not chunk.from_checkpoint for chunk in forced.chunks))
             self.assertNotEqual(forced.text, first.text)
+
+    def test_recomputed_upstream_context_invalidates_downstream_checkpoints(self):
+        terms = response(200, "Gurdjieff\nFourth Way\n")
+        text = "one two three four five six"
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint_dir = Path(temporary)
+            initial_transport = ScriptedTransport(
+                [
+                    terms,
+                    cleanup_response("One two "),
+                    cleanup_response("three four "),
+                    cleanup_response("five six"),
+                ]
+            )
+            first = self.make_client(
+                initial_transport, target_words=2
+            ).cleanup_text(text, checkpoint_dir)
+            run_dir = checkpoint_dir / first.input_sha256
+            checkpoints = sorted(run_dir.glob("chunk-*.json"))
+            self.assertEqual(len(checkpoints), 3)
+
+            # Force only chunk 1 to be recomputed. Its changed correction must
+            # invalidate every downstream checkpoint whose request context was
+            # derived from the old upstream output.
+            checkpoints[0].unlink()
+            resumed_transport = ScriptedTransport(
+                [
+                    terms,
+                    cleanup_response("Changed one two "),
+                    cleanup_response("changed three four "),
+                    cleanup_response("changed five six"),
+                ]
+            )
+            resumed = self.make_client(
+                resumed_transport, target_words=2
+            ).cleanup_text(text, checkpoint_dir)
+
+            self.assertEqual(len(resumed_transport.calls), 4)
+            self.assertTrue(all(not chunk.from_checkpoint for chunk in resumed.chunks))
+            self.assertTrue(
+                any("chunk-00002" in warning for warning in resumed.warnings)
+            )
+            self.assertTrue(
+                any("chunk-00003" in warning for warning in resumed.warnings)
+            )
+
+    def test_cancellation_after_remote_chunk_stops_later_calls_and_preserves_checkpoint(self):
+        text = "one two three four five six"
+        cancelled = {"value": False}
+        scripted = ScriptedTransport(
+            [
+                response(200, "Gurdjieff\nFourth Way\n"),
+                cleanup_response("One two "),
+                cleanup_response("three four "),
+                cleanup_response("five six"),
+            ]
+        )
+
+        def cancel_after_first_post(method, url, headers, body, timeout):
+            reply = scripted(method, url, headers, body, timeout)
+            if method == "POST":
+                cancelled["value"] = True
+            return reply
+
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint_dir = Path(temporary)
+            client = self.make_client(
+                cancel_after_first_post,
+                target_words=2,
+            )
+
+            with self.assertRaises(PipelineCancelledError):
+                client.cleanup_text(
+                    text,
+                    checkpoint_dir,
+                    cancel_check=lambda: cancelled["value"],
+                )
+
+            self.assertEqual(len(scripted.calls), 2)  # glossary + first POST only
+            run_dir = checkpoint_dir / hashlib.sha256(text.encode("utf-8")).hexdigest()
+            checkpoints = sorted(run_dir.glob("chunk-*.json"))
+            self.assertEqual(len(checkpoints), 1)
+            saved = json.loads(checkpoints[0].read_text(encoding="utf-8"))
+            self.assertEqual(saved["chunk_index"], 0)
+            self.assertEqual(saved["response"]["corrected"], "One two ")
+
+            resume_transport = ScriptedTransport(
+                [
+                    response(200, "Gurdjieff\nFourth Way\n"),
+                    cleanup_response("three four "),
+                    cleanup_response("five six"),
+                ]
+            )
+            resumed = self.make_client(
+                resume_transport,
+                target_words=2,
+            ).cleanup_text(text, checkpoint_dir)
+
+            self.assertEqual(len(resume_transport.calls), 3)
+            self.assertTrue(resumed.chunks[0].from_checkpoint)
+            self.assertFalse(resumed.chunks[1].from_checkpoint)
+            self.assertFalse(resumed.chunks[2].from_checkpoint)
+            self.assertEqual(resumed.text, "One two three four five six")
+
+    def test_glossary_retry_backoff_is_cooperatively_interruptible(self):
+        cancelled = {"value": False}
+        sleeps = []
+        transport = ScriptedTransport(
+            [
+                urllib.error.URLError("temporary glossary failure"),
+                response(200, "Gurdjieff\n"),
+            ]
+        )
+
+        def stop_during_backoff(delay):
+            sleeps.append(delay)
+            cancelled["value"] = True
+
+        client = CleanupClient(
+            client_id="client-id",
+            client_secret="client-secret",
+            endpoint="https://example.test/api/tooling/cleanup-chunk",
+            transport=transport,
+            sleep=stop_during_backoff,
+            retry_base_delay=30.0,
+        )
+
+        with self.assertRaises(PipelineCancelledError):
+            client.ensure_glossary(cancel_check=lambda: cancelled["value"])
+
+        self.assertEqual(len(transport.calls), 1)
+        self.assertEqual(sleeps, [0.1])
+
+    def test_cleanup_retry_backoff_is_cooperatively_interruptible(self):
+        cancelled = {"value": False}
+        sleeps = []
+        transport = ScriptedTransport(
+            [
+                response(200, "Gurdjieff\n"),
+                urllib.error.URLError("temporary cleanup failure"),
+                cleanup_response("Cleaned."),
+            ]
+        )
+
+        def stop_during_backoff(delay):
+            sleeps.append(delay)
+            cancelled["value"] = True
+
+        client = CleanupClient(
+            client_id="client-id",
+            client_secret="client-secret",
+            endpoint="https://example.test/api/tooling/cleanup-chunk",
+            transport=transport,
+            sleep=stop_during_backoff,
+            retry_base_delay=30.0,
+        )
+
+        with self.assertRaises(PipelineCancelledError):
+            client.cleanup_text(
+                "cleaned",
+                cancel_check=lambda: cancelled["value"],
+            )
+
+        self.assertEqual(len(transport.calls), 2)
+        self.assertEqual(sleeps, [0.1])
 
     def test_retries_network_429_and_5xx_and_honours_retry_after(self):
         sleeps = []
@@ -275,6 +493,21 @@ class CleanupClientTests(unittest.TestCase):
         self.assertIsNone(result.glossary_sha256)
         self.assertEqual(result.glossary_count, 0)
         self.assertIn("glossary pinning was explicitly disabled", result.warnings)
+
+    def test_rejects_unpinned_server_cleanup_profile(self):
+        bad = cleanup_response("Cleaned.")
+        decoded = json.loads(bad.body.decode("utf-8"))
+        decoded["cleanup_profile"] = "different-profile"
+        transport = ScriptedTransport(
+            [
+                response(200, "Gurdjieff\n"),
+                response(200, json.dumps(decoded), **{"Content-Type": "application/json"}),
+            ]
+        )
+        client = self.make_client(transport)
+
+        with self.assertRaisesRegex(CleanupProtocolError, "pinned profile"):
+            client.cleanup_text("cleaned")
 
     def test_from_environment_requires_both_access_credentials(self):
         with patch.dict(os.environ, {}, clear=True), patch(

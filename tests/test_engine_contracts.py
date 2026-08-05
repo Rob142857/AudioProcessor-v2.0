@@ -3,8 +3,10 @@ import importlib.util
 import json
 import os
 import queue
+import re
 import sys
 import tempfile
+import threading
 import types
 import unittest
 import warnings
@@ -100,6 +102,227 @@ class GuiEngineContractTests(unittest.TestCase):
             found = gui_transcribe._collect_files(tmp, False, "skip", "", queue.Queue())
         self.assertEqual(3, len(found))
 
+    def test_replace_before_date_is_strict_and_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "lecture.wav"
+            source.write_bytes(b"")
+            with self.assertRaisesRegex(ValueError, "YYYY-MM-DD"):
+                gui_transcribe._should_process(
+                    str(source), "before", "not-a-date"
+                )
+            with self.assertRaisesRegex(ValueError, "selection is invalid"):
+                gui_transcribe._should_process(str(source), "surprise", "")
+
+    def test_project_settings_canonicalize_paths_and_preserve_unknown_keys(self):
+        previous_path = gui_transcribe.SETTINGS_PATH
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp) / "Recordings"
+                root.mkdir()
+                settings_path = Path(tmp) / "settings.json"
+                gui_transcribe.SETTINGS_PATH = str(settings_path)
+                legacy_key = str(root).replace("\\", "/")
+                settings_path.write_text(
+                    json.dumps(
+                        {
+                            "projects": {
+                                legacy_key: {
+                                    "whisper_model": "faster-whisper-medium",
+                                    "future_setting": "preserve-me",
+                                }
+                            }
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                loaded = gui_transcribe._load_project(str(root))
+                self.assertEqual("preserve-me", loaded["future_setting"])
+                gui_transcribe._save_project(
+                    str(root), {"polished_pipeline": 1, "recursive": 1}
+                )
+
+                saved = json.loads(settings_path.read_text(encoding="utf-8"))
+                key = gui_transcribe._project_key(str(root))
+                self.assertEqual([key], list(saved["projects"]))
+                self.assertEqual(
+                    "preserve-me", saved["projects"][key]["future_setting"]
+                )
+                self.assertEqual(1, saved["projects"][key]["polished_pipeline"])
+        finally:
+            gui_transcribe.SETTINGS_PATH = previous_path
+
+    def test_polished_gui_maps_settings_to_pipeline_config(self):
+        q = queue.Queue()
+        captured = {}
+
+        class FakeConfig:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        def fake_execute(config, *, cancel_check):
+            captured["cancelled"] = cancel_check()
+            return 3
+
+        fake_archive = types.SimpleNamespace(
+            PipelineConfig=FakeConfig,
+            default_output_root=lambda source: source.parent / "Polished",
+            execute_pipeline=fake_execute,
+        )
+        settings = {
+            "whisper_model": "faster-whisper-large-v3",
+            "recursive": 1,
+            "replace_mode": "before",
+            "replace_before_date": "2026-04-06",
+            "force_reprocess": 0,
+        }
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            sys.modules, {"archive_pipeline": fake_archive}
+        ):
+            source = Path(tmp) / "Recordings"
+            source.mkdir()
+            self.assertEqual(
+                3,
+                gui_transcribe._run_polished_pipeline(
+                    str(source), settings, q
+                ),
+            )
+
+        self.assertEqual("faster-whisper-large-v3", captured["stt_model"])
+        self.assertTrue(captured["publish_source_docx"])
+        self.assertTrue(captured["recursive"])
+        self.assertEqual("before", captured["existing_docx_mode"])
+        self.assertEqual("2026-04-06", captured["replace_before_date"])
+        self.assertFalse(captured["force"])
+        self.assertFalse(captured["cancelled"])
+
+    def test_polished_single_file_uses_a_dedicated_disjoint_output(self):
+        captured = {}
+
+        class FakeConfig:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        fake_archive = types.SimpleNamespace(
+            PipelineConfig=FakeConfig,
+            default_output_root=mock.Mock(side_effect=AssertionError("folder only")),
+            execute_pipeline=lambda _config, *, cancel_check: 0,
+        )
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            sys.modules, {"archive_pipeline": fake_archive}
+        ):
+            archive = Path(tmp) / "1985 MW"
+            archive.mkdir()
+            source = archive / "0129 Visualization.mp3"
+            source.write_bytes(b"")
+            result = gui_transcribe._run_polished_pipeline(
+                str(source),
+                {
+                    "replace_mode": "all",
+                    "whisper_model": "faster-whisper-large-v3",
+                },
+                queue.Queue(),
+            )
+
+            self.assertEqual(0, result)
+            output_root = captured["output_root"]
+            self.assertEqual("0129 Visualization__mp3", output_root.name)
+            self.assertEqual(
+                "1985 MW - Polished Single Files", output_root.parent.name
+            )
+            self.assertNotEqual(archive.resolve(), output_root.parent.resolve())
+
+    def test_gui_source_declares_default_polished_route_without_credentials(self):
+        gui_source = (REPO_ROOT / "gui_transcribe.py").read_text(encoding="utf-8")
+        component_source = (REPO_ROOT / "gui_components.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('ps.get("polished_pipeline", 1)', component_source)
+        self.assertIn("protected GLM-4.7-Flash cleanup", component_source)
+        self.assertIn(
+            "Completed recordings, stages, and GLM chunks resume", component_source
+        )
+        self.assertIn("restarts from its beginning", component_source)
+        self.assertIn("only after the selected run verifies", component_source)
+        self.assertIn("force_reprocess", component_source)
+        self.assertNotIn("CF_ACCESS_CLIENT_SECRET", component_source)
+        self.assertNotIn("CF_ACCESS_CLIENT_SECRET", gui_source)
+        self.assertIn('root.protocol("WM_DELETE_WINDOW", on_window_close)', gui_source)
+
+    def test_window_close_waits_for_an_active_worker(self):
+        state = {"active": True, "close_pending": False}
+        confirm = mock.Mock(return_value=True)
+        request_stop = mock.Mock()
+        destroy = mock.Mock()
+
+        outcome = gui_transcribe._handle_window_close(
+            state,
+            confirm_close=confirm,
+            request_stop=request_stop,
+            destroy=destroy,
+        )
+
+        self.assertEqual("stopping", outcome)
+        self.assertTrue(state["close_pending"])
+        request_stop.assert_called_once_with()
+        destroy.assert_not_called()
+        self.assertEqual(
+            "waiting",
+            gui_transcribe._handle_window_close(
+                state,
+                confirm_close=confirm,
+                request_stop=request_stop,
+                destroy=destroy,
+            ),
+        )
+        request_stop.assert_called_once_with()
+
+    def test_window_close_is_immediate_only_while_idle(self):
+        state = {"active": False, "close_pending": False}
+        confirm = mock.Mock(return_value=True)
+        request_stop = mock.Mock()
+        destroy = mock.Mock()
+
+        outcome = gui_transcribe._handle_window_close(
+            state,
+            confirm_close=confirm,
+            request_stop=request_stop,
+            destroy=destroy,
+        )
+
+        self.assertEqual("closed", outcome)
+        destroy.assert_called_once_with()
+        confirm.assert_not_called()
+        request_stop.assert_not_called()
+
+    def test_window_close_handles_worker_finishing_during_confirmation(self):
+        state = {"active": True, "close_pending": False}
+
+        def confirm():
+            state["active"] = False
+            return True
+
+        request_stop = mock.Mock()
+        destroy = mock.Mock()
+        outcome = gui_transcribe._handle_window_close(
+            state,
+            confirm_close=confirm,
+            request_stop=request_stop,
+            destroy=destroy,
+        )
+
+        self.assertEqual("closed", outcome)
+        destroy.assert_called_once_with()
+        request_stop.assert_not_called()
+
+    def test_gui_launcher_uses_the_pinned_environment(self):
+        launcher = (REPO_ROOT / "run.bat").read_text(encoding="utf-8")
+        self.assertIn('.venv\\Scripts\\python.exe', launcher)
+        self.assertIn("install_geforce.ps1", launcher)
+        self.assertIn("gui_transcribe.py --gui", launcher)
+        self.assertNotIn("Activate.bat", launcher)
+        self.assertNotIn("install.ps1", launcher)
+
 
 class TranscriptionApiShapeTests(unittest.TestCase):
     @classmethod
@@ -114,6 +337,18 @@ class TranscriptionApiShapeTests(unittest.TestCase):
             if isinstance(node, ast.FunctionDef)
             and node.name == "transcribe_file_simple_auto"
         )
+
+    def load_top_level_function(self, name):
+        function = next(
+            node
+            for node in self.tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == name
+        )
+        module = ast.Module(body=[function], type_ignores=[])
+        ast.fix_missing_locations(module)
+        namespace = {"re": re, "threading": threading}
+        exec(compile(module, "transcribe_optimised.py", "exec"), namespace)
+        return namespace[name]
 
     def test_structured_return_options_are_keyword_only(self):
         names = [arg.arg for arg in self.function.args.kwonlyargs]
@@ -144,34 +379,127 @@ class TranscriptionApiShapeTests(unittest.TestCase):
         self.assertIn('TRANSCRIBE_ARTIFACT_CLEANUP", "0"', self.source)
         self.assertIn("use_australian_spelling=False", self.source)
 
+    def test_obsolete_fake_primer_is_neither_seeded_nor_deleted(self):
+        primer = (
+            "Now, as you know, we're looking at the biological basis or the "
+            "biological manifestation of spiritual things, and this is something "
+            "that requires careful attention because we need to understand how "
+            "the invisible world of spirit connects with the visible world of matter."
+        )
+        normalise = self.load_top_level_function("_remove_prompt_artifacts")
+
+        self.assertNotIn("_PRIMER_FRAGMENTS", self.source)
+        self.assertNotIn("punctuation_primer", self.source)
+        self.assertEqual(normalise(primer), primer)
+
+    def test_prompt_artifact_normalizer_keeps_generic_safe_cleanup(self):
+        normalise = self.load_top_level_function("_remove_prompt_artifacts")
+
+        self.assertEqual(
+            normalise(
+                "  First   sentence, , with spaced . . punctuation.\r\n\r\n\r\n"
+                " Second\tline.  "
+            ),
+            "First sentence, with spaced. punctuation.\n\nSecond line.",
+        )
+
+    def test_special_words_text_is_allow_listed_for_version_control(self):
+        ignore_rules = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
+        self.assertIn("!special_words.txt", ignore_rules.splitlines())
+
+    def test_stop_waits_until_the_inference_thread_has_exited(self):
+        join_after_stop = self.load_top_level_function(
+            "_join_inference_thread_after_stop"
+        )
+        release = threading.Event()
+        joined = threading.Event()
+        inference = threading.Thread(target=release.wait)
+        inference.start()
+
+        waiter = threading.Thread(
+            target=lambda: (
+                join_after_stop(inference, poll_interval=0.01),
+                joined.set(),
+            )
+        )
+        waiter.start()
+        self.assertFalse(joined.wait(0.03))
+        release.set()
+        self.assertTrue(joined.wait(1.0))
+        waiter.join(timeout=1.0)
+        inference.join(timeout=1.0)
+        self.assertFalse(inference.is_alive())
+        self.assertIn("daemon=False", self.source)
+
 
 class _FakeFont:
-    size = None
-    italic = False
-    color = types.SimpleNamespace(rgb=None)
+    def __init__(self):
+        self.name = None
+        self.size = None
+        self.italic = False
+        self.color = types.SimpleNamespace(rgb=None)
 
 
 class _FakeRun:
-    bold = False
-    font = _FakeFont()
+    def __init__(self, text=""):
+        self.text = text
+        self.bold = False
+        self.font = _FakeFont()
+
+
+class _FakeParagraphFormat:
+    def __init__(self):
+        self.alignment = None
+        self.space_before = None
+        self.space_after = None
+        self.line_spacing = None
+        self.keep_with_next = False
 
 
 class _FakeParagraph:
-    def __init__(self):
+    def __init__(self, text=""):
+        self.text = text
         self.alignment = None
-        self.runs = [_FakeRun()]
+        self.paragraph_format = _FakeParagraphFormat()
+        self.runs = [_FakeRun(text)] if text else []
+
+    def add_run(self, text):
+        self.text += text
+        run = _FakeRun(text)
+        self.runs.append(run)
+        return run
+
+
+class _FakeStyle:
+    def __init__(self):
+        self.font = _FakeFont()
+        self.paragraph_format = _FakeParagraphFormat()
+
+
+class _FakeSection:
+    pass
 
 
 class _FakeDocument:
     def __init__(self, path=None):
+        self.sections = [_FakeSection()]
+        self.styles = {
+            name: _FakeStyle()
+            for name in ("Normal", "Heading 1", "Heading 2", "Heading 3")
+        }
+        self.core_properties = types.SimpleNamespace(
+            title=None,
+            author=None,
+            subject=None,
+        )
         if path is not None and Path(path).read_bytes() != b"valid-docx":
             raise ValueError("invalid DOCX")
 
     def add_heading(self, *args, **kwargs):
         return _FakeParagraph()
 
-    def add_paragraph(self, *args, **kwargs):
-        return _FakeParagraph()
+    def add_paragraph(self, text="", *args, **kwargs):
+        return _FakeParagraph(text)
 
     def save(self, path):
         Path(path).write_bytes(b"valid-docx")
