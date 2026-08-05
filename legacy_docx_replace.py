@@ -39,7 +39,11 @@ class LegacyDocxReplacement:
 
     @property
     def operation(self) -> str:
-        return "replace" if self.original_sha256 is not None else "create"
+        if self.original_sha256 is None:
+            return "create"
+        if self.original_sha256 == self.generated_sha256:
+            return "noop"
+        return "replace"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -256,6 +260,165 @@ def _require_publishable_stt(
             )
 
 
+def _resolve_hashed_artifact(
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    generated_root: Path,
+    *,
+    artifact_key: str,
+    expected_hash: Any,
+) -> Path:
+    artifacts = manifest.get("artifacts")
+    value = artifacts.get(artifact_key) if isinstance(artifacts, dict) else None
+    if not isinstance(value, str) or not value.strip():
+        raise ReplacementError(
+            f"manifest artifact {artifact_key!r} is missing: {manifest_path}"
+        )
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = manifest_path.parent / candidate
+    if candidate.is_symlink():
+        raise ReplacementError(f"artifact is a symlink: {candidate}")
+    path = candidate.resolve()
+    if not _is_within(path, generated_root) or not path.is_file():
+        raise ReplacementError(
+            f"artifact {artifact_key!r} is missing or escapes output root: {path}"
+        )
+    if not isinstance(expected_hash, str) or not re.fullmatch(
+        r"[0-9a-fA-F]{64}", expected_hash
+    ):
+        raise ReplacementError(
+            f"manifest artifact {artifact_key!r} SHA-256 is invalid: {manifest_path}"
+        )
+    if _sha256_file(path).casefold() != expected_hash.casefold():
+        raise ReplacementError(f"artifact hash mismatch: {path}")
+    return path
+
+
+def _require_publishable_import(
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    generated_root: Path,
+) -> dict[str, Any]:
+    """Recheck the imported DOCX -> raw -> clean -> render hash chain."""
+
+    raw_input = manifest.get("raw_input")
+    if not isinstance(raw_input, dict) or raw_input.get("kind") != "source_docx":
+        raise ReplacementError(f"manifest imported-DOCX record is missing: {manifest_path}")
+    qa = manifest.get("qa")
+    qa_input = qa.get("raw_input") if isinstance(qa, dict) else None
+    if not isinstance(qa_input, dict) or qa_input.get("status") != "passed":
+        raise ReplacementError(
+            f"manifest lacks passing imported-transcript evidence: {manifest_path}"
+        )
+    coverage = qa.get("stt_coverage") if isinstance(qa, dict) else None
+    if not isinstance(coverage, dict) or coverage.get("status") != "not_applicable":
+        raise ReplacementError(
+            f"imported transcript must record STT coverage as not applicable: {manifest_path}"
+        )
+    stt = manifest.get("stt")
+    if (
+        not isinstance(stt, dict)
+        or stt.get("performed") is not False
+        or stt.get("backend") != "imported-docx"
+    ):
+        raise ReplacementError(
+            f"manifest falsely or ambiguously records speech-to-text: {manifest_path}"
+        )
+
+    container_hash = raw_input.get("container_sha256")
+    text_hash = raw_input.get("text_sha256")
+    for label, value in (("container", container_hash), ("text", text_hash)):
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", value):
+            raise ReplacementError(
+                f"imported DOCX {label} SHA-256 is invalid: {manifest_path}"
+            )
+    if not isinstance(raw_input.get("extractor_version"), str) or not str(
+        raw_input.get("extractor_version")
+    ).strip():
+        raise ReplacementError(
+            f"imported DOCX extractor version is missing: {manifest_path}"
+        )
+    raw_path = _resolve_hashed_artifact(
+        manifest,
+        manifest_path,
+        generated_root,
+        artifact_key="raw_text",
+        expected_hash=text_hash,
+    )
+    if stt.get("raw_sha256") != text_hash:
+        raise ReplacementError(
+            f"imported raw hash is inconsistent with manifest STT compatibility record: {manifest_path}"
+        )
+
+    cleanup = manifest.get("cleanup")
+    if not isinstance(cleanup, dict) or cleanup.get("input_sha256") != text_hash:
+        raise ReplacementError(
+            f"cleanup input is not the preserved imported transcript: {manifest_path}"
+        )
+    cleanup_record_path = _resolve_hashed_artifact(
+        manifest,
+        manifest_path,
+        generated_root,
+        artifact_key="cleanup",
+        expected_hash=cleanup.get("record_sha256"),
+    )
+    try:
+        cleanup_record = json.loads(cleanup_record_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ReplacementError(
+            f"invalid cleanup audit record {cleanup_record_path}: {exc}"
+        ) from exc
+    if not isinstance(cleanup_record, dict):
+        raise ReplacementError(f"cleanup audit record is invalid: {cleanup_record_path}")
+    for key in (
+        "model",
+        "profile",
+        "glossary_sha256",
+        "glossary_count",
+        "grounding_glossary_terms_min",
+        "grounding_glossary_terms_max",
+        "needs_review",
+        "input_sha256",
+        "output_sha256",
+    ):
+        if cleanup_record.get(key) != cleanup.get(key):
+            raise ReplacementError(
+                f"cleanup manifest does not match its hashed audit record ({key}): "
+                f"{manifest_path}"
+            )
+    clean_hash = cleanup.get("output_sha256")
+    _resolve_hashed_artifact(
+        manifest,
+        manifest_path,
+        generated_root,
+        artifact_key="clean_text",
+        expected_hash=clean_hash,
+    )
+    render = manifest.get("render")
+    if not isinstance(render, dict) or render.get("input_sha256") != clean_hash:
+        raise ReplacementError(
+            f"render input is not the verified cleaned transcript: {manifest_path}"
+        )
+    # Keep the raw artifact local to the generated tree; the return value is
+    # useful to callers and makes the complete check explicit.
+    if not raw_path.is_file():
+        raise ReplacementError(f"imported raw artifact disappeared: {raw_path}")
+    return raw_input
+
+
+def _require_publishable_raw_input(
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    generated_root: Path,
+) -> Optional[dict[str, Any]]:
+    raw_input = manifest.get("raw_input")
+    if isinstance(raw_input, dict) and raw_input.get("kind") == "source_docx":
+        return _require_publishable_import(manifest, manifest_path, generated_root)
+    _require_publishable_stt(manifest, manifest_path, generated_root)
+    return None
+
+
 def plan_legacy_docx_replacements(
     generated_root: Path,
     legacy_root: Path,
@@ -314,7 +477,9 @@ def plan_legacy_docx_replacements(
         qa = manifest.get("qa")
         if not isinstance(qa, dict) or qa.get("status") != "passed":
             raise ReplacementError(f"refusing transcript without passed QA: {manifest_path}")
-        _require_publishable_stt(manifest, manifest_path, generated_root)
+        imported_input = _require_publishable_raw_input(
+            manifest, manifest_path, generated_root
+        )
         _require_publishable_cleanup(manifest, manifest_path)
 
         source = manifest.get("source")
@@ -326,7 +491,7 @@ def plan_legacy_docx_replacements(
             raise ReplacementError(f"source escapes the dedicated scope: {legacy_source_candidate}")
         if not legacy_source_candidate.is_file() or legacy_source_candidate.is_symlink():
             raise ReplacementError(
-                f"source recording is missing, not a file, or a symlink: {legacy_source_candidate}"
+                f"source recording/document is missing, not a file, or a symlink: {legacy_source_candidate}"
             )
         legacy_source = legacy_source_candidate.resolve()
 
@@ -355,6 +520,46 @@ def plan_legacy_docx_replacements(
         if not _is_within(generated, generated_root):
             raise ReplacementError(f"generated DOCX escapes its output root: {generated}")
         validate_docx(generated)
+        generated_hash = _sha256_file(generated)
+
+        if imported_input is not None:
+            if source_relative.suffix.casefold() != ".docx":
+                raise ReplacementError(
+                    f"imported transcript source is not a DOCX path: {manifest_path}"
+                )
+            imported_path_value = imported_input.get("path")
+            if (
+                not isinstance(imported_path_value, str)
+                or _normal_path(Path(imported_path_value)) != _normal_path(target)
+            ):
+                raise ReplacementError(
+                    f"imported DOCX path does not match publication target: {manifest_path}"
+                )
+            if not target.is_file() or target.is_symlink():
+                raise ReplacementError(
+                    f"imported-DOCX publication cannot create a missing target: {target}"
+                )
+            render = manifest.get("render")
+            if not isinstance(render, dict) or render.get("output_sha256") != generated_hash:
+                raise ReplacementError(
+                    f"generated DOCX does not match the render hash chain: {manifest_path}"
+                )
+            current_target_hash = _sha256_file(target).casefold()
+            allowed_target_hashes = {
+                str(imported_input.get("container_sha256", "")).casefold()
+            }
+            # Immutable successful batch reports are the explicit authority for
+            # replacing a previously published polished version on a later uplift.
+            from archive_pipeline import immutable_publication_hashes
+
+            allowed_target_hashes.update(
+                immutable_publication_hashes(generated_root, manifest_path, target)
+            )
+            if current_target_hash not in allowed_target_hashes:
+                raise ReplacementError(
+                    "source DOCX changed after import and is not a proven prior "
+                    f"publication: {target}"
+                )
 
         target_key = _normal_path(target)
         if target_key in seen_targets:
@@ -370,7 +575,7 @@ def plan_legacy_docx_replacements(
                 source=legacy_source,
                 target=target,
                 target_relative=target_relative,
-                generated_sha256=_sha256_file(generated),
+                generated_sha256=generated_hash,
                 original_sha256=_sha256_file(target) if target.is_file() else None,
             )
         )
@@ -459,8 +664,6 @@ def apply_legacy_docx_replacements(
     backup_root = Path(backup_root).resolve()
     _require_disjoint(backup_root, plan.scope_root, "backup and legacy roots")
     _require_disjoint(backup_root, plan.generated_root, "backup and generated roots")
-    if backup_root.exists():
-        raise ReplacementError(f"backup root must be a new directory: {backup_root}")
 
     # Revalidate the whole batch before creating a backup directory or touching a target.
     for item in plan.items:
@@ -482,12 +685,18 @@ def apply_legacy_docx_replacements(
             if _sha256_file(item.target) != item.original_sha256:
                 raise ReplacementError(f"legacy target changed after planning: {item.target}")
 
+    mutating_items = tuple(item for item in plan.items if item.operation != "noop")
+    if not mutating_items:
+        return tuple(item.target for item in plan.items)
+    if backup_root.exists():
+        raise ReplacementError(f"backup root must be a new directory: {backup_root}")
+
     backup_root.mkdir(parents=True, exist_ok=False)
     backups: dict[Path, Path] = {}
     staged_files: dict[Path, Path] = {}
     committed: list[LegacyDocxReplacement] = []
     try:
-        for item in plan.items:
+        for item in mutating_items:
             if item.original_sha256 is not None:
                 backup = backup_root / item.target_relative
                 _copy_to_new_path(item.target, backup)
@@ -495,13 +704,13 @@ def apply_legacy_docx_replacements(
                     raise ReplacementError(f"backup verification failed: {backup}")
                 backups[item.target] = backup
 
-        for item in plan.items:
+        for item in mutating_items:
             staged = _stage_generated(item.generated, item.target)
             if _sha256_file(staged) != item.generated_sha256:
                 raise ReplacementError(f"staged replacement hash mismatch: {item.generated}")
             staged_files[item.target] = staged
 
-        for item in plan.items:
+        for item in mutating_items:
             staged = staged_files[item.target]
             if item.original_sha256 is None:
                 if item.target.exists() or item.target.is_symlink():

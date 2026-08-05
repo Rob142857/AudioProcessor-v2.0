@@ -190,7 +190,38 @@ class SettingsPanel(tk.Frame):
         self.pipeline_note.grid(
             row=row + 2, column=0, columnspan=3, sticky="w", padx=18, pady=(0, 4)
         )
-        row += 3
+
+        self.existing_transcripts_frame = tk.Frame(self, bg=CARD_BG)
+        self.existing_transcripts_frame.grid(
+            row=row + 3, column=0, columnspan=3, sticky="ew", padx=16, pady=(2, 0)
+        )
+        self.existing_transcripts_var = tk.IntVar(
+            value=int(bool(ps.get("existing_transcripts_only", 0)))
+        )
+        self.existing_transcripts_check = tk.Checkbutton(
+            self.existing_transcripts_frame,
+            text="Use existing Word transcripts (skip Whisper)",
+            variable=self.existing_transcripts_var,
+            bg=CARD_BG,
+            fg=FG,
+            selectcolor=CARD_BG,
+            activebackground=CARD_BG,
+            font=("Segoe UI", 10, "bold"),
+            command=self._toggle_pipeline,
+        )
+        self.existing_transcripts_check.pack(side="left")
+        self.existing_transcripts_note = tk.Label(
+            self,
+            text="",
+            bg=CARD_BG,
+            fg=FG_DIM,
+            font=("Segoe UI", 8),
+            anchor="w",
+        )
+        self.existing_transcripts_note.grid(
+            row=row + 4, column=0, columnspan=3, sticky="w", padx=18, pady=(0, 4)
+        )
+        row += 5
 
         # Model
         tk.Label(self, text="Model:", bg=CARD_BG, fg=FG,
@@ -201,11 +232,18 @@ class SettingsPanel(tk.Frame):
         self.model_var = tk.StringVar(value=saved_model)
         display_map = {k: v for k, v in self.MODEL_OPTIONS}
         self._display_var = tk.StringVar(value=display_map.get(self.model_var.get(), self.MODEL_OPTIONS[0][1]))
-        combo = ttk.Combobox(self, textvariable=self._display_var,
-                             values=[v for _, v in self.MODEL_OPTIONS],
-                             state="readonly", width=46, font=FONT_SM)
-        combo.grid(row=row, column=1, columnspan=2, sticky="w", padx=(8, 16), pady=(4, 6))
-        combo.bind("<<ComboboxSelected>>", self._on_model_change)
+        self.model_combo = ttk.Combobox(
+            self,
+            textvariable=self._display_var,
+            values=[v for _, v in self.MODEL_OPTIONS],
+            state="readonly",
+            width=46,
+            font=FONT_SM,
+        )
+        self.model_combo.grid(
+            row=row, column=1, columnspan=2, sticky="w", padx=(8, 16), pady=(4, 6)
+        )
+        self.model_combo.bind("<<ComboboxSelected>>", self._on_model_change)
 
         # ── Row: Recursive + Quality ──
         row += 1
@@ -218,9 +256,17 @@ class SettingsPanel(tk.Frame):
                        font=FONT_SM).pack(side="left", padx=(0, 24))
 
         self.quality_var = tk.IntVar(value=ps.get("quality_mode", 1))
-        tk.Checkbutton(chk_frame, text="Quality mode (beam search)", variable=self.quality_var,
-                       bg=CARD_BG, fg=FG, selectcolor=CARD_BG, activebackground=CARD_BG,
-                       font=FONT_SM).pack(side="left")
+        self.quality_check = tk.Checkbutton(
+            chk_frame,
+            text="Quality mode (beam search)",
+            variable=self.quality_var,
+            bg=CARD_BG,
+            fg=FG,
+            selectcolor=CARD_BG,
+            activebackground=CARD_BG,
+            font=FONT_SM,
+        )
+        self.quality_check.pack(side="left")
 
         # ── Row: Replace outputs ──
         row += 1
@@ -236,7 +282,7 @@ class SettingsPanel(tk.Frame):
         ]:
             tk.Radiobutton(repl_frame, text=label, variable=self.replace_var, value=val,
                            bg=CARD_BG, fg=FG, selectcolor=CARD_BG, activebackground=CARD_BG,
-                           font=FONT_SM, command=self._toggle_date).pack(side="left", padx=(0, 10))
+                           font=FONT_SM, command=self._on_replace_change).pack(side="left", padx=(0, 10))
 
         # ── Row: Date picker (shown only when "before" selected) ──
         row += 1
@@ -292,22 +338,72 @@ class SettingsPanel(tk.Frame):
         else:
             self._date_frame.grid_remove()
 
+    def _on_replace_change(self):
+        self._toggle_date()
+        self._update_existing_transcripts_note()
+
+    def _update_existing_transcripts_note(self):
+        conflict = (
+            bool(self.pipeline_var.get())
+            and bool(self.existing_transcripts_var.get())
+            and self.replace_var.get() == "skip"
+        )
+        if conflict:
+            self.existing_transcripts_note.configure(
+                text=(
+                    "Choose Replace all or Replace transcripts before; Skip existing "
+                    "selects no source Word transcripts."
+                ),
+                fg="#b45309",
+            )
+        else:
+            self.existing_transcripts_note.configure(
+                text=(
+                    "Requires a source-adjacent DOCX. Runs protected GLM-4.7-Flash "
+                    "cleanup and Word stages only; no audio inference."
+                ),
+                fg=FG_DIM,
+            )
+
     def _toggle_pipeline(self):
         enabled = bool(self.pipeline_var.get())
+        existing_only = enabled and bool(self.existing_transcripts_var.get())
         self.pipeline_flow.configure(
             fg="#1d4ed8" if enabled else FG_DIM,
             text=(
-                "Local Faster-Whisper  →  protected GLM-4.7-Flash cleanup  "
-                "→  polished Word"
+                (
+                    "Existing source Word  →  protected GLM-4.7-Flash cleanup  "
+                    "→  polished Word (no audio inference)"
+                    if existing_only
+                    else "Local Faster-Whisper  →  protected GLM-4.7-Flash cleanup  "
+                    "→  polished Word"
+                )
                 if enabled
                 else "Local transcription only (legacy mode; no protected cleanup)"
             ),
         )
         self.force_check.configure(state="normal" if enabled else "disabled")
+        self.force_check.configure(
+            text=(
+                "Rerun GLM cleanup and Word rendering even when verified checkpoints exist"
+                if existing_only
+                else "Reprocess from audio even when verified checkpoints exist (slow)"
+            )
+        )
+        self.existing_transcripts_check.configure(
+            state="normal" if enabled else "disabled"
+        )
+        self.model_combo.configure(state="disabled" if existing_only else "readonly")
+        self.quality_check.configure(state="disabled" if existing_only else "normal")
         if enabled:
             self.pipeline_note.grid()
+            self.existing_transcripts_frame.grid()
+            self.existing_transcripts_note.grid()
         else:
             self.pipeline_note.grid_remove()
+            self.existing_transcripts_frame.grid_remove()
+            self.existing_transcripts_note.grid_remove()
+        self._update_existing_transcripts_note()
 
     def apply(self, ps: dict) -> None:
         """Apply a project-settings dict to the panel widgets."""
@@ -319,6 +415,9 @@ class SettingsPanel(tk.Frame):
         self.model_var.set(saved_model)
         self._display_var.set(display_map.get(saved_model, self.MODEL_OPTIONS[0][1]))
         self.pipeline_var.set(int(bool(ps.get("polished_pipeline", 1))))
+        self.existing_transcripts_var.set(
+            int(bool(ps.get("existing_transcripts_only", 0)))
+        )
         self.recursive_var.set(ps.get("recursive", 1))
         self.quality_var.set(ps.get("quality_mode", 1))
         self.replace_var.set(ps.get("replace_mode", "skip"))
@@ -331,6 +430,7 @@ class SettingsPanel(tk.Frame):
         """Return current settings as a dict for persistence."""
         return {
             "polished_pipeline": self.pipeline_var.get(),
+            "existing_transcripts_only": self.existing_transcripts_var.get(),
             "whisper_model": self.model_var.get(),
             "recursive": self.recursive_var.get(),
             "quality_mode": self.quality_var.get(),

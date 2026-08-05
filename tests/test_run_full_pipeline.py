@@ -28,6 +28,12 @@ class FullPipelineLauncherContractTests(unittest.TestCase):
         self.assertIn('set "DOCTOR_MODE=cleanup-only"', LAUNCHER)
         self.assertIn(':doctor_render', LAUNCHER)
         self.assertIn('set "DOCTOR_MODE=render-only"', LAUNCHER)
+        self.assertIn(':doctor_existing_transcripts', LAUNCHER)
+        existing_block = LAUNCHER.split(":doctor_existing_transcripts", 1)[1].split(
+            ":doctor_render", 1
+        )[0]
+        self.assertIn('set "DOCTOR_MODE=cleanup-only"', existing_block)
+        self.assertIn('set "DOCTOR_GPU_ARG="', existing_block)
 
     def test_source_publication_is_default_with_stripped_opt_out(self):
         self.assertIn(

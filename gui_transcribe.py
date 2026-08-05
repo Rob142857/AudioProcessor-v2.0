@@ -168,6 +168,21 @@ def _validate_replace_policy(mode: str, cutoff_date: str) -> Optional[str]:
     return value
 
 
+def _validate_polished_selection(settings: dict) -> Optional[str]:
+    """Validate the GUI's polished-pipeline selection before saving or running."""
+
+    mode = str(settings.get("replace_mode", "skip"))
+    cutoff = _validate_replace_policy(
+        mode, str(settings.get("replace_before_date", ""))
+    )
+    if bool(settings.get("existing_transcripts_only", False)) and mode == "skip":
+        raise ValueError(
+            "Use existing Word transcripts (skip Whisper) cannot be combined with "
+            "Skip existing. Choose Replace all, or Replace transcripts before a date."
+        )
+    return cutoff
+
+
 def _default_terms_file() -> Optional[str]:
     p = os.path.join(REPO_ROOT, "special_words.txt")
     return p if os.path.isfile(p) else None
@@ -240,10 +255,10 @@ def _run_polished_pipeline(input_path: str, settings: dict, q: queue.Queue) -> i
         )
     else:
         output_root = default_output_root(source)
-    cutoff = _validate_replace_policy(
-        str(settings.get("replace_mode", "skip")),
-        str(settings.get("replace_before_date", "")),
+    existing_transcripts_only = bool(
+        settings.get("existing_transcripts_only", False)
     )
+    cutoff = _validate_polished_selection(settings)
     config = PipelineConfig(
         input_path=source,
         output_root=output_root,
@@ -253,22 +268,38 @@ def _run_polished_pipeline(input_path: str, settings: dict, q: queue.Queue) -> i
         recursive=bool(settings.get("recursive", True)),
         existing_docx_mode=str(settings.get("replace_mode", "skip")),
         replace_before_date=cutoff,
+        existing_transcripts_only=existing_transcripts_only,
     )
     q.put(f"Polished artifacts: {output_root}\n")
-    q.put(
-        "Pipeline: local Faster-Whisper -> protected GLM-4.7-Flash "
-        "-> polished Word\n"
-    )
+    if existing_transcripts_only:
+        q.put(
+            "Pipeline: existing source-adjacent Word -> protected "
+            "GLM-4.7-Flash -> polished Word (Whisper and audio inference skipped)\n"
+        )
+    else:
+        q.put(
+            "Pipeline: local Faster-Whisper -> protected GLM-4.7-Flash "
+            "-> polished Word\n"
+        )
     return int(execute_pipeline(config, cancel_check=STOP_FLAG.is_set))
 
 
-def _run_polished_preflight(q: queue.Queue) -> bool:
+def _run_polished_preflight(
+    q: queue.Queue, *, existing_transcripts_only: bool = False
+) -> bool:
     """Fail before opening audio when the pinned production lane is incomplete."""
 
     from pipeline_doctor import run_checks
 
-    q.put("Checking local GPU, document, and protected-cleanup prerequisites...\n")
-    checks = run_checks(cleanup_required=True, mode="full", require_gpu=True)
+    if existing_transcripts_only:
+        q.put("Checking document and protected-cleanup prerequisites (no GPU needed)...\n")
+    else:
+        q.put("Checking local GPU, document, and protected-cleanup prerequisites...\n")
+    checks = run_checks(
+        cleanup_required=True,
+        mode="cleanup-only" if existing_transcripts_only else "full",
+        require_gpu=not existing_transcripts_only,
+    )
     symbols = {"ok": "OK", "warning": "WARN", "error": "ERROR"}
     for check in checks:
         q.put(f"[{symbols.get(check.status, check.status):5}] {check.name}: {check.detail}\n")
@@ -418,10 +449,15 @@ def launch_gui():
     btn_bar.grid(row=3, column=0, sticky="w", pady=(0, 10))
 
     q: queue.Queue = queue.Queue()
-    worker_state = {"active": False, "close_pending": False}
+    worker_state = {
+        "active": False,
+        "close_pending": False,
+        "existing_transcripts_only": False,
+    }
 
     def finish_worker():
         worker_state["active"] = False
+        worker_state["existing_transcripts_only"] = False
         run_btn.configure(state="normal")
         stop_btn.configure(state="disabled")
         clear_btn.configure(state="normal")
@@ -438,15 +474,23 @@ def launch_gui():
             return
         snap = settings_panel.snapshot()
         try:
-            normalized_cutoff = _validate_replace_policy(
-                str(snap.get("replace_mode", "skip")),
-                str(snap.get("replace_before_date", "")),
+            normalized_cutoff = (
+                _validate_polished_selection(snap)
+                if snap.get("polished_pipeline", 1)
+                else _validate_replace_policy(
+                    str(snap.get("replace_mode", "skip")),
+                    str(snap.get("replace_before_date", "")),
+                )
             )
         except ValueError as exc:
-            messagebox.showerror("Invalid replacement date", str(exc))
+            messagebox.showerror("Cannot start pipeline", str(exc))
             return
         if normalized_cutoff is not None:
             snap["replace_before_date"] = normalized_cutoff
+        existing_only_run = bool(
+            snap.get("polished_pipeline", 1)
+            and snap.get("existing_transcripts_only", False)
+        )
 
         log.clear()
         log.append("Starting...\n")
@@ -456,13 +500,15 @@ def launch_gui():
         download_btn.configure(state="disabled")
         access_btn.configure(state="disabled")
         worker_state["active"] = True
+        worker_state["existing_transcripts_only"] = existing_only_run
         STOP_FLAG.clear()
         # Also reset the engine's internal stop event
-        try:
-            from transcribe_optimised import clear_stop
-            clear_stop()
-        except Exception:
-            pass
+        if not existing_only_run:
+            try:
+                from transcribe_optimised import clear_stop
+                clear_stop()
+            except Exception:
+                pass
 
         # Persist project settings
         folder = _project_folder(inp)
@@ -477,24 +523,33 @@ def launch_gui():
             sys.stdout = _QueueWriter(q)
             sys.stderr = _QueueWriter(q)
             try:
-                # Apply env vars from settings snapshot
-                os.environ["TRANSCRIBE_MODEL_NAME"] = snap["whisper_model"]
-                if snap["whisper_model"].startswith("faster-whisper-"):
-                    os.environ.pop("TRANSCRIBE_FORCE_NATIVE_WHISPER", None)
-                else:
-                    os.environ["TRANSCRIBE_FORCE_NATIVE_WHISPER"] = "1"
+                # Existing-transcript mode deliberately avoids even loading the
+                # transcription engine; only archive_pipeline's DOCX import,
+                # protected cleanup, and rendering paths are entered.
+                if not existing_only_run:
+                    os.environ["TRANSCRIBE_MODEL_NAME"] = snap["whisper_model"]
+                    if snap["whisper_model"].startswith("faster-whisper-"):
+                        os.environ.pop("TRANSCRIBE_FORCE_NATIVE_WHISPER", None)
+                    else:
+                        os.environ["TRANSCRIBE_FORCE_NATIVE_WHISPER"] = "1"
 
-                os.environ["TRANSCRIBE_QUALITY_MODE"] = (
-                    "1" if snap["quality_mode"] else "0"
-                )
-                os.environ["TRANSCRIBE_MAX_PERF"] = "1"
-                os.environ["TRANSCRIBE_ALLOW_PROMPT"] = "1"
-                terms = _default_terms_file()
-                if terms:
-                    os.environ["TRANSCRIBE_AWKWARD_FILE"] = terms
+                    os.environ["TRANSCRIBE_QUALITY_MODE"] = (
+                        "1" if snap["quality_mode"] else "0"
+                    )
+                    os.environ["TRANSCRIBE_MAX_PERF"] = "1"
+                    os.environ["TRANSCRIBE_ALLOW_PROMPT"] = "1"
+                    terms = _default_terms_file()
+                    if terms:
+                        os.environ["TRANSCRIBE_AWKWARD_FILE"] = terms
 
                 if snap.get("polished_pipeline", 1):
-                    if not _run_polished_preflight(q):
+                    existing_transcripts_only = bool(
+                        snap.get("existing_transcripts_only", False)
+                    )
+                    if not _run_polished_preflight(
+                        q,
+                        existing_transcripts_only=existing_transcripts_only,
+                    ):
                         return
                     exit_code = _run_polished_pipeline(inp, snap, q)
                     if STOP_FLAG.is_set():
@@ -547,11 +602,12 @@ def launch_gui():
     def stop():
         STOP_FLAG.set()
         # Also signal the engine's internal stop event for mid-transcription abort
-        try:
-            from transcribe_optimised import request_stop
-            request_stop()
-        except Exception:
-            pass
+        if not worker_state.get("existing_transcripts_only"):
+            try:
+                from transcribe_optimised import request_stop
+                request_stop()
+            except Exception:
+                pass
         stop_btn.configure(state="disabled")
         log.append(
             "\nCancellation requested. The current operation or protected cleanup "
@@ -616,13 +672,18 @@ def launch_gui():
     def update_run_label(*_args):
         run_btn.configure(
             text=(
-                "  Start Polished Pipeline"
+                (
+                    "  Start GLM + Word (Skip Whisper)"
+                    if settings_panel.existing_transcripts_var.get()
+                    else "  Start Polished Pipeline"
+                )
                 if settings_panel.pipeline_var.get()
                 else "  Start Local Transcription"
             )
         )
 
     settings_panel.pipeline_var.trace_add("write", update_run_label)
+    settings_panel.existing_transcripts_var.trace_add("write", update_run_label)
     update_run_label()
 
     # ── Log panel ────────────────────────────────────────────────────

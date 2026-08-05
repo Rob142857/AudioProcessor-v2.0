@@ -16,7 +16,9 @@ if not exist "%AUDIOPROCESSOR_PYTHON%" (
   exit /b 1
 )
 
-"%AUDIOPROCESSOR_PYTHON%" -c "import faster_whisper, keyring, psutil, torch, whisper; from docx import Document" 2>nul
+rem Keep GUI startup independent of the audio/GPU stack.  The selected pipeline
+rem performs its own mode-specific preflight before any work begins.
+"%AUDIOPROCESSOR_PYTHON%" -c "import keyring, psutil, tkinter; from docx import Document" 2>nul
 if errorlevel 1 (
   echo AudioProcessor's pinned environment is incomplete.
   echo.

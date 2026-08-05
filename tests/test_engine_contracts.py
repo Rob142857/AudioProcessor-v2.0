@@ -194,7 +194,99 @@ class GuiEngineContractTests(unittest.TestCase):
         self.assertEqual("before", captured["existing_docx_mode"])
         self.assertEqual("2026-04-06", captured["replace_before_date"])
         self.assertFalse(captured["force"])
+        self.assertFalse(captured["existing_transcripts_only"])
         self.assertFalse(captured["cancelled"])
+
+    def test_existing_transcript_mode_maps_to_no_whisper_pipeline_contract(self):
+        q = queue.Queue()
+        captured = {}
+
+        class FakeConfig:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        def fake_execute(config, *, cancel_check):
+            captured["executed"] = True
+            return 0
+
+        fake_archive = types.SimpleNamespace(
+            PipelineConfig=FakeConfig,
+            default_output_root=lambda source: source.parent / "Polished",
+            execute_pipeline=fake_execute,
+        )
+        settings = {
+            "existing_transcripts_only": 1,
+            "whisper_model": "faster-whisper-large-v3",
+            "recursive": 1,
+            "replace_mode": "all",
+            "replace_before_date": "",
+            "force_reprocess": 1,
+        }
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            sys.modules, {"archive_pipeline": fake_archive}
+        ):
+            source = Path(tmp) / "Recordings"
+            source.mkdir()
+            self.assertEqual(
+                0,
+                gui_transcribe._run_polished_pipeline(str(source), settings, q),
+            )
+
+        self.assertTrue(captured["existing_transcripts_only"])
+        self.assertTrue(captured["force"])
+        self.assertEqual("all", captured["existing_docx_mode"])
+        self.assertTrue(captured["executed"])
+        messages = ""
+        while not q.empty():
+            messages += q.get_nowait()
+        self.assertIn("existing source-adjacent Word", messages)
+        self.assertIn("Whisper and audio inference skipped", messages)
+
+    def test_existing_transcript_mode_rejects_skip_existing(self):
+        with self.assertRaisesRegex(ValueError, "cannot be combined with Skip existing"):
+            gui_transcribe._validate_polished_selection(
+                {
+                    "existing_transcripts_only": 1,
+                    "replace_mode": "skip",
+                    "replace_before_date": "",
+                }
+            )
+
+    def test_existing_transcript_preflight_does_not_require_audio_stack(self):
+        calls = []
+        fake_check = types.SimpleNamespace(
+            status="ok", name="Cleanup", detail="ready"
+        )
+
+        def fake_run_checks(**kwargs):
+            calls.append(kwargs)
+            return [fake_check]
+
+        q = queue.Queue()
+        with mock.patch.dict(
+            sys.modules,
+            {"pipeline_doctor": types.SimpleNamespace(run_checks=fake_run_checks)},
+        ):
+            self.assertTrue(
+                gui_transcribe._run_polished_preflight(
+                    q, existing_transcripts_only=True
+                )
+            )
+
+        self.assertEqual(
+            [
+                {
+                    "cleanup_required": True,
+                    "mode": "cleanup-only",
+                    "require_gpu": False,
+                }
+            ],
+            calls,
+        )
+        messages = ""
+        while not q.empty():
+            messages += q.get_nowait()
+        self.assertIn("no GPU needed", messages)
 
     def test_polished_single_file_uses_a_dedicated_disjoint_output(self):
         captured = {}
@@ -245,6 +337,10 @@ class GuiEngineContractTests(unittest.TestCase):
         self.assertIn("restarts from its beginning", component_source)
         self.assertIn("only after the selected run verifies", component_source)
         self.assertIn("force_reprocess", component_source)
+        self.assertIn("Use existing Word transcripts (skip Whisper)", component_source)
+        self.assertIn("source-adjacent DOCX", component_source)
+        self.assertIn("no audio inference", component_source)
+        self.assertIn("existing_transcripts_only", gui_source)
         self.assertNotIn("CF_ACCESS_CLIENT_SECRET", component_source)
         self.assertNotIn("CF_ACCESS_CLIENT_SECRET", gui_source)
         self.assertIn('root.protocol("WM_DELETE_WINDOW", on_window_close)', gui_source)

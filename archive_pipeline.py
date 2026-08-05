@@ -236,12 +236,16 @@ def require_disjoint_publication_roots(input_path: Path, output_root: Path) -> P
                 if not isinstance(recorded_path, str) or not recorded_path.strip():
                     same_source_resume = False
                 else:
-                    same_source_resume = (
-                        os.path.normcase(
-                            os.path.abspath(str(Path(recorded_path).resolve()))
-                        )
-                        == os.path.normcase(os.path.abspath(str(resolved_input)))
+                    recorded_key = os.path.normcase(
+                        os.path.abspath(str(Path(recorded_path).resolve()))
                     )
+                    allowed_keys = {
+                        os.path.normcase(os.path.abspath(str(resolved_input))),
+                        os.path.normcase(
+                            os.path.abspath(str(resolved_input.with_suffix(".docx")))
+                        ),
+                    }
+                    same_source_resume = recorded_key in allowed_keys
             if not same_source_resume:
                 raise ValueError(
                     "single-file source DOCX publication requires a new output "
@@ -294,6 +298,110 @@ def should_process_existing_docx(
     return modified < cutoff
 
 
+def _should_select_existing_transcript(
+    transcript: Path,
+    mode: str = "all",
+    replace_before_date: Optional[str] = None,
+) -> bool:
+    """Apply the replacement-date policy to an existing transcript itself."""
+
+    cutoff = validate_existing_docx_policy(mode, replace_before_date)
+    if mode == "skip":
+        return False
+    if mode == "all":
+        return True
+    assert cutoff is not None
+    return datetime.fromtimestamp(transcript.stat().st_mtime) < cutoff
+
+
+def _existing_transcript_discovery(
+    input_path: Path,
+    output_root: Path,
+    *,
+    recursive: bool,
+    existing_docx_mode: str,
+    replace_before_date: Optional[str],
+) -> tuple[list[Path], dict[str, int]]:
+    """Discover unique source-adjacent DOCX inputs without opening audio.
+
+    Same-stem multi-format recordings intentionally collapse to their one shared
+    DOCX: in this mode the Word document, not any candidate recording, is the
+    immutable raw input.  Candidate recordings are retained later as provenance.
+    """
+
+    validate_existing_docx_policy(existing_docx_mode, replace_before_date)
+    if existing_docx_mode == "skip":
+        raise ValueError(
+            "existing-transcript mode requires 'Replace all' or "
+            "'Replace transcripts before'; 'Skip existing' would select nothing"
+        )
+
+    input_path = input_path.resolve()
+    output_root = output_root.resolve()
+    stats = {
+        "recording_candidates": 0,
+        "without_docx": 0,
+        "duplicate_recording_variants": 0,
+        "selected_docx": 0,
+    }
+
+    if input_path.is_file() and input_path.suffix.casefold() == ".docx":
+        if input_path.is_symlink():
+            return [], stats
+        selected = (
+            [input_path]
+            if _should_select_existing_transcript(
+                input_path, existing_docx_mode, replace_before_date
+            )
+            else []
+        )
+        stats["selected_docx"] = len(selected)
+        return selected, stats
+
+    if input_path.is_file():
+        if input_path.suffix.lower() not in SUPPORTED_AUDIO_EXTENSIONS:
+            raise ValueError(f"Unsupported audio/video extension: {input_path.suffix}")
+        candidates = [input_path]
+    elif input_path.is_dir():
+        iterator = input_path.rglob("*") if recursive else input_path.iterdir()
+        candidates = [
+            candidate.resolve()
+            for candidate in iterator
+            if candidate.is_file()
+            and candidate.suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS
+            and not _is_relative_to(candidate.resolve(), output_root)
+        ]
+    else:
+        raise FileNotFoundError(f"Input does not exist: {input_path}")
+
+    selected_by_target: dict[str, Path] = {}
+    seen_targets: set[str] = set()
+    for recording in sorted(candidates, key=lambda item: str(item).casefold()):
+        stats["recording_candidates"] += 1
+        transcript = recording.with_suffix(".docx")
+        key = os.path.normcase(os.path.abspath(str(transcript)))
+        if key in seen_targets:
+            stats["duplicate_recording_variants"] += 1
+            continue
+        seen_targets.add(key)
+        if (
+            not transcript.is_file()
+            or transcript.is_symlink()
+            or _is_relative_to(transcript.resolve(), output_root)
+        ):
+            stats["without_docx"] += 1
+            continue
+        transcript = transcript.resolve()
+        if _should_select_existing_transcript(
+            transcript, existing_docx_mode, replace_before_date
+        ):
+            selected_by_target[key] = transcript
+
+    selected = sorted(selected_by_target.values(), key=lambda item: str(item).casefold())
+    stats["selected_docx"] = len(selected)
+    return selected, stats
+
+
 def discover_audio(
     input_path: Path,
     output_root: Path,
@@ -301,8 +409,18 @@ def discover_audio(
     recursive: bool = True,
     existing_docx_mode: str = "all",
     replace_before_date: Optional[str] = None,
+    existing_transcripts_only: bool = False,
 ) -> list[Path]:
     """Return deterministic, collision-preserving audio discovery results."""
+    if existing_transcripts_only:
+        selected, _stats = _existing_transcript_discovery(
+            input_path,
+            output_root,
+            recursive=recursive,
+            existing_docx_mode=existing_docx_mode,
+            replace_before_date=replace_before_date,
+        )
+        return selected
     input_path = input_path.resolve()
     output_root = output_root.resolve()
     # Fail invalid selection input even when the folder is empty, and before
@@ -346,6 +464,20 @@ def discover_audio(
 def source_relative_path(source: Path, input_path: Path) -> Path:
     root = input_path if input_path.is_dir() else input_path.parent
     return source.resolve().relative_to(root.resolve())
+
+
+def recording_candidates_for_transcript(transcript: Path) -> list[Path]:
+    """List same-stem recordings as provenance without reading their contents."""
+
+    transcript = Path(transcript).resolve()
+    candidates = [
+        item.resolve()
+        for item in transcript.parent.iterdir()
+        if item.is_file()
+        and item.stem.casefold() == transcript.stem.casefold()
+        and item.suffix.casefold() in SUPPORTED_AUDIO_EXTENSIONS
+    ]
+    return sorted(candidates, key=lambda item: str(item).casefold())
 
 
 def validate_source_docx_target_collisions(
@@ -393,6 +525,125 @@ def validate_source_docx_target_collisions(
         "choose one source recording from each group before running:\n"
         + "\n".join(details)
     )
+
+
+def _normal_path_key(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(str(path.resolve())))
+
+
+def imported_raw_signature(record: dict[str, Any]) -> str:
+    """Bind imported raw text to both its DOCX container and extractor."""
+
+    return sha256_text(
+        stable_json(
+            {
+                "kind": "source_docx",
+                "container_sha256": record.get("container_sha256"),
+                "text_sha256": record.get("text_sha256"),
+                "extractor_version": record.get("extractor_version"),
+            }
+        )
+    )
+
+
+def immutable_publication_hashes(
+    generated_root: Path,
+    manifest_path: Path,
+    target: Path,
+) -> set[str]:
+    """Return hashes proven published or recoverable after a hard interruption.
+
+    A unique per-run journal is persisted before the commit begins.  A recovery
+    journal is authoritative only for a target whose byte-exact original backup
+    still matches the hashed plan.  The caller separately requires the current
+    target to match the planned generated hash.  The generated workspace file is
+    deliberately *not* part of this proof because a forced resume may replace it
+    with a newer cleanup/render before the source publication step runs.
+    """
+
+    generated_root = Path(generated_root).resolve()
+    manifest_key = _normal_path_key(manifest_path)
+    target_key = _normal_path_key(target)
+    hashes: set[str] = set()
+    for report_path in generated_root.glob("source-docx-publication-*.json"):
+        if report_path.name == SOURCE_DOCX_PUBLICATION_REPORT:
+            continue
+        report = read_json(report_path)
+        status = report.get("status")
+        if status not in {"published", "planned", "rollback_incomplete"}:
+            continue
+        plan = report.get("plan")
+        items = plan.get("items") if isinstance(plan, dict) else None
+        if not isinstance(items, list):
+            continue
+        plan_payload = {
+            "generated_root": plan.get("generated_root"),
+            "scope_root": plan.get("scope_root"),
+            "items": items,
+        }
+        plan_sha256 = sha256_text(stable_json(plan_payload))
+        if (
+            plan.get("plan_sha256") != plan_sha256
+            or report.get("plan_sha256") != plan_sha256
+            or not isinstance(plan.get("generated_root"), str)
+            or _normal_path_key(Path(plan["generated_root"]))
+            != _normal_path_key(generated_root)
+        ):
+            continue
+        if status == "published":
+            published = report.get("published")
+            if not isinstance(published, list) or target_key not in {
+                _normal_path_key(Path(value))
+                for value in published
+                if isinstance(value, str) and value.strip()
+            }:
+                continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            manifest_value = item.get("manifest")
+            target_value = item.get("target")
+            generated_sha256 = item.get("generated_sha256")
+            if (
+                isinstance(manifest_value, str)
+                and isinstance(target_value, str)
+                and isinstance(generated_sha256, str)
+                and re.fullmatch(r"[0-9a-fA-F]{64}", generated_sha256)
+                and _normal_path_key(Path(manifest_value)) == manifest_key
+                and _normal_path_key(Path(target_value)) == target_key
+            ):
+                if status in {"planned", "rollback_incomplete"}:
+                    original_sha256 = item.get("original_sha256")
+                    relative_value = item.get("target_relative")
+                    backup_root_value = report.get("backup_root")
+                    generated_value = item.get("generated")
+                    if (
+                        not isinstance(original_sha256, str)
+                        or not re.fullmatch(r"[0-9a-fA-F]{64}", original_sha256)
+                        or not isinstance(relative_value, str)
+                        or not relative_value.strip()
+                        or not isinstance(backup_root_value, str)
+                        or not backup_root_value.strip()
+                        or not isinstance(generated_value, str)
+                        or not generated_value.strip()
+                    ):
+                        continue
+                    relative = Path(relative_value.replace("/", os.sep))
+                    if relative.is_absolute() or ".." in relative.parts:
+                        continue
+                    backup_root = Path(backup_root_value).resolve()
+                    backup = backup_root / relative
+                    generated = Path(generated_value).resolve()
+                    if (
+                        backup.is_symlink()
+                        or not backup.is_file()
+                        or not _is_relative_to(backup.resolve(), backup_root)
+                        or not file_hash_matches(backup, original_sha256)
+                        or not _is_relative_to(generated, generated_root)
+                    ):
+                        continue
+                hashes.add(generated_sha256.casefold())
+    return hashes
 
 
 def artifact_directory(source: Path, input_path: Path, output_root: Path) -> Path:
@@ -594,6 +845,71 @@ def validate_artifacts(
     }
 
 
+def validate_imported_artifacts(
+    raw_text: str,
+    cleaned_text: str,
+    cleanup_needs_review: bool,
+    raw_input: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate imported prose without inventing speech timestamps or coverage."""
+
+    reasons: list[str] = []
+    import_reasons: list[str] = []
+    raw_words = len(raw_text.split())
+    cleaned_words = len(cleaned_text.split())
+    if not raw_text.strip() or raw_words < 2:
+        reasons.append("imported transcript is empty or implausibly short")
+    if "no speech detected or transcription failed" in raw_text.strip().casefold():
+        reasons.append("imported transcript contains a failure placeholder")
+    if not cleaned_text.strip():
+        reasons.append("cleaned transcript is empty")
+    ratio = cleaned_words / raw_words if raw_words else 0.0
+    if raw_words and (ratio < 0.85 or ratio > 1.15):
+        reasons.append(f"cleaned/raw word ratio is {ratio:.3f}")
+
+    for key in ("container_sha256", "text_sha256"):
+        value = raw_input.get(key)
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", value):
+            import_reasons.append(f"imported transcript {key} is invalid")
+    if raw_input.get("text_sha256") != sha256_text(raw_text):
+        import_reasons.append("imported transcript text hash does not match raw.txt")
+    if not isinstance(raw_input.get("extractor_version"), str) or not str(
+        raw_input.get("extractor_version")
+    ).strip():
+        import_reasons.append("imported transcript extractor version is missing")
+    for key in ("word_count", "paragraph_count"):
+        value = raw_input.get(key)
+        if type(value) is not int or value <= 0:
+            import_reasons.append(f"imported transcript {key} is invalid")
+    reasons.extend(import_reasons)
+    if cleanup_needs_review:
+        reasons.append("cleanup service marked one or more chunks for review")
+
+    return {
+        "status": "needs_review" if reasons else "passed",
+        "reasons": reasons,
+        "raw_words": raw_words,
+        "cleaned_words": cleaned_words,
+        "cleaned_to_raw_ratio": ratio,
+        "segments": 0,
+        "raw_input": {
+            "kind": "source_docx",
+            "status": "needs_review" if import_reasons else "passed",
+            "reasons": import_reasons,
+            "container_sha256": raw_input.get("container_sha256"),
+            "text_sha256": raw_input.get("text_sha256"),
+            "extractor_version": raw_input.get("extractor_version"),
+            "word_count": raw_input.get("word_count"),
+            "paragraph_count": raw_input.get("paragraph_count"),
+        },
+        "stt_coverage": {
+            "status": "not_applicable",
+            "reason": "Existing DOCX was imported; no timestamp evidence was created",
+        },
+        "checked_at": utc_now(),
+    }
+
+
 @dataclass(frozen=True)
 class PipelineConfig:
     input_path: Path
@@ -612,6 +928,7 @@ class PipelineConfig:
     recursive: bool = True
     existing_docx_mode: str = "all"
     replace_before_date: Optional[str] = None
+    existing_transcripts_only: bool = False
     limit: Optional[int] = None
 
     @property
@@ -728,6 +1045,21 @@ class PipelineRunner:
             self.config.existing_docx_mode,
             self.config.replace_before_date,
         )
+        if self.config.existing_transcripts_only:
+            if self.config.existing_docx_mode == "skip":
+                raise ValueError(
+                    "existing-transcript mode cannot use 'Skip existing'; select "
+                    "'Replace all' or 'Replace transcripts before'"
+                )
+            if not self.config.cleanup_enabled:
+                raise ValueError(
+                    "existing-transcript mode requires protected GLM cleanup"
+                )
+            if self.config.cleanup_only or self.config.render_only:
+                raise ValueError(
+                    "existing-transcript mode already defines its raw-input route; "
+                    "do not combine it with cleanup-only or render-only"
+                )
         if self.config.publish_source_docx:
             require_disjoint_publication_roots(
                 self.config.input_path,
@@ -738,9 +1070,13 @@ class PipelineRunner:
         self.cleanup_client: Any = None
         self.cancel_check = cancel_check or (lambda: False)
         self.selected_manifest_paths: tuple[Path, ...] = ()
-        self.stt_runtime_versions = {
-            package: installed_version(package) for package in STT_RUNTIME_PACKAGES
-        }
+        self.stt_runtime_versions = (
+            {}
+            if self.config.existing_transcripts_only
+            else {
+                package: installed_version(package) for package in STT_RUNTIME_PACKAGES
+            }
+        )
 
     def close(self) -> None:
         self.index.close()
@@ -779,8 +1115,31 @@ class PipelineRunner:
         prompt = "; ".join(dict.fromkeys(value for value in values if value))
         return prompt, "publication-metadata"
 
-    def _stt_request_signature(self, source: Path) -> str:
+    def _stt_request_signature(
+        self,
+        source: Path,
+        manifest: Optional[dict[str, Any]] = None,
+    ) -> str:
         """Fingerprint every known input which can affect the raw transcript."""
+        if self.config.existing_transcripts_only:
+            raw_input = manifest.get("raw_input") if isinstance(manifest, dict) else None
+            if isinstance(raw_input, dict) and raw_input.get("kind") == "source_docx":
+                return imported_raw_signature(raw_input)
+            from existing_transcript_import import EXTRACTOR_VERSION
+
+            return sha256_text(
+                stable_json(
+                    {
+                        "kind": "source_docx",
+                        # The hardened importer performs lstat/reparse and
+                        # single-snapshot checks before it reads any bytes.
+                        "container_sha256": None,
+                        "extractor_version": EXTRACTOR_VERSION,
+                        "text_sha256": None,
+                    }
+                )
+            )
+
         prompt_files: list[dict[str, Any]] = []
         effective_initial_prompt, initial_prompt_source = (
             self._effective_initial_prompt(source)
@@ -853,7 +1212,7 @@ class PipelineRunner:
         stt_request_signature: str,
     ) -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": 2 if self.config.existing_transcripts_only else 1,
             "pipeline_version": PIPELINE_VERSION,
             "source": {
                 "path": str(source),
@@ -866,11 +1225,23 @@ class PipelineRunner:
             "created_at": utc_now(),
             "updated_at": utc_now(),
             "stt": {
-                "backend": "local",
-                "model": self.config.stt_model,
+                "performed": not self.config.existing_transcripts_only,
+                "backend": (
+                    "imported-docx" if self.config.existing_transcripts_only else "local"
+                ),
+                "model": (
+                    "not-performed"
+                    if self.config.existing_transcripts_only
+                    else self.config.stt_model
+                ),
                 "request_signature": stt_request_signature,
                 "signature": None,
             },
+            "raw_input": (
+                {"kind": "source_docx"}
+                if self.config.existing_transcripts_only
+                else {"kind": "local_stt"}
+            ),
             "cleanup": {
                 "enabled": self.config.cleanup_enabled,
                 "endpoint": self.config.cleanup_endpoint,
@@ -905,6 +1276,19 @@ class PipelineRunner:
         stt_request_signature: str,
     ) -> bool:
         stt = manifest.get("stt", {})
+        if self.config.existing_transcripts_only:
+            raw_input = manifest.get("raw_input")
+            if not isinstance(raw_input, dict) or raw_input.get("kind") != "source_docx":
+                return False
+            return (
+                stt.get("performed") is False
+                and stt.get("backend") == "imported-docx"
+                and stt.get("request_signature") == stt_request_signature
+                and raw_input.get("signature") == stt_request_signature
+                and file_hash_matches(paths["raw_text"], stt.get("raw_sha256"))
+                and stt.get("raw_sha256") == raw_input.get("text_sha256")
+                and self._import_source_state(manifest, paths) in {"original", "published"}
+            )
         return (
             (not self.config.force or self.config.cleanup_only or self.config.render_only)
             and fingerprints_match(manifest.get("source", {}), fingerprint)
@@ -916,6 +1300,43 @@ class PipelineRunner:
             and file_hash_matches(paths["raw_text"], stt.get("raw_sha256"))
             and file_hash_matches(paths["segments"], stt.get("segments_sha256"))
         )
+
+    def _import_source_state(
+        self,
+        manifest: dict[str, Any],
+        paths: dict[str, Path],
+    ) -> str:
+        """Classify the current source DOCX against immutable provenance."""
+
+        raw_input = manifest.get("raw_input")
+        if not isinstance(raw_input, dict) or raw_input.get("kind") != "source_docx":
+            return "invalid"
+        path_value = raw_input.get("path")
+        original_hash = raw_input.get("container_sha256")
+        if (
+            not isinstance(path_value, str)
+            or not path_value.strip()
+            or not isinstance(original_hash, str)
+            or not re.fullmatch(r"[0-9a-fA-F]{64}", original_hash)
+        ):
+            return "invalid"
+        source_docx = Path(path_value)
+        if not source_docx.is_file() or source_docx.is_symlink():
+            return "missing"
+        try:
+            current_hash = sha256_file(source_docx).casefold()
+        except OSError:
+            return "missing"
+        if current_hash == original_hash.casefold():
+            return "original"
+        published_hashes = immutable_publication_hashes(
+            self.config.output_root,
+            paths["manifest"],
+            source_docx,
+        )
+        if current_hash in published_hashes:
+            return "published"
+        return "changed"
 
     def _clean_is_reusable(
         self,
@@ -1023,8 +1444,8 @@ class PipelineRunner:
         )
         paths = artifact_paths(job_directory)
         fingerprint = quick_fingerprint(source)
-        stt_request_signature = self._stt_request_signature(source)
         manifest = read_json(paths["manifest"])
+        stt_request_signature = self._stt_request_signature(source, manifest)
         if not manifest:
             manifest = self._base_manifest(
                 source, relative, fingerprint, stt_request_signature
@@ -1044,17 +1465,20 @@ class PipelineRunner:
                 # provenance before a manifest exists.
                 glossary_error = exc
 
+        qa_record = manifest.get("qa") if isinstance(manifest.get("qa"), dict) else {}
+        raw_evidence_passed = (
+            qa_record.get("raw_input", {}).get("status") == "passed"
+            if self.config.existing_transcripts_only
+            and isinstance(qa_record.get("raw_input"), dict)
+            else coverage_record_is_passed(qa_record.get("stt_coverage"))
+        )
         final_candidate = (
             not self.config.force
             and not self.config.cleanup_only
             and not self.config.render_only
             and glossary_error is None
             and manifest.get("status") in FINAL_STATUSES
-            and coverage_record_is_passed(
-                manifest.get("qa", {}).get("stt_coverage")
-                if isinstance(manifest.get("qa"), dict)
-                else None
-            )
+            and raw_evidence_passed
             and not (
                 self.config.retry_review
                 and manifest.get("status") == "needs_review"
@@ -1064,7 +1488,7 @@ class PipelineRunner:
             manifest, fingerprint, paths, stt_request_signature
         ):
             stt = manifest.get("stt", {})
-            timestamp_artifacts_valid = (
+            timestamp_artifacts_valid = self.config.existing_transcripts_only or (
                 file_hash_matches(paths["vtt"], stt.get("vtt_sha256"))
                 and file_hash_matches(paths["srt"], stt.get("srt_sha256"))
             )
@@ -1114,116 +1538,205 @@ class PipelineRunner:
                 manifest, fingerprint, paths, stt_request_signature
             ):
                 raw_text = paths["raw_text"].read_text(encoding="utf-8")
-                segments_value = json.loads(paths["segments"].read_text(encoding="utf-8"))
-                segments = normalize_segments(segments_value)
-                expected_vtt = segments_to_vtt(segments)
-                expected_srt = segments_to_srt(segments)
-                if not file_hash_matches(
-                    paths["vtt"], manifest.get("stt", {}).get("vtt_sha256")
-                ):
-                    atomic_write_text(paths["vtt"], expected_vtt)
-                if not file_hash_matches(
-                    paths["srt"], manifest.get("stt", {}).get("srt_sha256")
-                ):
-                    atomic_write_text(paths["srt"], expected_srt)
-                manifest["stt"]["vtt_sha256"] = sha256_file(paths["vtt"])
-                manifest["stt"]["srt_sha256"] = sha256_file(paths["srt"])
+                if self.config.existing_transcripts_only:
+                    segments = []
+                else:
+                    segments_value = json.loads(
+                        paths["segments"].read_text(encoding="utf-8")
+                    )
+                    segments = normalize_segments(segments_value)
+                    expected_vtt = segments_to_vtt(segments)
+                    expected_srt = segments_to_srt(segments)
+                    if not file_hash_matches(
+                        paths["vtt"], manifest.get("stt", {}).get("vtt_sha256")
+                    ):
+                        atomic_write_text(paths["vtt"], expected_vtt)
+                    if not file_hash_matches(
+                        paths["srt"], manifest.get("stt", {}).get("srt_sha256")
+                    ):
+                        atomic_write_text(paths["srt"], expected_srt)
+                    manifest["stt"]["vtt_sha256"] = sha256_file(paths["vtt"])
+                    manifest["stt"]["srt_sha256"] = sha256_file(paths["srt"])
                 append_event(paths["events"], "raw_reused")
             else:
                 if self.config.cleanup_only or self.config.render_only:
                     raise RuntimeError(
                         "raw artifacts are unavailable or stale; cleanup/render-only cannot continue"
                     )
-                manifest["stage"] = "transcribing"
-                self._save_manifest(source, relative, paths, manifest)
-                append_event(paths["events"], "transcription_started")
-                details = self._transcribe(source)
-                # Preserve and clean the closest available representation of the
-                # model output.  The engine's `text` value may already contain
-                # derived paragraph formatting, so it is stored separately.
-                raw_value = details.get("raw_text")
-                if raw_value is None:
-                    raw_value = details.get("text")
-                raw_text = str(raw_value or "")
-                formatted_value = details.get("text")
-                formatted_stt = (
-                    str(formatted_value)
-                    if formatted_value is not None
-                    else raw_text
-                )
-                if not raw_text.strip():
-                    raise RuntimeError("speech-to-text returned no transcript")
-                segments = normalize_segments(details.get("segments"))
-                # Persist the exact stage output. Adding convenience newlines here
-                # would change its content hash after a restart and invalidate an
-                # otherwise reusable cleanup checkpoint.
-                atomic_write_text(paths["raw_text"], raw_text)
-                if formatted_stt and formatted_stt != raw_text:
-                    atomic_write_text(paths["formatted_stt"], formatted_stt)
-                atomic_write_json(paths["segments"], segments)
-                atomic_write_text(paths["vtt"], segments_to_vtt(segments))
-                atomic_write_text(paths["srt"], segments_to_srt(segments))
-                manifest["source"] = {
-                    "path": str(source),
-                    "relative_path": relative.as_posix(),
-                    **fingerprint,
-                    "sha256": sha256_file(source),
-                }
-                details_metadata = details.get("metadata", {})
-                if not isinstance(details_metadata, dict):
-                    details_metadata = {}
-                actual_model = str(
-                    details_metadata.get("model") or self.config.stt_model
-                )
-                actual_signature = sha256_text(
-                    stable_json(
+                if self.config.existing_transcripts_only:
+                    prior_input = manifest.get("raw_input")
+                    if isinstance(prior_input, dict) and prior_input.get(
+                        "container_sha256"
+                    ):
+                        raise RuntimeError(
+                            "preserved imported raw text is missing, corrupt, or no longer "
+                            "bound to its source; refusing to re-import a document that may "
+                            "already be polished"
+                        )
+                    manifest["stage"] = "importing_source_docx"
+                    self._save_manifest(source, relative, paths, manifest)
+                    append_event(paths["events"], "source_docx_import_started")
+                    from existing_transcript_import import import_existing_transcript
+
+                    imported = import_existing_transcript(source)
+                    raw_text = imported.text
+                    segments = []
+                    atomic_write_text(paths["raw_text"], raw_text)
+                    raw_input = {
+                        "kind": "source_docx",
+                        "path": imported.source_docx,
+                        "relative_path": relative.as_posix(),
+                        "container_sha256": imported.source_sha256,
+                        "size": imported.source_size,
+                        "mtime_ns": imported.source_mtime_ns,
+                        "extractor_version": imported.extractor_version,
+                        "text_sha256": sha256_text(raw_text),
+                        "word_count": imported.word_count,
+                        "paragraph_count": imported.paragraph_count,
+                        "recording_candidates": [
+                            str(path)
+                            for path in recording_candidates_for_transcript(source)
+                        ],
+                    }
+                    stt_request_signature = imported_raw_signature(raw_input)
+                    raw_input["signature"] = stt_request_signature
+                    manifest["raw_input"] = raw_input
+                    manifest["source"] = {
+                        "path": str(source),
+                        "relative_path": relative.as_posix(),
+                        "size": imported.source_size,
+                        "mtime_ns": imported.source_mtime_ns,
+                        "sha256": imported.source_sha256,
+                    }
+                    manifest["stt"] = {
+                        "performed": False,
+                        "backend": "imported-docx",
+                        "model": "not-performed",
+                        "requested_model": None,
+                        "actual_model": None,
+                        "request_signature": stt_request_signature,
+                        "signature": stt_request_signature,
+                        "metadata": {
+                            "speech_to_text_rerun": False,
+                            "timestamp_evidence": False,
+                        },
+                        "elapsed_seconds": None,
+                        "raw_sha256": sha256_file(paths["raw_text"]),
+                        "segments_sha256": None,
+                        "vtt_sha256": None,
+                        "srt_sha256": None,
+                        "formatted_stt_sha256": None,
+                    }
+                    manifest["artifacts"].update(
                         {
-                            "request_signature": stt_request_signature,
-                            "actual_model": actual_model,
-                            "device": details_metadata.get("device"),
+                            "raw_text": str(paths["raw_text"]),
+                            "formatted_stt": None,
+                            "segments": None,
+                            "vtt": None,
+                            "srt": None,
+                            "source_docx": imported.source_docx,
                         }
                     )
-                )
-                manifest["stt"] = {
-                    **manifest.get("stt", {}),
-                    "request_signature": stt_request_signature,
-                    "signature": actual_signature,
-                    "requested_model": self.config.stt_model,
-                    "actual_model": actual_model,
-                    "model": actual_model,
-                    "metadata": details_metadata,
-                    "elapsed_seconds": details.get("elapsed_seconds"),
-                    "raw_sha256": sha256_file(paths["raw_text"]),
-                    "segments_sha256": sha256_file(paths["segments"]),
-                    "vtt_sha256": sha256_file(paths["vtt"]),
-                    "srt_sha256": sha256_file(paths["srt"]),
-                    "formatted_stt_sha256": (
-                        sha256_file(paths["formatted_stt"])
-                        if paths["formatted_stt"].is_file()
-                        else None
-                    ),
-                }
-                manifest["artifacts"].update(
-                    {
-                        "raw_text": str(paths["raw_text"]),
-                        "formatted_stt": (
-                            str(paths["formatted_stt"])
+                    manifest["stage"] = "raw_complete"
+                    self._save_manifest(source, relative, paths, manifest)
+                    append_event(
+                        paths["events"],
+                        "source_docx_import_completed",
+                        words=imported.word_count,
+                        paragraphs=imported.paragraph_count,
+                    )
+                else:
+                    manifest["stage"] = "transcribing"
+                    self._save_manifest(source, relative, paths, manifest)
+                    append_event(paths["events"], "transcription_started")
+                    details = self._transcribe(source)
+                    # Preserve and clean the closest available representation of the
+                    # model output.  The engine's `text` value may already contain
+                    # derived paragraph formatting, so it is stored separately.
+                    raw_value = details.get("raw_text")
+                    if raw_value is None:
+                        raw_value = details.get("text")
+                    raw_text = str(raw_value or "")
+                    formatted_value = details.get("text")
+                    formatted_stt = (
+                        str(formatted_value)
+                        if formatted_value is not None
+                        else raw_text
+                    )
+                    if not raw_text.strip():
+                        raise RuntimeError("speech-to-text returned no transcript")
+                    segments = normalize_segments(details.get("segments"))
+                    # Persist the exact stage output. Adding convenience newlines here
+                    # would change its content hash after a restart and invalidate an
+                    # otherwise reusable cleanup checkpoint.
+                    atomic_write_text(paths["raw_text"], raw_text)
+                    if formatted_stt and formatted_stt != raw_text:
+                        atomic_write_text(paths["formatted_stt"], formatted_stt)
+                    atomic_write_json(paths["segments"], segments)
+                    atomic_write_text(paths["vtt"], segments_to_vtt(segments))
+                    atomic_write_text(paths["srt"], segments_to_srt(segments))
+                    manifest["source"] = {
+                        "path": str(source),
+                        "relative_path": relative.as_posix(),
+                        **fingerprint,
+                        "sha256": sha256_file(source),
+                    }
+                    details_metadata = details.get("metadata", {})
+                    if not isinstance(details_metadata, dict):
+                        details_metadata = {}
+                    actual_model = str(
+                        details_metadata.get("model") or self.config.stt_model
+                    )
+                    actual_signature = sha256_text(
+                        stable_json(
+                            {
+                                "request_signature": stt_request_signature,
+                                "actual_model": actual_model,
+                                "device": details_metadata.get("device"),
+                            }
+                        )
+                    )
+                    manifest["stt"] = {
+                        **manifest.get("stt", {}),
+                        "performed": True,
+                        "request_signature": stt_request_signature,
+                        "signature": actual_signature,
+                        "requested_model": self.config.stt_model,
+                        "actual_model": actual_model,
+                        "model": actual_model,
+                        "metadata": details_metadata,
+                        "elapsed_seconds": details.get("elapsed_seconds"),
+                        "raw_sha256": sha256_file(paths["raw_text"]),
+                        "segments_sha256": sha256_file(paths["segments"]),
+                        "vtt_sha256": sha256_file(paths["vtt"]),
+                        "srt_sha256": sha256_file(paths["srt"]),
+                        "formatted_stt_sha256": (
+                            sha256_file(paths["formatted_stt"])
                             if paths["formatted_stt"].is_file()
                             else None
                         ),
-                        "segments": str(paths["segments"]),
-                        "vtt": str(paths["vtt"]),
-                        "srt": str(paths["srt"]),
                     }
-                )
-                manifest["stage"] = "raw_complete"
-                self._save_manifest(source, relative, paths, manifest)
-                append_event(
-                    paths["events"],
-                    "transcription_completed",
-                    words=len(raw_text.split()),
-                    segments=len(segments),
-                )
+                    manifest["artifacts"].update(
+                        {
+                            "raw_text": str(paths["raw_text"]),
+                            "formatted_stt": (
+                                str(paths["formatted_stt"])
+                                if paths["formatted_stt"].is_file()
+                                else None
+                            ),
+                            "segments": str(paths["segments"]),
+                            "vtt": str(paths["vtt"]),
+                            "srt": str(paths["srt"]),
+                        }
+                    )
+                    manifest["stage"] = "raw_complete"
+                    self._save_manifest(source, relative, paths, manifest)
+                    append_event(
+                        paths["events"],
+                        "transcription_completed",
+                        words=len(raw_text.split()),
+                        segments=len(segments),
+                    )
 
             self._check_cancelled("between transcription and cleanup")
             raw_sha256 = sha256_text(raw_text)
@@ -1366,9 +1879,19 @@ class PipelineRunner:
                 append_event(paths["events"], "render_started")
                 metadata = {
                     "model": (
-                        f"{self.config.stt_model} -> {cleanup_metadata.get('model')}"
+                        (
+                            "Existing Word transcript (speech-to-text skipped) -> "
+                            f"{cleanup_metadata.get('model')}"
+                        )
+                        if self.config.existing_transcripts_only
+                        and cleanup_metadata.get("model")
+                        else f"{self.config.stt_model} -> {cleanup_metadata.get('model')}"
                         if cleanup_metadata.get("model")
-                        else self.config.stt_model
+                        else (
+                            "Existing Word transcript (speech-to-text skipped)"
+                            if self.config.existing_transcripts_only
+                            else self.config.stt_model
+                        )
                     ),
                     "device": "See manifest",
                     "time_taken": "See manifest",
@@ -1393,25 +1916,33 @@ class PipelineRunner:
             stt_metadata = stt_record.get("metadata", {})
             if not isinstance(stt_metadata, dict):
                 stt_metadata = {}
-            audio_duration_seconds = finite_seconds(
-                stt_metadata.get("audio_duration_seconds"), positive=True
-            )
-            if audio_duration_seconds is None:
-                audio_duration_seconds = probe_audio_duration_seconds(source)
-                if audio_duration_seconds is not None:
-                    stt_metadata = dict(stt_metadata)
-                    stt_metadata["audio_duration_seconds"] = audio_duration_seconds
-                    manifest["stt"]["metadata"] = stt_metadata
+            if self.config.existing_transcripts_only:
+                qa = validate_imported_artifacts(
+                    raw_text,
+                    cleaned_text,
+                    cleanup_needs_review,
+                    manifest.get("raw_input", {}),
+                )
+            else:
+                audio_duration_seconds = finite_seconds(
+                    stt_metadata.get("audio_duration_seconds"), positive=True
+                )
+                if audio_duration_seconds is None:
+                    audio_duration_seconds = probe_audio_duration_seconds(source)
+                    if audio_duration_seconds is not None:
+                        stt_metadata = dict(stt_metadata)
+                        stt_metadata["audio_duration_seconds"] = audio_duration_seconds
+                        manifest["stt"]["metadata"] = stt_metadata
 
-            qa = validate_artifacts(
-                raw_text,
-                cleaned_text,
-                segments,
-                cleanup_needs_review,
-                requested_stt_model=manifest.get("stt", {}).get("requested_model"),
-                actual_stt_model=manifest.get("stt", {}).get("actual_model"),
-                audio_duration_seconds=audio_duration_seconds,
-            )
+                qa = validate_artifacts(
+                    raw_text,
+                    cleaned_text,
+                    segments,
+                    cleanup_needs_review,
+                    requested_stt_model=manifest.get("stt", {}).get("requested_model"),
+                    actual_stt_model=manifest.get("stt", {}).get("actual_model"),
+                    audio_duration_seconds=audio_duration_seconds,
+                )
             atomic_write_json(paths["qa"], qa)
             manifest["qa"] = qa
             manifest["artifacts"]["qa"] = str(paths["qa"])
@@ -1440,6 +1971,11 @@ class PipelineRunner:
                     "nature": publication.genre or "Lecture",
                 },
                 "source": {
+                    "kind": (
+                        "source_docx"
+                        if self.config.existing_transcripts_only
+                        else "recording"
+                    ),
                     "path": str(source),
                     "relative_path": relative.as_posix(),
                     "sha256": manifest.get("source", {}).get("sha256"),
@@ -1453,6 +1989,24 @@ class PipelineRunner:
                     "cleanup": cleanup_metadata.get("model"),
                     "cleanup_profile": cleanup_metadata.get("profile"),
                 },
+                "raw_input": (
+                    {
+                        key: manifest.get("raw_input", {}).get(key)
+                        for key in (
+                            "kind",
+                            "path",
+                            "relative_path",
+                            "container_sha256",
+                            "text_sha256",
+                            "extractor_version",
+                            "word_count",
+                            "paragraph_count",
+                            "recording_candidates",
+                        )
+                    }
+                    if self.config.existing_transcripts_only
+                    else {"kind": "local_stt"}
+                ),
                 "glossary": {
                     "sha256": cleanup_metadata.get("glossary_sha256"),
                     "editable_terms": cleanup_metadata.get("glossary_count", 0),
@@ -1508,13 +2062,23 @@ class PipelineRunner:
             return "failed"
 
     def run(self) -> dict[str, int]:
-        files = discover_audio(
-            self.config.input_path,
-            self.config.output_root,
-            recursive=self.config.recursive,
-            existing_docx_mode=self.config.existing_docx_mode,
-            replace_before_date=self.config.replace_before_date,
-        )
+        discovery_stats: dict[str, int] = {}
+        if self.config.existing_transcripts_only:
+            files, discovery_stats = _existing_transcript_discovery(
+                self.config.input_path,
+                self.config.output_root,
+                recursive=self.config.recursive,
+                existing_docx_mode=self.config.existing_docx_mode,
+                replace_before_date=self.config.replace_before_date,
+            )
+        else:
+            files = discover_audio(
+                self.config.input_path,
+                self.config.output_root,
+                recursive=self.config.recursive,
+                existing_docx_mode=self.config.existing_docx_mode,
+                replace_before_date=self.config.replace_before_date,
+            )
         if self.config.limit is not None:
             files = files[: max(0, self.config.limit)]
         if self.config.publish_source_docx:
@@ -1538,7 +2102,23 @@ class PipelineRunner:
             "failed": 0,
             "cancelled": 0,
         }
-        print(f"Discovered {len(files):,} supported recording(s).")
+        if self.config.existing_transcripts_only:
+            print(
+                f"Discovered {len(files):,} existing Word transcript(s); "
+                "audio decoding and Whisper are disabled."
+            )
+            if discovery_stats.get("without_docx"):
+                print(
+                    f"Ignored {discovery_stats['without_docx']:,} unique recording "
+                    "name(s) without a source-adjacent DOCX."
+                )
+            if discovery_stats.get("duplicate_recording_variants"):
+                print(
+                    f"Collapsed {discovery_stats['duplicate_recording_variants']:,} "
+                    "same-stem recording variant(s) onto their one DOCX input."
+                )
+        else:
+            print(f"Discovered {len(files):,} supported recording(s).")
         if self.config.dry_run:
             counts["queued"] = len(files)
             self._write_summary(counts)
@@ -1590,6 +2170,7 @@ class PipelineRunner:
             "output": str(self.config.output_root),
             "existing_docx_mode": self.config.existing_docx_mode,
             "replace_before_date": self.config.replace_before_date,
+            "existing_transcripts_only": self.config.existing_transcripts_only,
             "counts": counts,
         }
         if publication is not None:
@@ -1689,9 +2270,30 @@ def publish_source_docx_batch(
         "counts": dict(counts),
     }
 
-    def write_final_report() -> None:
+    def write_report_snapshot() -> None:
         atomic_write_json(immutable_report_path, report)
         atomic_write_json(report_path, report)
+
+    def plan_targets_are_original(candidate_plan: Any) -> bool:
+        """Return true only when every planned target is back at pre-commit state."""
+
+        items = getattr(candidate_plan, "items", None)
+        if items is None:
+            return True
+        try:
+            for item in items:
+                target = Path(item.target)
+                original_sha256 = item.original_sha256
+                if original_sha256 is None:
+                    if target.exists() or target.is_symlink():
+                        return False
+                elif target.is_symlink() or not file_hash_matches(
+                    target, original_sha256
+                ):
+                    return False
+        except (AttributeError, OSError, TypeError):
+            return False
+        return True
 
     blockers = [
         name
@@ -1721,9 +2323,10 @@ def publish_source_docx_batch(
                 "finished_at": utc_now(),
             }
         )
-        write_final_report()
+        write_report_snapshot()
         return report
 
+    plan = None
     try:
         from legacy_docx_replace import (
             apply_legacy_docx_replacements,
@@ -1748,11 +2351,16 @@ def publish_source_docx_batch(
                 "plan_sha256": plan.plan_sha256,
                 "planned": len(plan.items),
                 "operations": operations,
+                "changes_planned": operations.get("create", 0)
+                + operations.get("replace", 0),
                 "plan": plan.to_dict(),
                 "published": [],
             }
         )
-        atomic_write_json(report_path, report)
+        # Persist the unique transaction journal before any backup or target
+        # replacement. If the process is killed mid-commit, exact backups plus
+        # this hashed plan make already-replaced targets safely recoverable.
+        write_report_snapshot()
         raise_if_cancelled(cancel_check, phase="source publication commit")
         published = apply_legacy_docx_replacements(
             plan,
@@ -1768,7 +2376,7 @@ def publish_source_docx_batch(
                 "finished_at": utc_now(),
             }
         )
-        write_final_report()
+        write_report_snapshot()
         return report
     except PipelineCancelledError as exc:
         report.setdefault("planned", 0)
@@ -1781,18 +2389,24 @@ def publish_source_docx_batch(
                 "finished_at": utc_now(),
             }
         )
-        write_final_report()
+        write_report_snapshot()
         raise
     except Exception as exc:
+        # An apply failure normally rolls every committed target back.  If any
+        # target is not demonstrably at its original hash, retain the hashed
+        # plan as a recovery-authoritative journal.  A later run will still
+        # require the exact original backup and the current target's planned
+        # generated hash before accepting it.
+        rollback_incomplete = plan is not None and not plan_targets_are_original(plan)
         report.update(
             {
-                "status": "failed",
+                "status": "rollback_incomplete" if rollback_incomplete else "failed",
                 "error": f"{type(exc).__name__}: {exc}",
                 "published": [],
                 "finished_at": utc_now(),
             }
         )
-        write_final_report()
+        write_report_snapshot()
         raise
 
 
@@ -1849,6 +2463,17 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--no-recursive",
         action="store_true",
         help="Only process recordings directly inside the selected folder",
+    )
+    parser.add_argument(
+        "--existing-transcripts-only",
+        "--use-existing-docx",
+        "--skip-stt",
+        dest="existing_transcripts_only",
+        action="store_true",
+        help=(
+            "Import each source-adjacent legacy Word transcript, skip audio "
+            "decoding/Whisper entirely, then run protected GLM cleanup and rendering"
+        ),
     )
     parser.add_argument(
         "--existing-docx-mode",
@@ -1940,12 +2565,22 @@ def execute_pipeline(
                 )
                 return 1
             if publication and publication.get("status") == "published":
-                counts["publication_published"] = int(
-                    publication.get("planned", 0) or 0
+                operations = publication.get("operations", {})
+                changed = (
+                    int(operations.get("create", 0) or 0)
+                    + int(operations.get("replace", 0) or 0)
+                    if isinstance(operations, dict)
+                    else int(publication.get("planned", 0) or 0)
                 )
+                unchanged = (
+                    int(operations.get("noop", 0) or 0)
+                    if isinstance(operations, dict)
+                    else 0
+                )
+                counts["publication_published"] = changed
                 print(
-                    f"Published {publication.get('planned', 0):,} source-adjacent "
-                    "DOCX file(s)."
+                    f"Source DOCX publication verified {publication.get('planned', 0):,} "
+                    f"file(s): {changed:,} changed, {unchanged:,} already current."
                 )
             elif publication:
                 counts["publication_suppressed"] = 1
@@ -1994,6 +2629,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         recursive=not args.no_recursive,
         existing_docx_mode=args.existing_docx_mode,
         replace_before_date=args.replace_before_date,
+        existing_transcripts_only=args.existing_transcripts_only,
         limit=args.limit,
     )
     return execute_pipeline(config)

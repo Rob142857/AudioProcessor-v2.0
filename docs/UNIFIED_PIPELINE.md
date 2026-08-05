@@ -17,6 +17,24 @@ recording
   -> final DOCX + manifest + status report
 ```
 
+For recordings whose legacy Faster-Whisper DOCX already exists, the same runner
+also has a distinct raw-input route:
+
+```text
+source-adjacent legacy DOCX
+  -> conservative Transcript: section import (audio and Whisper skipped)
+  -> immutable raw text + DOCX container/text hashes
+  -> pinned glossary snapshot
+  -> protected GLM-4.7-Flash cleanup
+  -> imported-text/hash checks (timestamp coverage is explicitly not applicable)
+  -> final DOCX + manifest + status report
+```
+
+This is not `cleanup-only` and it does not fabricate empty Whisper segments.
+No segment JSON, VTT, SRT, audio duration, or coverage claim is created. The
+legacy importer fails closed on ambiguous document structure and keeps the body
+only in hashed `raw.txt`, never in the manifest.
+
 Generated artifacts always go into a separate output folder; intermediate work never overwrites the source archive. A folder batch defaults to the sibling `<archive> - Polished` directory. The normal one-click launcher additionally requests a guarded post-run publication batch, described below, which can replace source-adjacent legacy DOCX files only after complete verification and backup.
 
 Every recording receives a collision-proof directory containing:
@@ -60,6 +78,15 @@ single-file canary automatically uses its own dedicated directory under the
 sibling `<source-folder> - Polished Single Files` tree, keeping generated work
 outside the guarded source scope and making a restart unambiguous.
 
+Select **Use existing Word transcripts (skip Whisper)** for an archive that
+already contains source-adjacent legacy DOCX files. Choose **Replace all** or
+**Replace transcripts before…**; **Skip existing** is deliberately invalid in
+this mode because every raw input is an existing document. Whisper model and
+quality controls are disabled, the preflight needs no GPU/audio stack, and the
+flow label changes to existing Word → protected GLM-4.7-Flash → polished Word.
+The advanced Force control reruns GLM and rendering from the hash-verified
+preserved import; it never causes a DOCX to be re-imported.
+
 The three existing-output policies select recordings by the source-adjacent
 DOCX: missing only, all, or missing plus documents whose local modification
 time is before a strict `YYYY-MM-DD` date. Invalid dates stop before audio is
@@ -77,11 +104,15 @@ window alive until the worker and any atomic Word publication transaction have
 finished; it never abandons the publisher merely because the close button was
 pressed.
 
-Before transcription starts, a publication run also groups the already
+Before local transcription starts, a publication run also groups the already
 selected recordings by their eventual source-adjacent `.docx` target. If two
 formats or files would map to the same Word filename, the run stops immediately
 and lists every conflicting source path. The tool never guesses which recording
 is authoritative; select one source from each reported group before retrying.
+
+Skip-Whisper mode instead discovers the unique DOCX itself. Same-stem audio
+formats collapse onto that one document without choosing or reading an audio
+file; every candidate recording path is retained as provenance in the manifest.
 
 With no arguments, the runner opens a folder chooser. For a safe first canary:
 
@@ -98,6 +129,7 @@ Useful controls:
 - `--render-only` rebuilds DOCX from existing cleaned text.
 - `--retry-review` retries only work which previously reached `needs_review`.
 - `--force` deliberately reruns all selected stages.
+- `--existing-transcripts-only` (aliases `--use-existing-docx` and `--skip-stt`) imports legacy DOCX bodies and runs GLM/render only; combine it with `--existing-docx-mode all` or `before`.
 - `--no-publish-source-docx` is a launcher-only opt-out which leaves final DOCX files solely in the polished output tree.
 - Ctrl+C stops between files; completed checkpoints remain reusable.
 
@@ -117,7 +149,7 @@ The publisher proceeds only when every discovered job is newly verified or an al
 
 Each published document ends with a single restrained provenance note in this form: `Processed by speech-to-text from a digitised tape recording originally recorded in person by MW on 22 January 1985.` Old cleanup timestamps, model/device details, and earlier generated provenance text are removed during rendering rather than appearing in the publication.
 
-Transcript completeness is a hard verification and publication gate. There must be at least one text-bearing STT segment with a valid end timestamp, the source audio duration must be known, and the final segment must reach the end within the greater of 2 seconds or 5% of the recording duration, capped at 120 seconds. This is the documented trailing-silence tolerance; a longer gap is sent to review instead of being assumed silent. Publication re-reads the hashed segment artifact and repeats this check. It also requires both recorded glossary-grounding minimum and maximum counts to be integers at least as large as the pinned glossary count.
+For fresh STT, transcript completeness is a hard verification and publication gate. There must be at least one text-bearing STT segment with a valid end timestamp, the source audio duration must be known, and the final segment must reach the end within the greater of 2 seconds or 5% of the recording duration, capped at 120 seconds. This is the documented trailing-silence tolerance; a longer gap is sent to review instead of being assumed silent. Publication re-reads the hashed segment artifact and repeats this check. Imported-DOCX mode instead rechecks the exact DOCX container → extracted raw text → GLM output → render hash chain and records STT coverage as `not_applicable`; it never claims timestamp completeness it cannot prove. Both routes require recorded glossary-grounding minimum and maximum counts to be integers at least as large as the pinned glossary count.
 
 Before changing any existing target, it copies and verifies the original in a new sibling tree outside both the archive and polished output:
 
@@ -126,6 +158,13 @@ Before changing any existing target, it copies and verifies the original in a ne
 ```
 
 Replacements are staged and committed atomically as one guarded batch. A mid-commit failure rolls back changed targets; verified backups are retained after success or failure. New source-adjacent DOCX targets have no prior file to back up. The latest publication or suppression result is recorded as `source-docx-publication-report.json` in the polished output root.
+
+Before commit, the publisher also writes a unique per-run planned journal. If
+the process or machine stops after an atomic replacement but before the final
+published receipt, the next run accepts that partial commit only after it
+rechecks the journal's plan hash, generated artifact, target mapping, and
+byte-exact original backup. It can then finish the remaining targets without
+re-importing its own polished documents.
 
 The service token is never written to settings, logs, manifests, or checkpoint files. The client refuses insecure non-local HTTP endpoints and Access login redirects/HTML, and validates access once before creating per-recording work.
 
@@ -136,8 +175,9 @@ The read-only archive inventory on 5 August 2026 found:
 - 2,278 supported recordings after adding AIFF, AIF, and 3GP discovery.
 - 2,260 recordings recognised by the old extension list.
 - 6 AIFF recordings that the old recursive runner silently omitted.
-- 9 locations where two audio formats have the same stem and therefore target the same legacy DOCX path.
+- 22 same-stem multi-format groups; fresh STT treats these as collisions, while skip-Whisper mode cleans each shared DOCX once without selecting an audio variant.
 - 2,259 existing DOCX files. Artifact generation preserves them; launcher publication replaces only fully verified targets after retaining originals in the timestamped backup tree.
+- 2,250 canonical source-adjacent DOCX inputs selected by skip-Whisper discovery; six unique recording names have no adjacent DOCX and nine alternate/old DOCX names do not exactly match a recording stem.
 
 The dry-run completed against the real archive and found all 2,278 recordings without modifying the archive.
 

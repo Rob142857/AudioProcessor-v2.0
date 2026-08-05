@@ -16,6 +16,7 @@ Converts audio/video files into professionally formatted DOCX transcripts. It de
 - **Vintage tape preprocessing** — noise reduction, loudness normalisation, dynamic range compression optimised for 1980s–90s recordings
 - **Single file or recursive batch** — process one file or an entire folder tree
 - **Stateful archive resume** — source/model/config hashes and stage manifests replace existence-only skipping in `archive_pipeline.py`
+- **Skip-Whisper archive refresh** — import an existing source-adjacent legacy DOCX, run only protected GLM cleanup and polished Word rendering, and retain immutable import provenance
 - **Per-project settings** — model, recursive mode, and replace policy saved per folder
 - **Domain terms** — feed a `special_words.txt` to improve recognition of specialist vocabulary
 - **Clean componentised GUI** — `gui_transcribe.py` (main) + `gui_components.py` (panels)
@@ -48,6 +49,14 @@ Switch polished mode off only when a local, uncleaned legacy transcript is
 specifically wanted. Cleanup credentials remain in Windows Credential Manager
 and are never stored in the GUI project settings.
 
+When a collection already has legacy Faster-Whisper Word transcripts, select
+**Use existing Word transcripts (skip Whisper)** and **Replace all** (or the
+strict before-date policy). The route becomes existing Word → protected
+GLM-4.7-Flash → polished Word. It does not load a speech model, decode audio,
+probe audio duration, or create timestamp artifacts. Force means rerun GLM and
+Word from the preserved imported `raw.txt`; it never re-imports a document that
+may already have been polished.
+
 For recursive transcription plus protected GLM cleanup:
 
 ```powershell
@@ -56,6 +65,12 @@ For recursive transcription plus protected GLM cleanup:
 ```
 
 The first command validates the service token and stores it in Windows Credential Manager; it does not write the token to repository settings. Environment variables remain available for unattended runs. Review the one-file canary before removing `--limit 1`.
+
+The equivalent headless skip-Whisper route is:
+
+```powershell
+.\run_full_pipeline.bat "C:\path\to\recordings" --existing-transcripts-only --existing-docx-mode all
+```
 
 For a complete unrestricted archive-folder run, `run_full_pipeline.bat` publishes each verified final DOCX beside its source audio by default. Before replacing any existing DOCX, the publisher creates a new sibling backup tree named `<archive-name> - Legacy DOCX Backup - <UTC run-id>`, verifies the whole batch, and retains the backups. Publication is blocked if any job failed, needs review, was cancelled, or if `--dry-run` or `--limit` is active. Use `--no-publish-source-docx` to keep results only in the separate polished output tree.
 

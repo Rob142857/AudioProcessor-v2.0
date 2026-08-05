@@ -25,6 +25,7 @@ set "FLAG_NO_CLEANUP=0"
 set "FLAG_CLEANUP_ONLY=0"
 set "FLAG_RENDER_ONLY=0"
 set "FLAG_DRY_RUN=0"
+set "FLAG_EXISTING_TRANSCRIPTS_ONLY=0"
 set "PUBLISH_SOURCE_DOCX=--publish-source-docx"
 
 :parse_arguments
@@ -35,6 +36,9 @@ if /I "%~1"=="--no-cleanup" set "FLAG_NO_CLEANUP=1"
 if /I "%~1"=="--cleanup-only" set "FLAG_CLEANUP_ONLY=1"
 if /I "%~1"=="--render-only" set "FLAG_RENDER_ONLY=1"
 if /I "%~1"=="--dry-run" set "FLAG_DRY_RUN=1"
+if /I "%~1"=="--existing-transcripts-only" set "FLAG_EXISTING_TRANSCRIPTS_ONLY=1"
+if /I "%~1"=="--use-existing-docx" set "FLAG_EXISTING_TRANSCRIPTS_ONLY=1"
+if /I "%~1"=="--skip-stt" set "FLAG_EXISTING_TRANSCRIPTS_ONLY=1"
 set "PIPELINE_ARGS=%PIPELINE_ARGS% %1"
 shift
 goto parse_arguments
@@ -61,6 +65,7 @@ set "DOCTOR_GPU_ARG=--require-gpu"
 set "DOCTOR_CLEANUP_ARG="
 
 if "%FLAG_DRY_RUN%"=="1" goto doctor_inventory
+if "%FLAG_EXISTING_TRANSCRIPTS_ONLY%"=="1" goto doctor_existing_transcripts
 if "%FLAG_RENDER_ONLY%"=="1" goto doctor_render
 if "%FLAG_CLEANUP_ONLY%"=="1" goto doctor_cleanup
 if "%FLAG_NO_CLEANUP%"=="1" goto doctor_transcribe_only
@@ -71,6 +76,11 @@ set "DOCTOR_MODE=inventory"
 set "DOCTOR_GPU_ARG="
 set "DOCTOR_CLEANUP_ARG=--no-cleanup"
 set "PUBLISH_SOURCE_DOCX="
+goto doctor_ready
+
+:doctor_existing_transcripts
+set "DOCTOR_MODE=cleanup-only"
+set "DOCTOR_GPU_ARG="
 goto doctor_ready
 
 :doctor_render

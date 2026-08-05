@@ -93,10 +93,18 @@ class ArchivePipelineTests(unittest.TestCase):
         config = PipelineConfig(input_path=Path("archive"), output_root=Path("output"))
 
         self.assertFalse(config.publish_source_docx)
+        self.assertFalse(config.existing_transcripts_only)
         self.assertFalse(parse_args(["archive"]).publish_source_docx)
         self.assertTrue(
             parse_args(["archive", "--publish-source-docx"]).publish_source_docx
         )
+        for flag in (
+            "--existing-transcripts-only",
+            "--use-existing-docx",
+            "--skip-stt",
+        ):
+            with self.subTest(flag=flag):
+                self.assertTrue(parse_args(["archive", flag]).existing_transcripts_only)
 
     def test_before_mode_rejects_missing_malformed_and_impossible_dates(self):
         invalid_dates = (
