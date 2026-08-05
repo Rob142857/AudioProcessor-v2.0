@@ -9,6 +9,7 @@ moviepy>=2.2.1                          # Audio/video loading for extraction
 # ── System / progress ──────────────────────────────────────────────
 psutil>=7.2.0
 tqdm>=4.67.0
+keyring>=25.6.0                         # Windows Credential Manager integration
 
 # ── PyTorch: install separately for your GPU ───────────────────────
 # Your GTX 1070 Ti has CUDA 12.4 support via the installed torch 2.6.0+cu124.

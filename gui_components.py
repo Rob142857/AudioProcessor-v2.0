@@ -7,6 +7,7 @@ from tkinter import ttk, filedialog
 
 SUPPORTED_EXTS = (
     ".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".wma",
+    ".aiff", ".aif", ".3gp",
     ".mp4", ".avi", ".mkv", ".mov", ".wmv", ".flv", ".webm",
 )
 
@@ -65,7 +66,7 @@ class InputPanel(tk.Frame):
     # ── helpers ──
     def _browse_file(self):
         types = [
-            ("Audio files", "*.mp3 *.wav *.flac *.m4a *.aac *.ogg *.wma"),
+            ("Audio files", "*.mp3 *.wav *.flac *.m4a *.aac *.ogg *.wma *.aiff *.aif *.3gp"),
             ("Video files", "*.mp4 *.avi *.mkv *.mov *.wmv *.flv *.webm"),
             ("All files", "*.*"),
         ]

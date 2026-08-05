@@ -1,0 +1,12 @@
+{
+  "last_folder": "C:\\path\\to\\audio-collection",
+  "projects": {
+    "C:\\path\\to\\audio-collection": {
+      "whisper_model": "faster-whisper-large-v3",
+      "recursive": 1,
+      "quality_mode": 1,
+      "replace_mode": "skip",
+      "replace_before_date": "2026-01-01"
+    }
+  }
+}

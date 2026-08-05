@@ -1,6 +1,7 @@
 import argparse
 import os
 import re
+import tempfile
 from datetime import date
 from pathlib import Path
 from typing import Optional
@@ -15,6 +16,39 @@ try:
 except ImportError:
     AUSTRALIAN_SPELLING_AVAILABLE = False
     def normalize_text(text, **kwargs): return text
+
+
+def _save_docx_atomically(doc: Document, out_path: Path) -> Path:
+    """Save and validate a DOCX before atomically replacing its destination."""
+    out_path = Path(out_path)
+    if out_path.suffix.lower() != ".docx":
+        raise ValueError(f"DOCX output path must end in .docx: {out_path}")
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            prefix=f".{out_path.stem}.",
+            suffix=".tmp.docx",
+            dir=out_path.parent,
+            delete=False,
+        ) as tmp:
+            tmp_path = Path(tmp.name)
+
+        doc.save(str(tmp_path))
+        # python-docx reopening the package catches truncated/corrupt writes before
+        # the destination is replaced.
+        Document(str(tmp_path))
+        os.replace(tmp_path, out_path)
+        tmp_path = None
+        return out_path
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def infer_year_from_parent(folder_name: str) -> int:
@@ -212,19 +246,27 @@ def convert_txt_to_docx(txt_path: Path, year: Optional[int] = None) -> Path:
 
     # Output path: same folder, .docx extension
     out_path = txt_path.with_suffix(".docx")
-    doc.save(out_path)
-    return out_path
+    return _save_docx_atomically(doc, out_path)
 
 
-def convert_txt_to_docx_from_text(body_text: str, source_audio_path: Path, year: Optional[int] = None, metadata: Optional[dict] = None, use_australian_spelling: bool = True) -> Path:
-    """Convert transcript text directly to DOCX, saving next to the source audio file.
+def convert_txt_to_docx_from_text(
+    body_text: str,
+    source_audio_path: Path,
+    year: Optional[int] = None,
+    metadata: Optional[dict] = None,
+    use_australian_spelling: bool = True,
+    *,
+    output_path: Optional[Path] = None,
+) -> Path:
+    """Convert transcript text directly to an atomically written DOCX.
     
     Args:
         body_text: The formatted transcript text to include in the document
-        source_audio_path: Path to the original audio/video file (DOCX will be saved next to it)
+        source_audio_path: Path to the original audio/video file, used for title/date inference
         year: Optional year override for date inference
         metadata: Optional dict with transcription metadata (model, device, time_taken, preprocessing)
         use_australian_spelling: Whether to convert to Australian spelling (default: True)
+        output_path: Optional explicit DOCX destination (defaults to next to the source)
     
     Returns:
         Path to the created DOCX file
@@ -331,10 +373,10 @@ def convert_txt_to_docx_from_text(body_text: str, source_audio_path: Path, year:
         note.runs[0].font.italic = True
         note.runs[0].font.color.rgb = RGBColor(128, 128, 128)  # Gray color
 
-    # Output path: same folder as source audio, .docx extension
-    out_path = source_audio_path.with_suffix(".docx")
-    doc.save(out_path)
-    return out_path
+    # Explicit output destinations let callers preserve a source-relative tree in
+    # a separate output root. The default remains next to the source audio.
+    out_path = Path(output_path) if output_path is not None else source_audio_path.with_suffix(".docx")
+    return _save_docx_atomically(doc, out_path)
 
 
 def main() -> None:

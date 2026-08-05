@@ -12,9 +12,11 @@ import gc
 import json
 import os
 import queue
+import shutil
 import subprocess
 import sys
 import threading
+import warnings
 from typing import List, Optional
 
 import tkinter as tk
@@ -36,17 +38,61 @@ STOP_FLAG     = threading.Event()
 def _load_settings() -> dict:
     try:
         with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            warnings.warn(
+                f"Ignoring settings in {SETTINGS_PATH}: the top-level value must be an object.",
+                RuntimeWarning,
+            )
+            return {}
+        return data
+    except FileNotFoundError:
+        return {}
+    except (OSError, json.JSONDecodeError) as exc:
+        warnings.warn(
+            f"Could not load settings from {SETTINGS_PATH}: {exc}",
+            RuntimeWarning,
+        )
         return {}
 
 
-def _save_settings(data: dict) -> None:
+def _save_settings(data: dict) -> bool:
+    """Atomically persist settings, retaining the previous file on failure."""
+    tmp_path = f"{SETTINGS_PATH}.tmp"
     try:
-        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+        os.makedirs(os.path.dirname(SETTINGS_PATH) or ".", exist_ok=True)
+        if os.path.isfile(SETTINGS_PATH):
+            try:
+                with open(SETTINGS_PATH, "r", encoding="utf-8") as existing:
+                    existing_data = json.load(existing)
+                if not isinstance(existing_data, dict):
+                    raise ValueError("top-level value is not an object")
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
+                backup_path = f"{SETTINGS_PATH}.invalid-backup"
+                if not os.path.exists(backup_path):
+                    shutil.copy2(SETTINGS_PATH, backup_path)
+                warnings.warn(
+                    f"Backed up invalid settings to {backup_path} before replacing them: {exc}",
+                    RuntimeWarning,
+                )
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(data or {}, f, indent=2)
-    except Exception:
-        pass
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, SETTINGS_PATH)
+        return True
+    except (OSError, TypeError, ValueError) as exc:
+        warnings.warn(
+            f"Could not save settings to {SETTINGS_PATH}: {exc}",
+            RuntimeWarning,
+        )
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        return False
 
 
 def _load_project(folder: str) -> dict:
@@ -66,11 +112,11 @@ def _default_terms_file() -> Optional[str]:
 
 # ── Transcription helpers ────────────────────────────────────────────
 def _run_single(path: str, outdir: Optional[str], q: queue.Queue,
-                *, threads: Optional[int] = None):
-    """Transcribe one file, writing progress to *q*."""
+                *, threads: Optional[int] = None) -> bool:
+    """Transcribe one file, writing progress to *q* and reporting success."""
     if STOP_FLAG.is_set():
         q.put("Cancelled.\n")
-        return
+        return False
     try:
         from transcribe_optimised import transcribe_file_simple_auto
         target = outdir or os.path.dirname(path)
@@ -78,15 +124,18 @@ def _run_single(path: str, outdir: Optional[str], q: queue.Queue,
                                           threads_override=threads)
         if out and os.path.isfile(out):
             q.put(f"Done -> {out}\n")
+            return True
         else:
             q.put("Warning: no output generated.\n")
+            return False
     except Exception as e:
         # Check if this was a stop request (don't print traceback for user-initiated stops)
         if STOP_FLAG.is_set() or "Stop requested" in str(e):
             q.put("Stopped.\n")
-            return
+            return False
         import traceback
         q.put(f"Error: {e}\n{traceback.format_exc()}")
+        return False
 
 
 def _run_batch(paths: List[str], q: queue.Queue,
@@ -100,8 +149,11 @@ def _run_batch(paths: List[str], q: queue.Queue,
             return
         q.put(f"\n[{i}/{total}] {os.path.basename(p)}\n")
         try:
-            _run_single(p, None, q, threads=threads)
-            ok += 1
+            succeeded = _run_single(p, None, q, threads=threads)
+            if succeeded:
+                ok += 1
+            else:
+                fail += 1
         except Exception as e:
             fail += 1
             q.put(f"Error ({os.path.basename(p)}): {e}\n")

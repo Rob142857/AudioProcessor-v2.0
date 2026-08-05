@@ -24,6 +24,9 @@ __pycache__/
 *.m4a
 *.aac
 *.ogg
+*.aiff
+*.aif
+*.3gp
 *.mp4
 *.mov
 *.avi
@@ -53,3 +56,5 @@ Thumbs.db
 # Environment reports
 env_report.json
 .transcribe_settings.json
+.transcribe_settings.json.tmp
+.transcribe_settings.json.invalid-backup

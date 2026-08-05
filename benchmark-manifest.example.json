@@ -1,0 +1,21 @@
+{
+  "terms": [
+    "Gurdjieff",
+    "enneagram",
+    "Fourth Way"
+  ],
+  "samples": [
+    {
+      "id": "clean-lecture",
+      "reference": "gold/clean-lecture.reference.txt",
+      "terms": [
+        "Philip Groves"
+      ],
+      "hypotheses": {
+        "faster-whisper-large-v3": "hypotheses/clean-lecture.faster-whisper-large-v3.txt",
+        "cloudflare-whisper-large-v3-turbo": "hypotheses/clean-lecture.cloudflare-whisper-large-v3-turbo.txt",
+        "deepgram-nova-3": "hypotheses/clean-lecture.deepgram-nova-3.txt"
+      }
+    }
+  ]
+}

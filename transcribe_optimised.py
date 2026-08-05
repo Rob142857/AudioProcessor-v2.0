@@ -1754,8 +1754,12 @@ def transcribe_with_dataset_optimization(input_path: str, output_dir=None, threa
         full_text = " ".join(texts).strip()
 
     if not full_text:
-        print("⚠️  Warning: No transcription text generated")
-        full_text = "[No speech detected or transcription failed]"
+        try:
+            if preprocessing_used and os.path.exists(working_input_path):
+                os.remove(working_input_path)
+        finally:
+            force_gpu_memory_cleanup()
+        raise RuntimeError("No speech text was produced by dataset transcription")
 
     print(f"⚡ Hardware utilised: {device_name} (Dataset Optimized)")
 
@@ -1814,7 +1818,8 @@ def transcribe_with_dataset_optimization(input_path: str, output_dir=None, threa
     # We no longer save TXT or quality report sidecar files.
     txt_path = None
 
-    # Generate DOCX directly next to the source audio file
+    # Generate the optional DOCX. An explicit file path wins over output_dir;
+    # otherwise the backwards-compatible destination is next to the source.
     docx_path = None
     elapsed = time.time() - start_time
     try:
@@ -1830,7 +1835,17 @@ def transcribe_with_dataset_optimization(input_path: str, output_dir=None, threa
             'preprocessing': "Vintage tape preset" if preprocessing_used else "None"
         }
         
-        docx_path = convert_txt_to_docx_from_text(formatted_text, source_path, metadata=metadata)
+        dataset_output_path = (
+            Path(output_dir) / source_path.with_suffix(".docx").name
+            if output_dir else None
+        )
+        docx_path = convert_txt_to_docx_from_text(
+            formatted_text,
+            source_path,
+            metadata=metadata,
+            use_australian_spelling=False,
+            output_path=dataset_output_path,
+        )
         print(f"✅ DOCX file saved: {docx_path}")
     except Exception as docx_err:
         print(f"⚠️  Failed to generate DOCX: {docx_err}")
@@ -2302,16 +2317,30 @@ def transcribe_with_vad_parallel(input_path, vad_segments, model, base_transcrib
         return combined_result
 
 
-def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: Optional[int] = None):
+def transcribe_file_simple_auto(
+    input_path,
+    output_dir=None,
+    threads_override: Optional[int] = None,
+    *,
+    return_details: bool = False,
+    write_docx: bool = True,
+    docx_output_path=None,
+):
     """
     High-quality, simplified single-file transcription on best available device.
     - Device selection: CUDA > DirectML > CPU
     - No VAD; transcribe the entire file
-    - Robust DOCX save with fallback
+    - Optional, explicit DOCX destination
     - Safe cleanup that avoids torch re-import problems
-    Returns path to the .docx file saved next to the source file.
+
+    The backwards-compatible default returns the DOCX path as a string. With
+    ``return_details=True`` a dict is returned containing the formatted text,
+    original model text and segments, metadata, output path and timing. Set
+    ``write_docx=False`` for an STT-only call (requires ``return_details=True``).
     """
     global _SESSION_GPU_INIT_DONE, _SESSION_HW_CONFIG
+    if not write_docx and not return_details:
+        raise ValueError("write_docx=False requires return_details=True")
     # Initialize all variables at the beginning to ensure they're always accessible
     use_vad = False
     enable_speakers = False
@@ -2400,6 +2429,12 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
         use_vad = False
     
     # Use dataset optimization (parallel GPU processing) for all files when enabled
+    if use_dataset and (return_details or not write_docx or docx_output_path is not None):
+        # The legacy dataset path only returns a DOCX path and cannot fulfil the
+        # structured-result contract. Use the normal engine for advanced calls.
+        print("ℹ️  Dataset optimization disabled for structured/custom output mode")
+        use_dataset = False
+
     if use_dataset:
         try:
             result = transcribe_with_dataset_optimization(input_path, output_dir, threads_override)
@@ -3341,12 +3376,31 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
     # Extract text (with artifact suppression around music)
     result = transcription_result
     full_text = ""
+    raw_text = ""
+    raw_segments = []
     segments_with_speakers = []
     removed_segments = []
     kept_count = 0
     if isinstance(result, dict):
+        result_text = result.get("text", "")
+        if isinstance(result_text, str):
+            raw_text = result_text
+        elif result_text is not None:
+            raw_text = str(result_text)
+
         segments = result.get("segments")
         if isinstance(segments, list) and segments:
+            # Work with copies so the caller-facing raw segments retain the
+            # model's exact text and original order.
+            raw_segments = [dict(seg) for seg in segments if isinstance(seg, dict)]
+            segments = [dict(seg) for seg in raw_segments]
+            if not raw_text.strip():
+                raw_text = " ".join(
+                    str(seg.get("text", "")).strip()
+                    for seg in raw_segments
+                    if str(seg.get("text", "")).strip()
+                ).strip()
+
             def _is_suspicious_music_artifact(seg_text: str) -> bool:
                 t = (seg_text or "").lower()
                 if "©" in seg_text or "(c)" in t or "copyright" in t:
@@ -3366,11 +3420,13 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
             
             for i, seg in enumerate(segments):
                 seg_text = str(seg.get("text", "")).strip()
-                # Light, in-segment de-repetition to curb decode loops without changing wording intent
-                try:
-                    seg_text = _clean_repetitions_in_segment(seg_text)
-                except Exception as _e:
-                    pass
+                # Repetition can be meaningful in a lecture. Only apply the
+                # heuristic when the caller explicitly leaves verbatim mode.
+                if not _is_verbatim_mode():
+                    try:
+                        seg_text = _clean_repetitions_in_segment(seg_text)
+                    except Exception as _e:
+                        pass
                 avg_logprob = seg.get("avg_logprob", 0.0)
                 no_speech_prob = seg.get("no_speech_prob", 0.0)
                 seg_start = seg.get("start", 0)
@@ -3403,7 +3459,7 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
                         "start": seg_start,
                         "end": seg_end,
                     })
-                    print(f"  🧽 Filtered segment {i+1}: [{seg_start:.1f}s-{seg_end:.1f}s] '{seg_text[:30]}...' (suspicious={suspicious}, low_conf={very_low_confidence})")
+                    print(f"  🧽 Filtered segment {i+1}: [{seg_start:.1f}s-{seg_end:.1f}s] '{seg_text[:30]}...' (suspicious={suspicious}, low_conf={extremely_low_confidence})")
                     
             # Assemble text. In verbatim mode, prefer coherent paragraphs built from segment timings.
             para_text = None
@@ -3444,10 +3500,10 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
 
             # Speaker identification removed as requested
         else:
-            text_result = result.get("text", "")
-            full_text = text_result.strip() if isinstance(text_result, str) else str(text_result).strip()
+            full_text = raw_text.strip()
     elif isinstance(result, list) and result:
-        full_text = str(result[0]).strip()
+        raw_text = str(result[0])
+        full_text = raw_text.strip()
     else:
         full_text = ""
 
@@ -3458,8 +3514,13 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
         print(f"   e.g., '{sample['text']}' (avg_logprob={sample['avg_logprob']}, no_speech_prob={sample['no_speech_prob']})")
 
     if not full_text:
-        print("⚠️  Warning: No transcription text generated")
-        full_text = "[No speech detected or transcription failed]"
+        # Never publish a placeholder DOCX as a successful transcription.
+        try:
+            if preprocessing_used and working_input_path != input_path and os.path.exists(working_input_path):
+                os.remove(working_input_path)
+        finally:
+            force_gpu_memory_cleanup()
+        raise RuntimeError("No speech text was produced after all transcription attempts")
 
     print(f"⚡ Hardware utilised: {device_name}")
     
@@ -3469,14 +3530,18 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
     # MINIMAL POST-PROCESSING — Pure Whisper output
     # Only light cleanup; paragraphing already done by _segments_to_paragraphs when segments exist.
     try:
-        # Strip leaked initial-prompt / punctuation-primer text from output.
-        # Whisper sometimes echoes the prompt at segment boundaries or at the end.
-        full_text = _remove_prompt_artifacts(full_text)
-
-        # Remove obvious music hallucinations (watermarks, etc.)
-        full_text, music_removed = _remove_music_hallucinations(full_text)
-        if music_removed:
-            print(f"🎵 Removed {music_removed} music/hallucination pattern(s)")
+        # Plausible spoken phrases must not be deleted by default. The legacy
+        # prompt/music patterns remain available as an explicit opt-in for old
+        # workflows, while the raw model text is always returned unchanged.
+        artifact_cleanup_enabled = str(
+            os.environ.get("TRANSCRIBE_ARTIFACT_CLEANUP", "0")
+        ).strip().lower() in ("1", "true", "yes", "on")
+        music_removed = 0
+        if artifact_cleanup_enabled:
+            full_text = _remove_prompt_artifacts(full_text)
+            full_text, music_removed = _remove_music_hallucinations(full_text)
+            if music_removed:
+                print(f"🎵 Removed {music_removed} music/hallucination pattern(s)")
 
         # Paragraph formatting:
         # If _segments_to_paragraphs already ran (timestamp-based), the text already
@@ -3499,32 +3564,54 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
         formatted_text = full_text
         quality_stats = {}
 
-    # Generate DOCX directly next to the source audio file
+    # Generate the optional DOCX. An explicit file path wins over output_dir;
+    # otherwise the backwards-compatible destination is next to the source.
     docx_path = None
+    docx_error = None
     elapsed = time.time() - start_time
     
     # Final GPU memory check after text processing (first file only)
     if not _SESSION_GPU_INIT_DONE:
         log_gpu_memory_status("after text processing complete")
     
-    try:
-        from txt_to_docx import convert_txt_to_docx_from_text
-        from pathlib import Path
-        source_path = Path(input_path)
-        
-        # Prepare metadata for DOCX footer
-        backend_name = "Faster-Whisper" if using_fw else "Native Whisper"
-        metadata = {
-            'model': f"{backend_name} {selected_model_name}",
-            'device': device_name,
-            'time_taken': format_duration(elapsed),
-            'preprocessing': "Vintage tape preset" if preprocessing_used else "None"
-        }
-        
-        docx_path = convert_txt_to_docx_from_text(formatted_text, source_path, metadata=metadata)
-        print(f"✅ DOCX file saved: {docx_path}")
-    except Exception as docx_err:
-        print(f"⚠️  Failed to generate DOCX: {docx_err}")
+    from pathlib import Path
+    source_path = Path(input_path)
+
+    backend_name = "Faster-Whisper" if using_fw else "Native Whisper"
+    metadata = {
+        'model': f"{backend_name} {selected_model_name}",
+        'device': device_name,
+        'time_taken': format_duration(elapsed),
+        'elapsed_seconds': elapsed,
+        'preprocessing': "Vintage tape preset" if preprocessing_used else "None",
+        'quality': quality_stats,
+    }
+
+    if write_docx:
+        try:
+            from txt_to_docx import convert_txt_to_docx_from_text
+
+            requested_docx_path = None
+            if docx_output_path is not None:
+                requested_docx_path = Path(docx_output_path)
+            elif output_dir:
+                requested_docx_path = Path(output_dir) / source_path.with_suffix(".docx").name
+
+            docx_path = convert_txt_to_docx_from_text(
+                formatted_text,
+                source_path,
+                metadata=metadata,
+                # Do not run context-blind substitutions (for example
+                # check->cheque or program->programme) in the STT engine.
+                use_australian_spelling=False,
+                output_path=requested_docx_path,
+            )
+            print(f"✅ DOCX file saved: {docx_path}")
+        except Exception as docx_err:
+            docx_error = docx_err
+            print(f"⚠️  Failed to generate DOCX: {docx_err}")
+    else:
+        print("ℹ️  DOCX generation skipped (write_docx=False)")
 
     # Final stats
     print("\n🎉 TRANSCRIPTION COMPLETE!")
@@ -3555,7 +3642,21 @@ def transcribe_file_simple_auto(input_path, output_dir=None, threads_override: O
     except Exception as _cleanup_e:
         print(f"⚠️  Failed to remove temporary file: {_cleanup_e}")
 
-    return str(docx_path) if docx_path else None
+    if docx_error is not None:
+        raise RuntimeError(f"Failed to generate DOCX: {docx_error}") from docx_error
+
+    details = {
+        "text": formatted_text,
+        "raw_text": raw_text,
+        "segments": raw_segments,
+        "metadata": metadata,
+        "docx_path": str(docx_path) if docx_path is not None else None,
+        "source_path": str(source_path),
+        "elapsed_seconds": elapsed,
+    }
+    if return_details:
+        return details
+    return str(docx_path) if docx_path is not None else None
 
 
 def transcribe_file_optimised(input_path, model_name="medium", output_dir=None, force_optimised=True, *, threads_override: Optional[int] = None):
