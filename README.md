@@ -92,6 +92,24 @@ For a complete unrestricted archive-folder run, `run_full_pipeline.bat` publishe
 
 The GUI checkbox **Retain detailed troubleshooting logging** defaults on. Turning it off prevents optional `run.jsonl` event logs and stores compact terminology digests instead of duplicating the full selected/dropped glossary lists. Operational manifests, hashes and checkpoints remain because safe resume and provenance depend on them.
 
+## Source DOCX cleanup after review
+
+When the archive run is complete and its GLM Review documents are accepted, use
+the separate planner below. It is **read-only by default**. It recursively
+keeps only source-side ` - GLM Review.docx` files proven by completed local
+Parakeet manifests in the polished workspace, and lists every other source
+DOCX for review:
+
+```powershell
+python prepare_docx_cleanup.py "C:\\path\\to\\archive"
+```
+
+After reviewing the exact count, a deliberate `--apply --expected-count N`
+does not permanently erase files: it moves the approved non-final DOCX files
+to `docx-cleanup-quarantine` in the polished workspace, preserving the folder
+structure for recovery. Do not run the apply mode until the batch is complete
+and you have approved the dry-run list.
+
 Single-file publication is supported for a reviewed canary. Always give it a new, dedicated `--output` directory which contains only that run's manifest; its guarded publication scope is the input file's parent directory. Folder batches remain the normal archive workflow.
 
 ```powershell
