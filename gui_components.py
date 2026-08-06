@@ -124,6 +124,7 @@ class SettingsPanel(tk.Frame):
     """All transcription settings in a compact card."""
 
     MODEL_OPTIONS = [
+        ("nvidia/parakeet-tdt-0.6b-v3",     "NVIDIA Parakeet TDT 0.6B v3  (GPU, fast archive default)"),
         ("faster-whisper-large-v3",       "Faster-Whisper Large-v3  (GPU 4GB+, best quality)"),
         ("faster-whisper-large-v3-turbo", "Faster-Whisper Large-v3-turbo  (GPU 4GB+, 2x faster)"),
         ("faster-whisper-medium",         "Faster-Whisper Medium  (GPU 2GB+, good quality)"),
@@ -162,7 +163,7 @@ class SettingsPanel(tk.Frame):
         self.pipeline_flow = tk.Label(
             self,
             text=(
-                "Local Faster-Whisper Word  →  protected GLM-4.7-Flash cleanup  "
+                "Local NVIDIA Parakeet Word  →  five protected GLM-4.7-Flash review workers  "
                 "→  separate GLM Review Word"
             ),
             bg="#eff6ff",
@@ -179,8 +180,8 @@ class SettingsPanel(tk.Frame):
             self,
             text=(
                 "Completed recordings, stages, and GLM chunks resume after interruption; "
-                "a recording stopped during Whisper restarts from its beginning. Raw "
-                "Whisper Word files and separate GLM Review copies are kept side by side."
+                "a recording stopped during speech-to-text restarts from its beginning. Raw "
+                "speech Word files and separate GLM Review copies are kept side by side."
             ),
             bg=CARD_BG,
             fg=FG_DIM,
@@ -200,7 +201,7 @@ class SettingsPanel(tk.Frame):
         )
         self.existing_transcripts_check = tk.Checkbutton(
             self.existing_transcripts_frame,
-            text="Use existing Word transcripts (skip Whisper)",
+            text="Use existing Word transcripts (skip speech-to-text)",
             variable=self.existing_transcripts_var,
             bg=CARD_BG,
             fg=FG,
@@ -226,9 +227,9 @@ class SettingsPanel(tk.Frame):
         # Model
         tk.Label(self, text="Model:", bg=CARD_BG, fg=FG,
                  font=("Segoe UI", 10, "bold")).grid(row=row, column=0, sticky="w", padx=16, pady=(4, 6))
-        saved_model = ps.get("whisper_model", "faster-whisper-large-v3")
+        saved_model = ps.get("whisper_model", "nvidia/parakeet-tdt-0.6b-v3")
         if saved_model not in valid_models:
-            saved_model = "faster-whisper-large-v3"  # reset stale/invalid model names
+            saved_model = "nvidia/parakeet-tdt-0.6b-v3"  # reset stale/invalid model names
         self.model_var = tk.StringVar(value=saved_model)
         display_map = {k: v for k, v in self.MODEL_OPTIONS}
         self._display_var = tk.StringVar(value=display_map.get(self.model_var.get(), self.MODEL_OPTIONS[0][1]))
@@ -352,6 +353,7 @@ class SettingsPanel(tk.Frame):
     def _on_model_change(self, _evt=None):
         rev = {v: k for k, v in self.MODEL_OPTIONS}
         self.model_var.set(rev.get(self._display_var.get(), self.MODEL_OPTIONS[0][0]))
+        self._toggle_pipeline()
 
     def _toggle_date(self):
         if self.replace_var.get() == "before":
@@ -394,6 +396,7 @@ class SettingsPanel(tk.Frame):
     def _toggle_pipeline(self):
         enabled = bool(self.pipeline_var.get())
         existing_only = enabled and bool(self.existing_transcripts_var.get())
+        uses_parakeet = self.model_var.get().casefold().startswith("nvidia/parakeet-")
         self.pipeline_flow.configure(
             fg="#1d4ed8" if enabled else FG_DIM,
             text=(
@@ -401,8 +404,13 @@ class SettingsPanel(tk.Frame):
                     "Existing Whisper Word  →  protected GLM-4.7-Flash cleanup  "
                     "→  separate GLM Review Word (no audio inference)"
                     if existing_only
-                else "Local Faster-Whisper Word  →  protected GLM-4.7-Flash cleanup  "
+                else (
+                    "Local NVIDIA Parakeet Word  →  five protected GLM-4.7-Flash review workers  "
                     "→  separate GLM Review Word"
+                    if uses_parakeet
+                    else "Local Faster-Whisper Word  →  protected GLM-4.7-Flash cleanup  "
+                    "→  separate GLM Review Word"
+                )
                 )
                 if enabled
                 else "Local transcription only (legacy mode; no protected cleanup)"
@@ -420,7 +428,9 @@ class SettingsPanel(tk.Frame):
             state="normal" if enabled else "disabled"
         )
         self.model_combo.configure(state="disabled" if existing_only else "readonly")
-        self.quality_check.configure(state="disabled" if existing_only else "normal")
+        self.quality_check.configure(
+            state="disabled" if existing_only or uses_parakeet else "normal"
+        )
         if enabled:
             self.pipeline_note.grid()
             self.existing_transcripts_frame.grid()
@@ -435,9 +445,9 @@ class SettingsPanel(tk.Frame):
         """Apply a project-settings dict to the panel widgets."""
         valid_models = {k for k, _ in self.MODEL_OPTIONS}
         display_map = {k: v for k, v in self.MODEL_OPTIONS}
-        saved_model = ps.get("whisper_model", "faster-whisper-large-v3")
+        saved_model = ps.get("whisper_model", "nvidia/parakeet-tdt-0.6b-v3")
         if saved_model not in valid_models:
-            saved_model = "faster-whisper-large-v3"  # reset stale/invalid model names
+            saved_model = "nvidia/parakeet-tdt-0.6b-v3"  # reset stale/invalid model names
         self.model_var.set(saved_model)
         self._display_var.set(display_map.get(saved_model, self.MODEL_OPTIONS[0][1]))
         self.pipeline_var.set(int(bool(ps.get("polished_pipeline", 1))))

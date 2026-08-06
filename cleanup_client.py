@@ -59,6 +59,24 @@ _REPAIR_COUNT_FIELDS = (
 )
 
 
+def _windows_extended_path(path: str | Path) -> str:
+    """Return an extended Windows path when a checkpoint name exceeds MAX_PATH.
+
+    The generated archive root is intentionally descriptive. A long lecture
+    name plus its checksum directory can therefore make the final checkpoint
+    filename longer than Windows' traditional 260-character limit, even when
+    its temporary filename is short. ``\\\\?\\`` lets ``os.replace`` address the
+    durable final name without weakening the atomic-write guarantee.
+    """
+
+    value = os.path.abspath(os.fspath(path))
+    if os.name != "nt" or value.startswith("\\\\?\\"):
+        return value
+    if value.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + value[2:]
+    return "\\\\?\\" + value
+
+
 class CleanupClientError(RuntimeError):
     """Base class for cleanup client failures."""
 
@@ -892,10 +910,11 @@ class CleanupClient:
         glossary: GlossarySnapshot,
         preceding_context: str,
     ) -> tuple[CleanupChunkResult | None, str | None]:
-        if not path.exists():
+        filesystem_path = Path(_windows_extended_path(path))
+        if not filesystem_path.exists():
             return None, None
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(filesystem_path.read_text(encoding="utf-8"))
             expected = {
                 "checkpoint_version": CHECKPOINT_VERSION,
                 "input_sha256": input_sha256,
@@ -987,14 +1006,19 @@ class CleanupClient:
                 "usage": result.usage,
             },
         }
-        path.parent.mkdir(parents=True, exist_ok=True)
+        filesystem_path = Path(_windows_extended_path(path))
+        filesystem_parent = Path(_windows_extended_path(path.parent))
+        filesystem_parent.mkdir(parents=True, exist_ok=True)
         temporary_name: str | None = None
         try:
             with tempfile.NamedTemporaryFile(
                 mode="w",
                 encoding="utf-8",
-                dir=path.parent,
-                prefix=f".{path.name}.",
+                dir=filesystem_parent,
+                # Keep the atomic-write temporary name intentionally short.
+                # Deep output roots plus the descriptive final checkpoint name
+                # can otherwise exceed the traditional Windows path limit.
+                prefix=".cp-",
                 suffix=".tmp",
                 delete=False,
             ) as temporary:
@@ -1003,7 +1027,7 @@ class CleanupClient:
                 temporary.write("\n")
                 temporary.flush()
                 os.fsync(temporary.fileno())
-            os.replace(temporary_name, path)
+            os.replace(temporary_name, filesystem_path)
         finally:
             if temporary_name and os.path.exists(temporary_name):
                 os.unlink(temporary_name)

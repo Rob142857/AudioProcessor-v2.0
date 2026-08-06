@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from archive_pipeline import (
+    DEFAULT_GUI_STT_MODEL,
     PipelineConfig,
     PipelineRunner,
     SOURCE_DOCX_PUBLICATION_REPORT,
@@ -96,7 +97,9 @@ class ArchivePipelineTests(unittest.TestCase):
         self.assertFalse(config.publish_source_docx)
         self.assertFalse(config.existing_transcripts_only)
         self.assertTrue(config.retain_troubleshooting_artifacts)
+        self.assertEqual(config.glm_workers, 5)
         self.assertFalse(parse_args(["archive"]).publish_source_docx)
+        self.assertEqual(parse_args(["archive"]).glm_workers, 5)
         self.assertTrue(
             parse_args(["archive", "--no-troubleshooting-logs"]).no_troubleshooting_logs
         )
@@ -112,6 +115,68 @@ class ArchivePipelineTests(unittest.TestCase):
                 self.assertTrue(
                     parse_args(["archive", flag]).existing_transcripts_only
                 )
+
+    def test_parakeet_staged_run_hands_durable_raw_jobs_to_two_glm_workers(self):
+        """The GPU producer may advance before independent cleanup consumers finish."""
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source_root = root / "archive"
+            output_root = root / "output"
+            source_root.mkdir()
+            sources = [source_root / "one.wav", source_root / "two.wav"]
+            for source in sources:
+                source.write_bytes(b"synthetic-audio-fixture")
+
+            def fake_transcribe(runner, source):
+                text = f"This is a durable transcript for {source.stem} with sufficient words."
+                return {
+                    "raw_text": text,
+                    "text": text,
+                    "segments": [{"start": 0, "end": 10, "text": text}],
+                    "elapsed_seconds": 0.01,
+                    "metadata": {
+                        "model": runner.config.stt_model,
+                        "backend": "nvidia-parakeet",
+                        "device": "cuda",
+                        "audio_duration_seconds": 10,
+                    },
+                }
+
+            cleanup_client = FakeCleanupClient()
+            config = PipelineConfig(
+                input_path=source_root,
+                output_root=output_root,
+                stt_model=DEFAULT_GUI_STT_MODEL,
+                glm_workers=2,
+            )
+            runner = PipelineRunner(config)
+            try:
+                with mock.patch.object(
+                    PipelineRunner,
+                    "_get_cleanup_client",
+                    return_value=cleanup_client,
+                ), mock.patch.object(
+                    PipelineRunner,
+                    "_transcribe",
+                    autospec=True,
+                    side_effect=fake_transcribe,
+                ):
+                    counts = runner.run()
+                self.assertEqual(2, counts["verified"])
+                self.assertEqual(0, counts["failed"])
+                self.assertGreaterEqual(cleanup_client.calls, 2)
+                for source in sources:
+                    paths = artifact_paths(
+                        artifact_directory(source, source_root, output_root)
+                    )
+                    manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
+                    self.assertEqual("verified", manifest["status"])
+                    self.assertTrue(paths["raw_text"].is_file())
+                    self.assertTrue(paths["clean_text"].is_file())
+                    self.assertTrue(paths["docx"].is_file())
+            finally:
+                runner.close()
 
     def test_off_mode_compacts_terminology_bodies_to_digests(self):
         terminology = {
@@ -246,7 +311,7 @@ class ArchivePipelineTests(unittest.TestCase):
             self.assertEqual(recursive, [direct.resolve(), nested_audio.resolve()])
             self.assertEqual(flat, [direct.resolve()])
 
-    def test_source_docx_collision_is_rejected_before_any_recording_runs(self):
+    def test_same_stem_audio_variants_collapse_to_one_canonical_source(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             source_root = root / "archive"
@@ -262,24 +327,21 @@ class ArchivePipelineTests(unittest.TestCase):
                     output_root=output_root,
                     cleanup_enabled=False,
                     publish_source_docx=True,
+                    dry_run=True,
                 )
             )
             try:
                 with mock.patch.object(runner, "process_one") as process_one:
-                    with self.assertRaisesRegex(
-                        ValueError, "source-adjacent DOCX target collisions"
-                    ) as caught:
-                        runner.run()
+                    counts = runner.run()
                 process_one.assert_not_called()
             finally:
                 runner.close()
 
-            message = str(caught.exception)
-            self.assertIn(str(mp3.resolve()), message)
-            self.assertIn(str(wav.resolve()), message)
-            self.assertIn(
-                str(mp3.with_name("lecture - GLM Review.docx").resolve()),
-                message,
+            # Lossless WAV takes precedence over MP3 for a folder selection.
+            self.assertEqual(counts["discovered"], 1)
+            self.assertEqual(counts["queued"], 1)
+            self.assertEqual(
+                discover_audio(source_root, output_root), [wav.resolve()]
             )
 
     def test_fresh_stt_rejects_raw_whisper_review_cross_role_collision(self):
@@ -314,7 +376,7 @@ class ArchivePipelineTests(unittest.TestCase):
             collision = ordinary.with_name("lecture - GLM Review.docx").resolve()
             self.assertIn(str(collision), message)
             self.assertIn(f"GLM review: {ordinary.resolve()}", message)
-            self.assertIn(f"raw Whisper: {review_named.resolve()}", message)
+            self.assertIn(f"raw speech-to-text: {review_named.resolve()}", message)
 
     def test_collision_validation_uses_the_already_filtered_selected_set(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -1196,6 +1258,19 @@ class ArchivePipelineTests(unittest.TestCase):
             found = [item.name for item in discover_audio(root, output)]
 
             self.assertEqual(found, ["one.mp3", "three.3gp", "two.aiff"])
+
+    def test_discovery_prefers_highest_quality_same_stem_container(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder) / "archive"
+            output = root / "generated"
+            root.mkdir()
+            output.mkdir()
+            for name in ("lecture.3gp", "lecture.mp3", "lecture.flac"):
+                (root / name).write_bytes(b"data")
+
+            found = discover_audio(root, output)
+
+            self.assertEqual(found, [(root / "lecture.flac").resolve()])
 
     def test_same_stem_different_formats_have_distinct_artifact_directories(self):
         with tempfile.TemporaryDirectory() as folder:

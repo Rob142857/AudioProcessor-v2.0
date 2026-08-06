@@ -1,8 +1,8 @@
 # AudioProcessor v2.0
 
-Audio and video transcription for Windows x64 using Faster-Whisper (CTranslate2), with an optional protected GLM cleanup stage for the Dr Philip Groves archive.
+Audio and video transcription for Windows x64 using local NVIDIA Parakeet or Faster-Whisper, with protected GLM cleanup for the Dr Philip Groves archive.
 
-For archive-wide work, use the resume-safe pipeline documented in [docs/UNIFIED_PIPELINE.md](docs/UNIFIED_PIPELINE.md). It preserves raw text and timestamps, checkpoints each stage, uses the complete pinned glossary for Whisper hotword selection and GLM cleanup, and writes working artifacts into a separate output tree. Fresh STT publishes `<name>.docx` plus `<name> - GLM Review.docx`; skip-Whisper mode leaves the existing `<name>.docx` byte-for-byte unchanged and publishes only the review sibling. Every GLM Review copy carries a removable `Needs human review.` notice beneath its provenance statement.
+For archive-wide work, use the resume-safe pipeline documented in [docs/UNIFIED_PIPELINE.md](docs/UNIFIED_PIPELINE.md). It writes durable raw text before review, checkpoints each stage, uses the complete pinned glossary for GLM cleanup, and writes working artifacts into a separate output tree. With the Parakeet default, one local GPU worker continues to the next recording as soon as its raw transcript is durable, while two independent GLM review workers consume that queue. Fresh STT publishes `<name>.docx` plus `<name> - GLM Review.docx`; existing-transcript mode leaves the source `<name>.docx` byte-for-byte unchanged and publishes only the review sibling. Every GLM Review copy carries a removable `Needs human review.` notice beneath its provenance statement.
 
 ## What It Does
 
@@ -10,7 +10,9 @@ Converts audio/video files into professionally formatted DOCX transcripts. It de
 
 ### Key Features
 
-- **Faster-Whisper Large-v3** — fidelity-oriented local default
+- **NVIDIA Parakeet TDT 0.6B v3** — fast local archive default, loaded once per batch
+- **Five GLM review workers** — begin as each durable Parakeet transcript is ready, without holding the GPU lane
+- **Faster-Whisper Large-v3** — retained comparison/fallback option
 - **Faster-Whisper Large-v3-turbo** — faster comparison/overflow option
 - **Native Whisper Large-v3** — OpenAI fallback (GPU or CPU)
 - **Vintage tape preprocessing** — noise reduction, loudness normalisation, dynamic range compression optimised for 1980s–90s recordings
@@ -39,8 +41,10 @@ The installer tries registered `py -3.12` first, then `%LOCALAPPDATA%\Programs\P
 .\run.bat
 ```
 
-The GUI defaults to **Polished archive pipeline**: local Faster-Whisper,
-protected GLM-4.7-Flash cleanup, and separate human-review Word publication.
+The GUI defaults to **Polished archive pipeline**: local NVIDIA Parakeet,
+five protected GLM-4.7-Flash cleanup workers, and separate human-review Word
+publication. Its two live panes show the GPU speech-to-text lane and the GLM
+review queue independently.
 It runs the full environment and protected-access preflight before opening any
 audio. Existing-output selection remains available, including strict
 `Refresh transcripts before…`; normal reruns reuse verified checkpoints, while
@@ -72,7 +76,19 @@ The equivalent headless skip-Whisper route is:
 .\run_full_pipeline.bat "C:\path\to\recordings" --existing-transcripts-only --existing-docx-mode all
 ```
 
-For a complete unrestricted archive-folder run, `run_full_pipeline.bat` publishes each completed job immediately. Fresh STT creates or refreshes the raw Whisper `<name>.docx` according to the selected policy and writes GLM output to `<name> - GLM Review.docx`. Skip-Whisper never changes the source DOCX. An older tool-generated review copy is atomically replaced only when its hash is proven by a prior journal; a manually changed review fails closed. Exact backups live under the separate polished workspace in `publication-backups/<run-id>/`, never as archive sidecars. A `needs_review` result is still published for human checking and always records `approval_state: pending_human_review`; failed or incomplete jobs are not published. Use `--no-publish-source-docx` to keep results only in the separate polished output tree.
+### Local Parakeet comparison
+
+Parakeet is installed in an isolated environment and is now the production GUI
+default. The comparison runner remains useful for one-recording checks; it
+writes only `<name> - Parakeet v3.txt` and a small provenance JSON file beside it.
+
+```powershell
+.\.parakeet-venv\Scripts\python.exe .\parakeet_compare.py "C:\path\to\one-recording-folder"
+```
+
+Do not run this while the GUI is using the GTX 1070 Ti for Parakeet.
+
+For a complete unrestricted archive-folder run, `run_full_pipeline.bat` publishes each completed reviewed job immediately. Fresh STT creates or refreshes the raw speech `<name>.docx` according to the selected policy and writes GLM output to `<name> - GLM Review.docx`. Existing-transcript mode never changes the source DOCX. An older tool-generated review copy is atomically replaced only when its hash is proven by a prior journal; a manually changed review fails closed. Exact backups live under the separate polished workspace in `publication-backups/<run-id>/`, never as archive sidecars. A `needs_review` result is still published for human checking and always records `approval_state: pending_human_review`; failed or incomplete jobs are not published. Use `--no-publish-source-docx` to keep results only in the separate polished output tree.
 
 The GUI checkbox **Retain detailed troubleshooting logging** defaults on. Turning it off prevents optional `run.jsonl` event logs and stores compact terminology digests instead of duplicating the full selected/dropped glossary lists. Operational manifests, hashes and checkpoints remain because safe resume and provenance depend on them.
 

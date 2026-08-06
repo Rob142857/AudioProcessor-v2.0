@@ -1,8 +1,8 @@
 """AudioProcessor v2.0 — Speech-to-Text Transcription Tool
 
-Clean GUI for converting audio/video to text using Whisper AI.
-  - Faster-Whisper large-v3 (GPU, CTranslate2 int8) -- recommended
-  - Native Whisper large-v3 (GPU / CPU fallback)
+Clean GUI for converting audio/video to text with local speech models.
+  - NVIDIA Parakeet TDT 0.6B v3 (GPU) -- archive default
+  - Faster-Whisper large-v3 (GPU, CTranslate2 int8) -- retained comparison option
   - Single file or recursive batch processing
   - Skip / replace / replace-before-date for existing outputs
 """
@@ -248,7 +248,7 @@ def _run_batch(paths: List[str], q: queue.Queue,
 
 
 def _run_polished_pipeline(input_path: str, settings: dict, q: queue.Queue) -> int:
-    """Run the resumable Whisper -> GLM -> Word path used by the GUI."""
+    """Run the resumable local STT -> GLM -> Word path used by the GUI."""
 
     from archive_pipeline import PipelineConfig, default_output_root, execute_pipeline
 
@@ -270,11 +270,14 @@ def _run_polished_pipeline(input_path: str, settings: dict, q: queue.Queue) -> i
     retain_troubleshooting_artifacts = bool(
         settings.get("retain_troubleshooting_artifacts", True)
     )
+    selected_stt_model = str(
+        settings.get("whisper_model", "nvidia/parakeet-tdt-0.6b-v3")
+    )
     cutoff = _validate_polished_selection(settings)
     config = PipelineConfig(
         input_path=source,
         output_root=output_root,
-        stt_model=str(settings.get("whisper_model", "faster-whisper-large-v3")),
+        stt_model=selected_stt_model,
         force=bool(settings.get("force_reprocess", False)),
         publish_source_docx=True,
         recursive=bool(settings.get("recursive", True)),
@@ -282,6 +285,8 @@ def _run_polished_pipeline(input_path: str, settings: dict, q: queue.Queue) -> i
         replace_before_date=cutoff,
         existing_transcripts_only=existing_transcripts_only,
         retain_troubleshooting_artifacts=retain_troubleshooting_artifacts,
+        glm_workers=5,
+        progress_callback=lambda lane, message: q.put(("progress", lane, message)),
     )
     q.put(f"Polished artifacts: {output_root}\n")
     if not retain_troubleshooting_artifacts:
@@ -291,20 +296,29 @@ def _run_polished_pipeline(input_path: str, settings: dict, q: queue.Queue) -> i
         )
     if existing_transcripts_only:
         q.put(
-            "Pipeline: existing Whisper Word -> protected GLM-4.7-Flash -> "
+            "Pipeline: existing speech Word -> protected GLM-4.7-Flash -> "
             "separate '<name> - GLM Review.docx' (Whisper and audio skipped; "
             "source Word remains unchanged)\n"
         )
     else:
-        q.put(
-            "Pipeline: local Faster-Whisper -> raw '<name>.docx' plus protected "
-            "GLM-4.7-Flash '<name> - GLM Review.docx'\n"
-        )
+        if selected_stt_model.casefold().startswith("nvidia/parakeet-"):
+            q.put(
+                "Pipeline: one local Parakeet GPU worker -> durable raw '<name>.docx'; "
+                "five protected GLM-4.7-Flash workers review the completed queue independently.\n"
+            )
+        else:
+            q.put(
+                "Pipeline: local Faster-Whisper -> raw '<name>.docx' plus protected "
+                "GLM-4.7-Flash '<name> - GLM Review.docx'\n"
+            )
     return int(execute_pipeline(config, cancel_check=STOP_FLAG.is_set))
 
 
 def _run_polished_preflight(
-    q: queue.Queue, *, existing_transcripts_only: bool = False
+    q: queue.Queue,
+    *,
+    existing_transcripts_only: bool = False,
+    stt_model: str = "nvidia/parakeet-tdt-0.6b-v3",
 ) -> bool:
     """Fail before opening audio when the pinned production lane is incomplete."""
 
@@ -318,6 +332,7 @@ def _run_polished_preflight(
         cleanup_required=True,
         mode="cleanup-only" if existing_transcripts_only else "full",
         require_gpu=not existing_transcripts_only,
+        stt_model=None if existing_transcripts_only else stt_model,
     )
     symbols = {"ok": "OK", "warning": "WARN", "error": "ERROR"}
     for check in checks:
@@ -511,8 +526,10 @@ def launch_gui():
             and snap.get("existing_transcripts_only", False)
         )
 
-        log.clear()
-        log.append("Starting...\n")
+        stt_log.clear()
+        glm_log.clear()
+        stt_log.append("Starting speech-to-text lane...\n")
+        glm_log.append("Starting protected GLM review queue...\n")
         run_btn.configure(state="disabled")
         stop_btn.configure(state="normal")
         clear_btn.configure(state="disabled")
@@ -547,7 +564,9 @@ def launch_gui():
                 # protected cleanup, and rendering paths are entered.
                 if not existing_only_run:
                     os.environ["TRANSCRIBE_MODEL_NAME"] = snap["whisper_model"]
-                    if snap["whisper_model"].startswith("faster-whisper-"):
+                    if snap["whisper_model"].casefold().startswith("nvidia/parakeet-"):
+                        os.environ.pop("TRANSCRIBE_FORCE_NATIVE_WHISPER", None)
+                    elif snap["whisper_model"].startswith("faster-whisper-"):
                         os.environ.pop("TRANSCRIBE_FORCE_NATIVE_WHISPER", None)
                     else:
                         os.environ["TRANSCRIBE_FORCE_NATIVE_WHISPER"] = "1"
@@ -568,6 +587,7 @@ def launch_gui():
                     if not _run_polished_preflight(
                         q,
                         existing_transcripts_only=existing_transcripts_only,
+                        stt_model=str(snap.get("whisper_model", "nvidia/parakeet-tdt-0.6b-v3")),
                     ):
                         return
                     exit_code = _run_polished_pipeline(inp, snap, q)
@@ -575,13 +595,13 @@ def launch_gui():
                         q.put("\nStopped safely. Completed checkpoints were preserved.\n")
                     elif exit_code == 0:
                         q.put(
-                            "\nPipeline completed. Raw Whisper documents and "
+                            "\nPipeline completed. Raw speech documents and "
                             "separate GLM Review copies are ready.\n"
                         )
                     elif exit_code == 3:
                         q.put(
                             "\nPipeline completed. One or more GLM Review documents are "
-                            "flagged for human checking; original Whisper documents "
+                            "flagged for human checking; original speech documents "
                             "remain untouched.\n"
                         )
                     else:
@@ -632,11 +652,12 @@ def launch_gui():
             except Exception:
                 pass
         stop_btn.configure(state="disabled")
-        log.append(
-            "\nCancellation requested. The current operation or protected cleanup "
-            "chunk may take a little time to finish; completed checkpoints will "
-            "be preserved. A recording stopped during Whisper will restart from "
-            "its beginning on the next run.\n"
+        stt_log.append(
+            "\nCancellation requested. The current speech-to-text operation will stop safely; "
+            "completed raw transcripts and GLM checkpoints are preserved.\n"
+        )
+        glm_log.append(
+            "\nCancellation requested. No new GLM review will start; completed chunks are preserved.\n"
         )
 
     def clear_cache():
@@ -661,7 +682,7 @@ def launch_gui():
                 torch.cuda.empty_cache()  # reclaim after ipc_collect
         except Exception:
             pass
-        log.append("Model unloaded & GPU cache cleared.\n")
+        stt_log.append("Model cache cleared.\n")
 
     def configure_cleanup_access():
         try:
@@ -720,9 +741,33 @@ def launch_gui():
     settings_panel.existing_transcripts_var.trace_add("write", update_run_label)
     update_run_label()
 
-    # ── Log panel ────────────────────────────────────────────────────
-    log = LogPanel(outer)
-    log.grid(row=4, column=0, sticky="nsew", pady=(0, 0))
+    # ── Live pipeline lanes ──────────────────────────────────────────
+    # The two panes expose the actual producer/consumer hand-off: one GPU
+    # Parakeet worker continues with the next recording while five GLM workers
+    # independently review already-durable raw transcripts.
+    logs = tk.Frame(outer, bg=BG)
+    logs.grid(row=4, column=0, sticky="nsew", pady=(0, 0))
+    logs.columnconfigure(0, weight=1)
+    logs.columnconfigure(1, weight=1)
+    logs.rowconfigure(1, weight=1)
+    tk.Label(
+        logs,
+        text="Parakeet speech-to-text (one local GPU worker)",
+        bg=BG,
+        fg="#1d4ed8",
+        font=("Segoe UI", 9, "bold"),
+    ).grid(row=0, column=0, sticky="w", pady=(0, 4))
+    tk.Label(
+        logs,
+        text="GLM review queue (five protected workers)",
+        bg=BG,
+        fg="#0f766e",
+        font=("Segoe UI", 9, "bold"),
+    ).grid(row=0, column=1, sticky="w", padx=(12, 0), pady=(0, 4))
+    stt_log = LogPanel(logs)
+    stt_log.grid(row=1, column=0, sticky="nsew")
+    glm_log = LogPanel(logs)
+    glm_log.grid(row=1, column=1, sticky="nsew", padx=(12, 0))
 
     def on_window_close():
         outcome = _handle_window_close(
@@ -738,7 +783,7 @@ def launch_gui():
             destroy=root.destroy,
         )
         if outcome == "stopping":
-            log.append(
+            stt_log.append(
                 "The window will close automatically after the safe stop completes.\n"
             )
 
@@ -749,7 +794,15 @@ def launch_gui():
         try:
             while True:
                 msg = q.get_nowait()
-                log.append(msg)
+                if (
+                    isinstance(msg, tuple)
+                    and len(msg) == 3
+                    and msg[0] == "progress"
+                ):
+                    _marker, lane, text = msg
+                    (glm_log if lane == "glm" else stt_log).append(str(text))
+                else:
+                    stt_log.append(str(msg))
         except queue.Empty:
             pass
         root.after(120, poll)
@@ -769,8 +822,8 @@ def main():
     parser.add_argument("--outdir", help="Output folder override")
     parser.add_argument("--gui", action="store_true", help="Launch GUI")
     parser.add_argument("--threads", type=int, help="CPU thread override")
-    parser.add_argument("--model", default="faster-whisper-large-v3",
-                        help="Model: faster-whisper-large-v3 | large-v3")
+    parser.add_argument("--model", default="nvidia/parakeet-tdt-0.6b-v3",
+                        help="Model: nvidia/parakeet-tdt-0.6b-v3 | faster-whisper-large-v3 | large-v3")
     args = parser.parse_args()
 
     if args.gui or not args.input:

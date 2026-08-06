@@ -14,13 +14,15 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import queue
 import re
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import traceback
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Optional
@@ -37,7 +39,11 @@ from stt_coverage import (
 configure_safe_stdio()
 
 
-PIPELINE_VERSION = "3.0.0"
+PIPELINE_VERSION = "3.1.0"
+DEFAULT_STT_MODEL = "faster-whisper-large-v3"
+DEFAULT_GUI_STT_MODEL = "nvidia/parakeet-tdt-0.6b-v3"
+DEFAULT_GLM_REVIEW_WORKERS = 5
+PARAKEET_MODEL_PREFIX = "nvidia/parakeet-"
 DEFAULT_CLEANUP_ENDPOINT = (
     "https://pg.objectiveartefacts.com.au/api/tooling/cleanup-chunk"
 )
@@ -95,6 +101,35 @@ STT_RUNTIME_PACKAGES = (
     "openai-whisper",
     "torch",
 )
+# A single lecture sometimes exists in several containers (typically a legacy
+# 3GP plus an MP3, or an MP3 plus a later FLAC). Fresh publication is sibling
+# DOCX based, so those variants must resolve to one canonical source rather
+# than colliding over the same ``<stem>.docx`` and Review document. This order
+# favours lossless audio first, then ordinary audio containers, then video and
+# legacy mobile containers. An explicitly selected individual file is never
+# substituted.
+CANONICAL_AUDIO_EXTENSION_ORDER = (
+    ".wav",
+    ".flac",
+    ".aiff",
+    ".aif",
+    ".m4a",
+    ".mp3",
+    ".aac",
+    ".ogg",
+    ".wma",
+    ".webm",
+    ".mkv",
+    ".mov",
+    ".mp4",
+    ".avi",
+    ".wmv",
+    ".flv",
+    ".3gp",
+)
+CANONICAL_AUDIO_EXTENSION_RANK = {
+    extension: rank for rank, extension in enumerate(CANONICAL_AUDIO_EXTENSION_ORDER)
+}
 
 
 def utc_now() -> str:
@@ -458,7 +493,12 @@ def discover_audio(
     replace_before_date: Optional[str] = None,
     existing_transcripts_only: bool = False,
 ) -> list[Path]:
-    """Return deterministic, collision-preserving audio discovery results."""
+    """Return deterministic, publication-safe recording discovery results.
+
+    Folder discovery collapses same-stem alternate containers to the canonical
+    source audio variant. This keeps the raw and GLM Review Word destinations
+    unambiguous without deleting or modifying any alternate recording.
+    """
     if existing_transcripts_only:
         selected, _stats = _existing_transcript_discovery(
             input_path,
@@ -488,7 +528,7 @@ def discover_audio(
     if not input_path.is_dir():
         raise FileNotFoundError(f"Input does not exist: {input_path}")
 
-    files: list[Path] = []
+    grouped: dict[str, list[Path]] = {}
     candidates = input_path.rglob("*") if recursive else input_path.iterdir()
     for candidate in candidates:
         if not candidate.is_file():
@@ -504,7 +544,24 @@ def discover_audio(
                 replace_before_date,
             )
         ):
-            files.append(resolved)
+            key = os.path.normcase(
+                os.path.abspath(str(resolved.with_suffix(".docx")))
+            )
+            grouped.setdefault(key, []).append(resolved)
+
+    def canonical_variant(candidates: list[Path]) -> Path:
+        return min(
+            candidates,
+            key=lambda item: (
+                CANONICAL_AUDIO_EXTENSION_RANK.get(item.suffix.casefold(), 99),
+                # For duplicate copies in the same container, prefer the most
+                # substantial file before falling back to a stable path order.
+                -item.stat().st_size,
+                str(item).casefold(),
+            ),
+        )
+
+    files = [canonical_variant(variants) for variants in grouped.values()]
     return sorted(files, key=lambda item: str(item).casefold())
 
 
@@ -538,7 +595,7 @@ def validate_source_docx_target_collisions(
     Artifact directories include the source extension and are collision-safe,
     but source-adjacent publication normalises source extensions. Fresh-STT runs
     publish both ``<stem>.docx`` and ``<stem> - GLM Review.docx``; validate the
-    union so one source's raw Whisper target cannot overwrite another source's
+    union so one source's raw speech-to-text target cannot overwrite another source's
     review target. Imported-DOCX runs publish only the review target.
     """
 
@@ -563,7 +620,7 @@ def validate_source_docx_target_collisions(
             add_target(
                 (scope_root / relative).with_suffix(".docx"),
                 source,
-                "raw Whisper",
+                "raw speech-to-text",
             )
 
     collisions = [
@@ -588,7 +645,7 @@ def validate_source_docx_target_collisions(
         )
     raise ValueError(
         "selected recordings contain source-adjacent DOCX target collisions; "
-        "choose one source recording from each group before running:\n"
+        "rename or omit the conflicting source recording before running:\n"
         + "\n".join(details)
     )
 
@@ -984,7 +1041,7 @@ def validate_imported_artifacts(
 class PipelineConfig:
     input_path: Path
     output_root: Path
-    stt_model: str = "faster-whisper-large-v3"
+    stt_model: str = DEFAULT_STT_MODEL
     cleanup_enabled: bool = True
     cleanup_endpoint: str = DEFAULT_CLEANUP_ENDPOINT
     cleanup_model: str = DEFAULT_CLEANUP_MODEL
@@ -1000,6 +1057,15 @@ class PipelineConfig:
     replace_before_date: Optional[str] = None
     existing_transcripts_only: bool = False
     retain_troubleshooting_artifacts: bool = True
+    # Internal stage-only mode. It creates durable raw STT artifacts, then
+    # returns them to the concurrent GLM queue without asking the cleanup
+    # service or writing a provisional final document.
+    stt_only: bool = False
+    # A value above one enables the staged Parakeet -> GLM batch lane. One
+    # local Parakeet worker owns the GPU; this many independent GLM workers
+    # review already-durable raw transcripts over the protected service.
+    glm_workers: int = DEFAULT_GLM_REVIEW_WORKERS
+    progress_callback: Optional[Callable[[str, str], None]] = None
     limit: Optional[int] = None
 
     @property
@@ -1033,8 +1099,12 @@ class PipelineConfig:
 class JobIndex:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(path)
+        # The staged pipeline has one STT and two cleanup runners. Each owns a
+        # separate connection; WAL plus a patient busy timeout keeps the index
+        # durable rather than treating a momentary write overlap as job loss.
+        self.connection = sqlite3.connect(path, timeout=30, check_same_thread=False)
         self.connection.execute("PRAGMA journal_mode=WAL")
+        self.connection.execute("PRAGMA busy_timeout=30000")
         self.connection.execute(
             """
             CREATE TABLE IF NOT EXISTS jobs (
@@ -1131,6 +1201,13 @@ class PipelineRunner:
                     "existing-transcript mode already defines its raw-input route; "
                     "do not combine it with cleanup-only or render-only"
                 )
+        if self.config.stt_only:
+            if self.config.existing_transcripts_only:
+                raise ValueError("STT-only mode cannot import an existing Word transcript")
+            if self.config.cleanup_only or self.config.render_only:
+                raise ValueError("STT-only mode cannot be combined with a later-stage-only mode")
+        if self.config.glm_workers < 1:
+            raise ValueError("GLM worker count must be at least one")
         if self.config.publish_source_docx:
             require_disjoint_publication_roots(
                 self.config.input_path,
@@ -1139,6 +1216,7 @@ class PipelineRunner:
         self.config.output_root.mkdir(parents=True, exist_ok=True)
         self.index = JobIndex(self.config.output_root / "pipeline.sqlite3")
         self.cleanup_client: Any = None
+        self.parakeet_session: Any = None
         self._stt_glossary_terms: tuple[str, ...] = ()
         self.cancel_check = cancel_check or (lambda: False)
         self.selected_manifest_paths: tuple[Path, ...] = ()
@@ -1147,6 +1225,7 @@ class PipelineRunner:
         # from publishing an old final manifest for a later, unvisited source.
         self.processed_manifest_paths: list[Path] = []
         self.per_job_publication_reports: list[dict[str, Any]] = []
+        self.incremental_publication_handled = False
         self.stt_runtime_versions = (
             {}
             if self.config.existing_transcripts_only
@@ -1156,7 +1235,25 @@ class PipelineRunner:
         )
 
     def close(self) -> None:
+        if self.parakeet_session is not None:
+            self.parakeet_session.close(force=bool(self.cancel_check()))
+            self.parakeet_session = None
         self.index.close()
+
+    def _emit_progress(self, lane: str, message: str) -> None:
+        """Send compact, thread-safe GUI progress without changing CLI output."""
+
+        callback = self.config.progress_callback
+        if callback is not None:
+            try:
+                callback(lane, message)
+            except Exception:
+                # GUI diagnostics must never make an archive job fail.
+                pass
+
+    @property
+    def _uses_parakeet(self) -> bool:
+        return self.config.stt_model.casefold().startswith(PARAKEET_MODEL_PREFIX)
 
     def _check_cancelled(self, phase: str) -> None:
         raise_if_cancelled(self.cancel_check, phase=phase)
@@ -1284,7 +1381,13 @@ class PipelineRunner:
                     "threads": self.config.threads,
                     "environment": content_environment,
                     "prompt": prompt_values,
-                    "cleanup_glossary_sha256": glossary_sha256,
+                    # Parakeet has no prompt/hotword interface. Its raw output
+                    # must therefore not be invalidated when the editable GLM
+                    # glossary changes; the glossary is applied in the later
+                    # protected cleanup stage instead.
+                    "cleanup_glossary_sha256": (
+                        None if self._uses_parakeet else glossary_sha256
+                    ),
                     "hotword_selection_version": HOTWORD_SELECTION_VERSION,
                     "runtime": self.stt_runtime_versions,
                 }
@@ -1480,6 +1583,23 @@ class PipelineRunner:
         )
 
     def _transcribe(self, source: Path) -> dict[str, Any]:
+        if self._uses_parakeet:
+            from parakeet_stt import ParakeetCancelledError, ParakeetSession
+
+            if self.parakeet_session is None:
+                self.parakeet_session = ParakeetSession(
+                    model=self.config.stt_model,
+                    device="cuda",
+                    log=lambda message: self._emit_progress("stt", message),
+                )
+            try:
+                return self.parakeet_session.transcribe(
+                    source,
+                    cancel_check=self.cancel_check,
+                )
+            except ParakeetCancelledError as exc:
+                raise PipelineCancelledError(str(exc)) from exc
+
         os.environ["TRANSCRIBE_MODEL_NAME"] = self.config.stt_model
         os.environ.setdefault("TRANSCRIBE_VERBATIM", "1")
         os.environ.setdefault("TRANSCRIBE_ALLOW_PROMPT", "1")
@@ -1883,6 +2003,17 @@ class PipelineRunner:
                     artifact_path=str(rendered_whisper),
                 )
 
+            if self.config.stt_only:
+                # This is the hand-off point between the single local GPU lane
+                # and the independent GLM review queue. The source hash, raw
+                # text, coarse clip timing and raw Word transcript are already
+                # durable, so a cleanup failure never causes another audio run.
+                manifest["status"] = "raw_complete"
+                manifest["stage"] = "raw_complete"
+                self._save_manifest(source, relative, paths, manifest)
+                self._append_event(paths["events"], "raw_stage_completed")
+                return "raw_complete"
+
             self._check_cancelled("between transcription and cleanup")
             raw_sha256 = sha256_text(raw_text)
             cleanup_needs_review = False
@@ -2209,7 +2340,286 @@ class PipelineRunner:
             )
             return "failed"
 
+    def _run_staged_parakeet(self) -> dict[str, int]:
+        """Run one local Parakeet lane and independent GLM review workers.
+
+        Each stage has a durable boundary at ``raw_complete``.  A GLM outage,
+        stop request, or one failed recording leaves the raw transcript and its
+        manifest intact, and the next identical run starts from that boundary.
+        """
+
+        self.processed_manifest_paths.clear()
+        self.per_job_publication_reports.clear()
+        files = discover_audio(
+            self.config.input_path,
+            self.config.output_root,
+            recursive=self.config.recursive,
+            existing_docx_mode=self.config.existing_docx_mode,
+            replace_before_date=self.config.replace_before_date,
+        )
+        if self.config.limit is not None:
+            files = files[: max(0, self.config.limit)]
+        if self.config.publish_source_docx:
+            validate_source_docx_target_collisions(
+                files,
+                self.config.input_path,
+                include_whisper_docx=True,
+            )
+        self.selected_manifest_paths = tuple(
+            artifact_paths(
+                artifact_directory(source, self.config.input_path, self.config.output_root)
+            )["manifest"]
+            for source in files
+        )
+        counts: dict[str, int] = {
+            "discovered": len(files),
+            "queued": 0,
+            "skipped": 0,
+            "verified": 0,
+            "needs_review": 0,
+            "failed": 0,
+            "cancelled": 0,
+        }
+        print(
+            f"Discovered {len(files):,} supported recording(s). "
+            f"Parakeet uses one local GPU lane; GLM review uses {self.config.glm_workers} worker(s)."
+        )
+        self._emit_progress(
+            "stt",
+            f"Parakeet queue: {len(files):,} recording(s). One local GPU worker.\n",
+        )
+        self._emit_progress(
+            "glm",
+            f"GLM queue: waiting for Parakeet raw transcripts; {self.config.glm_workers} workers ready.\n",
+        )
+        if self.config.dry_run:
+            counts["queued"] = len(files)
+            self._write_summary(counts)
+            print("Dry run only; no source recording or transcript was changed.")
+            return counts
+        if not files:
+            self._write_summary(counts)
+            return counts
+
+        # Verify protected access once before expensive local transcription.
+        try:
+            self._check_cancelled("cleanup glossary validation")
+            self._get_cleanup_client().ensure_glossary(cancel_check=self.cancel_check)
+            self._check_cancelled("cleanup glossary validation")
+        except PipelineCancelledError:
+            counts["cancelled"] += 1
+            self._write_summary(counts)
+            return counts
+        except Exception as exc:
+            counts["failed"] += len(files)
+            print(f"Protected cleanup preflight failed: {type(exc).__name__}: {exc}")
+            self._emit_progress("glm", f"GLM preflight failed: {type(exc).__name__}: {exc}\n")
+            self._write_summary(counts)
+            return counts
+
+        # The STT runner deliberately returns after raw artifacts become
+        # durable. The cleanup runners then reuse those artifacts without ever
+        # invoking the GPU/audio stage.
+        shared_progress = self.config.progress_callback
+        stt_runner = PipelineRunner(
+            replace(
+                self.config,
+                stt_only=True,
+                cleanup_only=False,
+                render_only=False,
+                publish_source_docx=False,
+                progress_callback=shared_progress,
+            ),
+            cancel_check=self.cancel_check,
+        )
+        cleanup_runners = [
+            PipelineRunner(
+                replace(
+                    self.config,
+                    stt_only=False,
+                    cleanup_only=True,
+                    render_only=False,
+                    publish_source_docx=False,
+                    progress_callback=shared_progress,
+                ),
+                cancel_check=self.cancel_check,
+            )
+            for _ in range(self.config.glm_workers)
+        ]
+        cleanup_queue: queue.Queue[Path | None] = queue.Queue()
+        publication_queue: queue.Queue[tuple[Path, str] | None] = queue.Queue()
+        count_lock = threading.Lock()
+        publication_lock = threading.Lock()
+
+        def manifest_path_for(source: Path) -> Path:
+            return artifact_paths(
+                artifact_directory(source, self.config.input_path, self.config.output_root)
+            )["manifest"]
+
+        def record(status: str) -> None:
+            with count_lock:
+                counts[status] = counts.get(status, 0) + 1
+
+        def queue_publication(source: Path, status: str) -> None:
+            if self.config.publish_source_docx and status in FINAL_STATUSES | {"skipped"}:
+                publication_queue.put((source, status))
+
+        def stt_worker() -> None:
+            try:
+                for index, source in enumerate(files, 1):
+                    if self.cancel_check():
+                        record("cancelled")
+                        self._emit_progress("stt", "Stop requested; no new recording will start.\n")
+                        break
+                    label = f"[{index:,}/{len(files):,}] {source.name}"
+                    print(f"[Parakeet {label}]")
+                    self._emit_progress("stt", f"{label} — transcribing…\n")
+                    status = stt_runner.process_one(source)
+                    self.processed_manifest_paths.append(manifest_path_for(source))
+                    if status == "raw_complete":
+                        cleanup_queue.put(source)
+                        self._emit_progress(
+                            "stt", f"{label} — raw transcript durable; queued for GLM review.\n"
+                        )
+                    elif status in FINAL_STATUSES | {"skipped"}:
+                        record(status)
+                        queue_publication(source, status)
+                        self._emit_progress("stt", f"{label} — already complete ({status}).\n")
+                    else:
+                        record(status)
+                        self._emit_progress("stt", f"{label} — {status}; checkpoints preserved.\n")
+                    if status == "cancelled":
+                        break
+            except Exception as exc:
+                record("failed")
+                message = f"Parakeet scheduler failed: {type(exc).__name__}: {exc}"
+                print(message, file=sys.stderr)
+                self._emit_progress("stt", message + "\n")
+            finally:
+                for _ in cleanup_runners:
+                    cleanup_queue.put(None)
+                stt_runner.close()
+
+        def cleanup_worker(worker_number: int, runner: "PipelineRunner") -> None:
+            self._emit_progress("glm", f"GLM worker {worker_number} waiting for a raw transcript.\n")
+            try:
+                while True:
+                    source = cleanup_queue.get()
+                    if source is None:
+                        return
+                    if self.cancel_check():
+                        self._emit_progress(
+                            "glm", f"GLM worker {worker_number} stopping after its current completed work.\n"
+                        )
+                        continue
+                    label = source.name
+                    self._emit_progress("glm", f"GLM worker {worker_number}: {label} — reviewing…\n")
+                    status = runner.process_one(source)
+                    record(status)
+                    queue_publication(source, status)
+                    self._emit_progress(
+                        "glm",
+                        f"GLM worker {worker_number}: {label} — {status}.\n",
+                    )
+                    if status == "cancelled":
+                        return
+            except Exception as exc:
+                record("failed")
+                message = f"GLM worker {worker_number} failed: {type(exc).__name__}: {exc}"
+                print(message, file=sys.stderr)
+                self._emit_progress("glm", message + "\n")
+            finally:
+                runner.close()
+
+        def publication_worker() -> None:
+            if not self.config.publish_source_docx:
+                return
+            try:
+                while True:
+                    item = publication_queue.get()
+                    if item is None:
+                        return
+                    source, status = item
+                    manifest_path = manifest_path_for(source)
+                    single_counts = {
+                        "discovered": 1,
+                        "queued": 0,
+                        "skipped": int(status == "skipped"),
+                        "verified": int(status == "verified"),
+                        "needs_review": int(status == "needs_review"),
+                        "failed": 0,
+                        "cancelled": 0,
+                    }
+                    try:
+                        report = publish_source_docx_batch(
+                            self.config,
+                            single_counts,
+                            manifest_paths=(manifest_path,),
+                            # Completed GLM documents remain safe to publish
+                            # even if a later recording is cancelled.
+                            cancel_check=None,
+                        )
+                        if report is not None:
+                            with publication_lock:
+                                self.per_job_publication_reports.append(report)
+                                operations = report.get("operations", {})
+                                changed = sum(
+                                    int(operations.get(name, 0) or 0)
+                                    for name in ("create", "replace")
+                                )
+                                counts["publication_published"] = counts.get(
+                                    "publication_published", 0
+                                ) + changed
+                            self._emit_progress(
+                                "glm", f"Published reviewed Word output for {source.name}.\n"
+                            )
+                    except Exception as exc:
+                        with publication_lock:
+                            counts["publication_failed"] = counts.get(
+                                "publication_failed", 0
+                            ) + 1
+                        message = f"Word publication failed safely for {source.name}: {type(exc).__name__}: {exc}"
+                        print(message, file=sys.stderr)
+                        self._emit_progress("glm", message + "\n")
+            finally:
+                return
+
+        publisher = threading.Thread(
+            target=publication_worker, daemon=True, name="word-publication-worker"
+        )
+        cleanup_threads = [
+            threading.Thread(
+                target=cleanup_worker,
+                args=(number, runner),
+                daemon=True,
+                name=f"glm-review-worker-{number}",
+            )
+            for number, runner in enumerate(cleanup_runners, 1)
+        ]
+        stt_thread = threading.Thread(target=stt_worker, daemon=True, name="parakeet-stt-worker")
+        publisher.start()
+        for thread in cleanup_threads:
+            thread.start()
+        stt_thread.start()
+        stt_thread.join()
+        for thread in cleanup_threads:
+            thread.join()
+        publication_queue.put(None)
+        publisher.join()
+        self.incremental_publication_handled = bool(self.config.publish_source_docx)
+        self._write_summary(counts)
+        return counts
+
     def run(self) -> dict[str, int]:
+        if (
+            self._uses_parakeet
+            and not self.config.existing_transcripts_only
+            and not self.config.cleanup_only
+            and not self.config.render_only
+            and not self.config.stt_only
+            and self.config.glm_workers > 1
+        ):
+            return self._run_staged_parakeet()
         self.processed_manifest_paths.clear()
         self.per_job_publication_reports.clear()
         discovery_stats: dict[str, int] = {}
@@ -2661,7 +3071,16 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("input", nargs="?", help="Audio file or archive folder")
     parser.add_argument("--output", help="Separate artifact/output root")
     parser.add_argument(
-        "--model", default="faster-whisper-large-v3", help="Local STT model"
+        "--model", default=DEFAULT_GUI_STT_MODEL, help="Local STT model"
+    )
+    parser.add_argument(
+        "--glm-workers",
+        type=int,
+        default=DEFAULT_GLM_REVIEW_WORKERS,
+        help=(
+            "Independent protected GLM review workers after Parakeet raw STT "
+            f"(default: {DEFAULT_GLM_REVIEW_WORKERS})"
+        ),
     )
     parser.add_argument("--threads", type=int, help="CPU thread limit")
     parser.add_argument(
@@ -2755,7 +3174,10 @@ def execute_pipeline(
                 file=sys.stderr,
             )
             return 1
-        if config.publish_source_docx:
+        incremental_publication_handled = (
+            getattr(runner, "incremental_publication_handled", False) is True
+        )
+        if config.publish_source_docx and not incremental_publication_handled:
             if cancel_check is not None and cancel_check():
                 counts["cancelled"] = max(1, counts.get("cancelled", 0))
             try:
@@ -2827,6 +3249,18 @@ def execute_pipeline(
                 blockers = ", ".join(publication.get("blocking_conditions", ()))
                 print(f"Sibling Word publication suppressed: {blockers}")
             runner._write_summary(counts, publication=publication)
+        elif config.publish_source_docx:
+            # The staged Parakeet lane serially published each completed Word
+            # document while the next audio/GLM jobs continued. Do not repeat
+            # the replacement transaction over an entire long batch here.
+            runner._write_summary(
+                counts,
+                publication={
+                    "status": "incremental",
+                    "planned": len(runner.per_job_publication_reports),
+                    "run_id": "per-completed-document",
+                },
+            )
     finally:
         runner.close()
     print(stable_json(counts))
@@ -2871,6 +3305,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         replace_before_date=args.replace_before_date,
         existing_transcripts_only=args.existing_transcripts_only,
         retain_troubleshooting_artifacts=not args.no_troubleshooting_logs,
+        glm_workers=args.glm_workers,
         limit=args.limit,
     )
     return execute_pipeline(config)

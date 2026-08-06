@@ -177,7 +177,7 @@ The read-only archive inventory on 5 August 2026 found:
 - 2,278 supported recordings after adding AIFF, AIF, and 3GP discovery.
 - 2,260 recordings recognised by the old extension list.
 - 6 AIFF recordings that the old recursive runner silently omitted.
-- 22 same-stem multi-format groups; fresh STT treats these as collisions, while skip-Whisper mode cleans each shared DOCX once without selecting an audio variant.
+- 22 same-stem multi-format groups; fresh STT safely selects one canonical source per group (lossless audio first, then conventional audio, then video/mobile containers), while skip-speech-to-text mode cleans each shared DOCX once without selecting an audio variant. Alternate containers remain untouched.
 - 2,259 existing DOCX files. Skip-Whisper publication preserves every source transcript and creates separate ` - GLM Review.docx` siblings for human checking.
 - 2,250 canonical source-adjacent DOCX inputs selected by skip-Whisper discovery; six unique recording names have no adjacent DOCX and nine alternate/old DOCX names do not exactly match a recording stem.
 

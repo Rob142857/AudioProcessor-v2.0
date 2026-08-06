@@ -278,6 +278,33 @@ class CleanupClientTests(unittest.TestCase):
             self.assertTrue(all(not chunk.from_checkpoint for chunk in forced.chunks))
             self.assertNotEqual(forced.text, first.text)
 
+    def test_checkpoint_temp_name_stays_short_for_deep_windows_output_paths(self):
+        terms = response(200, "Gurdjieff\nFourth Way\n")
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch(
+                "cleanup_client.tempfile.NamedTemporaryFile",
+                wraps=tempfile.NamedTemporaryFile,
+            ) as named_temporary:
+                self.make_client(
+                    ScriptedTransport([terms, cleanup_response("One two three.")]),
+                    target_words=3,
+                ).cleanup_text("one two three", Path(temporary))
+
+        self.assertEqual(named_temporary.call_args.kwargs["prefix"], ".cp-")
+
+    @unittest.skipUnless(os.name == "nt", "Windows path handling")
+    def test_checkpoint_replace_uses_an_extended_windows_destination(self):
+        terms = response(200, "Gurdjieff\nFourth Way\n")
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("cleanup_client.os.replace", wraps=os.replace) as replace:
+                self.make_client(
+                    ScriptedTransport([terms, cleanup_response("One two three.")]),
+                    target_words=3,
+                ).cleanup_text("one two three", Path(temporary))
+
+        _temporary, destination = replace.call_args.args
+        self.assertTrue(str(destination).startswith("\\\\?\\"))
+
     def test_recomputed_upstream_context_invalidates_downstream_checkpoints(self):
         terms = response(200, "Gurdjieff\nFourth Way\n")
         text = "one two three four five six"

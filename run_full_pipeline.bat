@@ -6,16 +6,19 @@ set "PYTHONIOENCODING=utf-8"
 cd /d "%~dp0"
 
 set "PIPELINE_PYTHON=.venv\Scripts\python.exe"
-if not exist "%PIPELINE_PYTHON%" (
-  echo AudioProcessor's pinned local environment was not found.
-  echo.
-  echo Run the reviewed local installer first:
-  echo   .\install_geforce.ps1
-  echo.
-  echo Supported lane: Python 3.12 x64, torch 2.6.0+cu124,
-  echo Faster-Whisper 1.2.1, and CTranslate2 4.8.1.
-  pause
-  exit /b 1
+"%PIPELINE_PYTHON%" -c "import keyring; from docx import Document" 2>nul
+if errorlevel 1 (
+  set "PIPELINE_PYTHON=.parakeet-venv\Scripts\python.exe"
+  "%PIPELINE_PYTHON%" -c "import keyring; from docx import Document" 2>nul
+  if errorlevel 1 (
+    echo AudioProcessor's local environments are incomplete.
+    echo.
+    echo Run the reviewed local installer first:
+    echo   .\install_geforce.ps1 -RecreateVenv
+    pause
+    exit /b 1
+  )
+  echo Using the isolated NVIDIA Parakeet environment.
 )
 
 rem Parse launcher policy flags while preserving all pipeline arguments.
@@ -27,6 +30,7 @@ set "FLAG_RENDER_ONLY=0"
 set "FLAG_DRY_RUN=0"
 set "FLAG_EXISTING_TRANSCRIPTS_ONLY=0"
 set "PUBLISH_SOURCE_DOCX=--publish-source-docx"
+set "PIPELINE_STT_MODEL=nvidia/parakeet-tdt-0.6b-v3"
 
 :parse_arguments
 if "%~1"=="" goto arguments_parsed
@@ -39,7 +43,20 @@ if /I "%~1"=="--dry-run" set "FLAG_DRY_RUN=1"
 if /I "%~1"=="--existing-transcripts-only" set "FLAG_EXISTING_TRANSCRIPTS_ONLY=1"
 if /I "%~1"=="--use-existing-docx" set "FLAG_EXISTING_TRANSCRIPTS_ONLY=1"
 if /I "%~1"=="--skip-stt" set "FLAG_EXISTING_TRANSCRIPTS_ONLY=1"
+if /I "%~1"=="--model" goto capture_model
 set "PIPELINE_ARGS=%PIPELINE_ARGS% %1"
+shift
+goto parse_arguments
+
+:capture_model
+if "%~2"=="" (
+  echo --model requires a model value.
+  pause
+  exit /b 2
+)
+set "PIPELINE_STT_MODEL=%~2"
+set "PIPELINE_ARGS=%PIPELINE_ARGS% %1 %2"
+shift
 shift
 goto parse_arguments
 
@@ -101,7 +118,7 @@ set "DOCTOR_GPU_ARG=--require-gpu"
 set "DOCTOR_CLEANUP_ARG=--no-cleanup"
 
 :doctor_ready
-"%PIPELINE_PYTHON%" pipeline_doctor.py --mode "%DOCTOR_MODE%" %DOCTOR_GPU_ARG% %DOCTOR_CLEANUP_ARG%
+"%PIPELINE_PYTHON%" pipeline_doctor.py --mode "%DOCTOR_MODE%" %DOCTOR_GPU_ARG% %DOCTOR_CLEANUP_ARG% --stt-model "%PIPELINE_STT_MODEL%"
 if errorlevel 1 (
   echo.
   echo Preflight failed. No archive files were changed.

@@ -242,7 +242,7 @@ class GuiEngineContractTests(unittest.TestCase):
         messages = ""
         while not q.empty():
             messages += q.get_nowait()
-        self.assertIn("existing Whisper Word", messages)
+        self.assertIn("existing speech Word", messages)
         self.assertIn("Whisper and audio skipped", messages)
 
     def test_existing_transcript_mode_rejects_skip_existing(self):
@@ -282,6 +282,7 @@ class GuiEngineContractTests(unittest.TestCase):
                     "cleanup_required": True,
                     "mode": "cleanup-only",
                     "require_gpu": False,
+                    "stt_model": None,
                 }
             ],
             calls,
@@ -340,7 +341,7 @@ class GuiEngineContractTests(unittest.TestCase):
         self.assertIn("restarts from its beginning", component_source)
         self.assertIn("separate GLM Review copies", component_source)
         self.assertIn("force_reprocess", component_source)
-        self.assertIn("Use existing Word transcripts (skip Whisper)", component_source)
+        self.assertIn("Use existing Word transcripts (skip speech-to-text)", component_source)
         self.assertIn("source-adjacent Whisper DOCX", component_source)
         self.assertIn("no audio inference", component_source)
         self.assertIn(

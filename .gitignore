@@ -1,6 +1,11 @@
 # Python virtual environments
 .venv/
 venv/
+.parakeet-venv/
+.parakeet-install-*.log
+.parakeet-install-*.log.err
+parakeet-run*.log
+parakeet-glm-run*.log
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

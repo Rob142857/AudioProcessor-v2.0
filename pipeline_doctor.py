@@ -39,6 +39,7 @@ EXPECTED_VERSIONS = {
 EXPECTED_PYTHON = (3, 12)
 EXPECTED_TORCH_CUDA = "12.4"
 VALID_MODES = ("full", "transcribe", "cleanup-only", "render-only", "inventory")
+PARAKEET_MODEL_PREFIX = "nvidia/parakeet-"
 
 
 @dataclass
@@ -325,6 +326,86 @@ def check_model_cache(*, required: bool, mode: str) -> Check:
     )
 
 
+def check_parakeet_environment(*, required: bool) -> list[Check]:
+    """Verify the isolated NeMo/CUDA lane without importing it into this venv."""
+
+    interpreter = REPO_ROOT / ".parakeet-venv" / "Scripts" / "python.exe"
+    if not interpreter.is_file():
+        return [
+            Check(
+                "NVIDIA Parakeet environment",
+                _status_for_problem(required),
+                f"isolated interpreter is missing: {interpreter}",
+                required,
+            )
+        ]
+    probe = (
+        "import json, torch, nemo; "
+        "ok=torch.cuda.is_available(); "
+        "device=torch.cuda.current_device() if ok else None; "
+        "print(json.dumps({'torch':torch.__version__, 'nemo':nemo.__version__, "
+        "'cuda':str(torch.version.cuda), 'available':ok, 'name': "
+        "torch.cuda.get_device_name(device) if ok else None, 'capability': "
+        "torch.cuda.get_device_capability(device) if ok else None}))"
+    )
+    try:
+        result = subprocess.run(
+            [str(interpreter), "-B", "-c", probe],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if result.returncode:
+            detail = (result.stderr or result.stdout or "unknown failure").strip()
+            return [
+                Check(
+                    "NVIDIA Parakeet environment",
+                    _status_for_problem(required),
+                    f"isolated import probe failed: {detail[:400]}",
+                    required,
+                )
+            ]
+        value = json.loads(result.stdout.strip())
+    except Exception as exc:
+        return [
+            Check(
+                "NVIDIA Parakeet environment",
+                _status_for_problem(required),
+                f"isolated import probe failed: {_exception_detail(exc)}",
+                required,
+            )
+        ]
+    cuda_ok = bool(value.get("available")) and value.get("cuda") == EXPECTED_TORCH_CUDA
+    cache = Path.home() / ".cache" / "huggingface" / "hub" / "models--nvidia--parakeet-tdt-0.6b-v3"
+    return [
+        Check(
+            "NVIDIA Parakeet environment",
+            "ok",
+            f"NeMo {value.get('nemo')}; torch {value.get('torch')}; isolated interpreter {interpreter}",
+            required,
+        ),
+        Check(
+            "NVIDIA Parakeet CUDA",
+            "ok" if cuda_ok else _status_for_problem(required),
+            (
+                f"CUDA {value.get('cuda')}; {value.get('name')}; "
+                f"compute {value.get('capability')}"
+                if cuda_ok
+                else f"CUDA unavailable or incompatible: {value}"
+            ),
+            required,
+        ),
+        Check(
+            "NVIDIA Parakeet model cache",
+            "ok" if cache.is_dir() else "warning",
+            str(cache) if cache.is_dir() else "model is not cached; the first run may download it",
+            False,
+        ),
+    ]
+
+
 def check_cleanup_credentials(*, required: bool) -> Check:
     token_present = False
     token_source = None
@@ -381,9 +462,11 @@ def run_checks(
     cleanup_required: bool = True,
     mode: str = "full",
     require_gpu: bool = False,
+    stt_model: Optional[str] = None,
 ) -> list[Check]:
     needs = requirements_for_mode(mode, cleanup_required=cleanup_required)
     checks: list[Check] = [check_python()]
+    uses_parakeet = bool(stt_model and stt_model.casefold().startswith(PARAKEET_MODEL_PREFIX))
 
     if needs.transcribe:
         ffmpeg = find_ffmpeg()
@@ -402,6 +485,25 @@ def run_checks(
         )
     else:
         checks.append(skipped_check("FFmpeg", mode))
+
+    if needs.transcribe and uses_parakeet:
+        checks.extend(check_parakeet_environment(required=True))
+        _module, docx_check = package_check(
+            "docx", "python-docx", "python-docx", required=needs.render, mode=mode
+        )
+        checks.append(docx_check)
+        terms = REPO_ROOT / "special_words.txt"
+        checks.append(
+            Check(
+                "GLM glossary source",
+                "ok" if terms.is_file() else "warning",
+                str(terms) if terms.is_file() else "special_words.txt is absent; server glossary remains authoritative",
+                False,
+            )
+        )
+        checks.append(check_settings(required=True, mode=mode))
+        checks.append(check_cleanup_credentials(required=needs.cleanup))
+        return checks
 
     torch_module, torch_package = package_check(
         "torch", "torch", "PyTorch", required=needs.transcribe, mode=mode
@@ -543,11 +645,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         action="store_true",
         help="Do not require Cloudflare cleanup credentials",
     )
+    parser.add_argument(
+        "--stt-model",
+        help="Selected local STT model; enables the isolated Parakeet checks when applicable",
+    )
     args = parser.parse_args(argv)
     checks = run_checks(
         cleanup_required=not args.no_cleanup,
         mode=args.mode,
         require_gpu=args.require_gpu,
+        stt_model=args.stt_model,
     )
     if args.json:
         print(json.dumps([asdict(check) for check in checks], indent=2))
