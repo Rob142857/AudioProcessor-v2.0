@@ -11,7 +11,7 @@ Converts audio/video files into professionally formatted DOCX transcripts. It de
 ### Key Features
 
 - **NVIDIA Parakeet TDT 0.6B v3** — fast local archive default, loaded once per batch
-- **Five GLM review workers** — begin as each durable Parakeet transcript is ready, without holding the GPU lane
+- **Ten GLM review workers** — begin as each durable Parakeet transcript is ready, without holding the GPU lane
 - **Faster-Whisper Large-v3** — retained comparison/fallback option
 - **Faster-Whisper Large-v3-turbo** — faster comparison/overflow option
 - **Native Whisper Large-v3** — OpenAI fallback (GPU or CPU)
@@ -42,7 +42,7 @@ The installer tries registered `py -3.12` first, then `%LOCALAPPDATA%\Programs\P
 ```
 
 The GUI defaults to **Polished archive pipeline**: local NVIDIA Parakeet,
-five protected GLM-4.7-Flash cleanup workers, and separate human-review Word
+ten protected GLM-4.7-Flash cleanup workers, and separate human-review Word
 publication. Its two live panes show the GPU speech-to-text lane and the GLM
 review queue independently.
 It runs the full environment and protected-access preflight before opening any

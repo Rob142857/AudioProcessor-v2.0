@@ -163,7 +163,7 @@ class SettingsPanel(tk.Frame):
         self.pipeline_flow = tk.Label(
             self,
             text=(
-                "Local NVIDIA Parakeet Word  →  five protected GLM-4.7-Flash review workers  "
+                "Local NVIDIA Parakeet Word  →  ten protected GLM-4.7-Flash review workers  "
                 "→  separate GLM Review Word"
             ),
             bg="#eff6ff",
@@ -405,7 +405,7 @@ class SettingsPanel(tk.Frame):
                     "→  separate GLM Review Word (no audio inference)"
                     if existing_only
                 else (
-                    "Local NVIDIA Parakeet Word  →  five protected GLM-4.7-Flash review workers  "
+                    "Local NVIDIA Parakeet Word  →  ten protected GLM-4.7-Flash review workers  "
                     "→  separate GLM Review Word"
                     if uses_parakeet
                     else "Local Faster-Whisper Word  →  protected GLM-4.7-Flash cleanup  "

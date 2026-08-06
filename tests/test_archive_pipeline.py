@@ -97,9 +97,9 @@ class ArchivePipelineTests(unittest.TestCase):
         self.assertFalse(config.publish_source_docx)
         self.assertFalse(config.existing_transcripts_only)
         self.assertTrue(config.retain_troubleshooting_artifacts)
-        self.assertEqual(config.glm_workers, 5)
+        self.assertEqual(config.glm_workers, 10)
         self.assertFalse(parse_args(["archive"]).publish_source_docx)
-        self.assertEqual(parse_args(["archive"]).glm_workers, 5)
+        self.assertEqual(parse_args(["archive"]).glm_workers, 10)
         self.assertTrue(
             parse_args(["archive", "--no-troubleshooting-logs"]).no_troubleshooting_logs
         )

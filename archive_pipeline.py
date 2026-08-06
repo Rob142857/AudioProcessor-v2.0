@@ -42,7 +42,7 @@ configure_safe_stdio()
 PIPELINE_VERSION = "3.1.0"
 DEFAULT_STT_MODEL = "faster-whisper-large-v3"
 DEFAULT_GUI_STT_MODEL = "nvidia/parakeet-tdt-0.6b-v3"
-DEFAULT_GLM_REVIEW_WORKERS = 5
+DEFAULT_GLM_REVIEW_WORKERS = 10
 PARAKEET_MODEL_PREFIX = "nvidia/parakeet-"
 DEFAULT_CLEANUP_ENDPOINT = (
     "https://pg.objectiveartefacts.com.au/api/tooling/cleanup-chunk"
