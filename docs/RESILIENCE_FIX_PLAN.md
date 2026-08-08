@@ -9,16 +9,20 @@ Run analysed: `C:\Users\RobertEvans\OneDrive - RME Solutions Technology\_PG Comp
 
 ## 1. What actually happened
 
-Evidence: 1632 per-job `manifest.json` files under the polished root.
+Evidence: 1730 per-job `manifest.json` files under the polished root, scanned recursively.
+Job directories sit at two different depths — `<year>/<job>__mp3` for most, and
+`Tapes From Joe (MW, RL, et al)/<year>/<job>__mp3` for 98 of them. Any audit script must
+use `rglob`/`glob(recursive=True)`, not a fixed `*/*/` depth.
 
 | status | count |
 |---|---|
-| `needs_review` | 942 |
-| `verified` | 521 |
-| **`failed`** | **168** |
+| `needs_review` | 985 |
+| `verified` | 522 |
+| **`failed`** | **221** |
 | `running` (stuck) | 1 |
+| `cancelled` | 1 |
 
-Parakeet was fine. **165 of the 168 failures still have a valid `raw.txt`** — the GPU
+Parakeet was fine. **218 of the 221 failures still have a valid `raw.txt`** — the GPU
 transcription completed and is durable. Everything failed *after* the raw boundary,
 in the GLM cleanup stage or in manifest persistence.
 
@@ -26,21 +30,32 @@ in the GLM cleanup stage or in manifest persistence.
 
 | # | Cause | Class |
 |---|---|---|
-| **149** | Windows `MAX_PATH` exceeded creating `cleanup-chunks/<sha256>/` | **A** |
+| **201** | Windows `MAX_PATH` exceeded creating `cleanup-chunks/<sha256>/` | **A** |
 | 9 | DNS `getaddrinfo failed` — cleanup retries exhausted | **B** |
-| 8 | `PermissionError [WinError 5]` renaming `manifest.json` | **C** |
+| 9 | `PermissionError [WinError 5]` renaming `manifest.json` | **C** |
 | 2 | `ParakeetError` (1 worker timeout, 1 too-short audio) | **D** |
 | 1 | job stuck in `running`, never reaped | **E** |
 
+Class A is **91% of all failures**. Every `— failed.` line in the operator log traces to
+it; every `— needs_review.` line succeeded. Spot-checked against the log directly:
+
+| log line | manifest |
+|---|---|
+| `1985 0122 Tibetan Book of the Dead 1.mp3 — failed` | `failed`, WinError 206 |
+| `1985 0129 Tibetan Book of the Dead 2.mp3 — failed` | `failed`, WinError 206 |
+| `1985 0326 Egyptian Studies 01.mp3 — failed` | `failed`, WinError 206 |
+| `1985 0730 Egyptian Studies.mp3 — needs_review` | `needs_review`, no error |
+| `1985 0917 Gardens.mp3 — needs_review` | `needs_review`, no error |
+
 ---
 
-## 2. Root cause A — MAX_PATH (149 of 168 failures, 89%)
+## 2. Root cause A — MAX_PATH (201 of 221 failures, 91%)
 
 Two error strings, one bug:
 
 ```
-FileNotFoundError: [WinError 206] The filename or extension is too long: '...\cleanup-chunks\b367829...'   (92x)
-FileNotFoundError: [WinError 3] The system cannot find the path specified: '...\cleanup-chunks\b367829...'  (57x)
+FileNotFoundError: [WinError 206] The filename or extension is too long: '...\cleanup-chunks\b367829...'   (140x)
+FileNotFoundError: [WinError 3] The system cannot find the path specified: '...\cleanup-chunks\b367829...'   (61x)
 ```
 
 Both point at a directory path with no filename — that is `mkdir`, not a file write.
@@ -73,17 +88,21 @@ C:\Users\RobertEvans\OneDrive - RME Solutions Technology\_PG Completed Recording
 `MAX_PATH` is 260. `HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\LongPathsEnabled`
 is **`0`** on this machine, so Python's plain-path calls are capped at 260.
 
-**This will keep getting worse.** Across the 1632 jobs, the projected `run_dir` length
+**This will keep getting worse.** Across all 1730 jobs, the projected `run_dir` length
 distribution is:
 
 | length | jobs |
 |---|---|
-| 180–239 | 1400 |
-| 240–259 | 174 (within 12 chars of the limit) |
-| **260+** | **58 (already fatal)** |
+| 180–239 | 1429 |
+| 240–259 | 239 (within 12 chars of the limit) |
+| **260+** | **62 (already fatal)** |
 
-150 jobs sit close enough that adding one word to a lecture title, or moving the root
-one folder deeper, tips them over.
+202 jobs sit close enough that adding one word to a lecture title, or moving the root
+one folder deeper, tips them over. The longest is 286 characters
+(`1995 Prepared\Lecture 26 120795 Some Correspondences nof Respiration Hydrogen and Carbon_mixdown_Mono__flac`).
+
+The `Tapes From Joe (MW, RL, et al)\<year>\` subtree is a whole extra nesting level, which
+is why its failure rate is worse than the rest: 53 of its 98 jobs failed.
 
 ---
 
@@ -107,7 +126,7 @@ network and should wait for it to come back.
 
 ---
 
-## 4. Root cause C — non-atomic-enough atomic write (8 failures)
+## 4. Root cause C — non-atomic-enough atomic write (9 failures)
 
 ```
 PermissionError: [WinError 5] Access is denied:
@@ -124,7 +143,7 @@ os.replace(temporary, path)     # single attempt, no retry
 On POSIX `rename()` over an open file is fine. On Windows it fails with `WinError 5`
 if *anything* has the destination open — and the output root is inside **OneDrive**,
 which opens files to sync them, plus Defender scans on close. This is a transient
-lock measured in milliseconds. One retry would have caught all eight.
+lock measured in milliseconds. One retry would have caught all nine.
 
 Note this also loses work in a nastier way than A or B: the job had *completed* and was
 being written down when the rename failed, so a full GLM review was thrown away.
@@ -152,13 +171,13 @@ exception, writes `status: "failed"`, and returns. The GLM worker records the re
 moves to the next item. **Nothing transient is ever re-attempted inside a run.**
 
 A 7-second DNS blip and a permanently malformed audio file are treated identically. All
-149 MAX_PATH failures were deterministic and correctly non-retryable — but the 17 in
-classes B/C/D were all transient, and all 17 would have passed on a second attempt.
+201 MAX_PATH failures were deterministic and correctly non-retryable — but the 20 in
+classes B/C/D were all transient, and nearly all would have passed on a second attempt.
 
 Good news, and the reason this is recoverable: `FINAL_STATUSES` is
 `{"verified", "needs_review"}` ([archive_pipeline.py:77](archive_pipeline.py:77)), so
 `failed` jobs *are* re-attempted on the next run, and completed cleanup chunks are reused
-from the checkpoint dir. Once A–C are fixed, a plain re-run recovers all 168 without
+from the checkpoint dir. Once A–C are fixed, a plain re-run recovers all 221 without
 re-transcribing anything.
 
 ---
@@ -167,7 +186,7 @@ re-transcribing anything.
 
 Ordered by impact. Each item is independently shippable.
 
-### Fix 1 — Extended paths for checkpoint directory creation *(fixes 149 / 89%)*
+### Fix 1 — Extended paths for checkpoint directory creation *(fixes 201 / 91%)*
 
 `cleanup_client.py`, in `cleanup_text` around line 613:
 
@@ -191,7 +210,7 @@ line 306). Add a case with a `checkpoint_dir` long enough that
 `len(checkpoint_dir / sha256) > 260`, assert `cleanup_text` completes and the checkpoint
 files land. Skip on non-Windows.
 
-### Fix 2 — Retrying atomic replace *(fixes 8)*
+### Fix 2 — Retrying atomic replace *(fixes 9)*
 
 `archive_pipeline.py`, `atomic_write_bytes` at line 175. Wrap the `os.replace` in a short
 bounded retry, and use extended paths on Windows for defence in depth:
@@ -272,15 +291,15 @@ At the end of a run, print a grouped tally instead of leaving the operator to re
 manifests:
 
 ```
-168 failed:
-  149  path too long (Windows MAX_PATH)  — see docs/RESILIENCE_FIX_PLAN.md
+221 failed:
+  201  path too long (Windows MAX_PATH)  — see docs/RESILIENCE_FIX_PLAN.md
     9  cleanup network unreachable
-    8  manifest write blocked (OneDrive/AV lock)
+    9  manifest write blocked (OneDrive/AV lock)
     2  Parakeet error
 ```
 
 This run's failures were only diagnosable by scripting over the manifests. The GUI showed
-"failed" 168 times with no reason attached.
+"failed" 221 times with no reason attached.
 
 ---
 
@@ -305,14 +324,14 @@ Independent of the fixes, both are worth doing:
 ## 9. Recovery of this run
 
 After Fixes 1–3 land, re-run the same command over the same root. `failed` is not a final
-status, so all 168 are re-attempted; `raw.txt` is intact for 165 of them so Parakeet does
+status, so all 221 are re-attempted; `raw.txt` is intact for 218 of them so Parakeet does
 not re-run; completed cleanup chunks are reused from `cleanup-chunks/`. Expected cost is
-GLM review only, on ~168 recordings.
+GLM review only, on ~221 recordings.
 
-Verify afterwards with:
+Verify afterwards with the command below, run from the polished root. Note
+`recursive=True` — the `Tapes From Joe` subtree is one level deeper, and a `*/*/` glob
+silently under-reports by 98 jobs and 53 failures:
 
 ```bash
-python -c "import json,glob,collections; print(collections.Counter(json.load(open(p,encoding='utf-8')).get('status') for p in glob.glob('*/*/manifest.json')))"
+python -c "import json,glob,collections; print(collections.Counter(json.load(open(p,encoding='utf-8')).get('status') for p in glob.glob('**/manifest.json',recursive=True)))"
 ```
-
-run from the polished root.
