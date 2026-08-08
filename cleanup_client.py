@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import re
+import socket
 import tempfile
 import time
 from typing import Any, Callable, Mapping, Sequence
@@ -34,6 +35,18 @@ DEFAULT_TARGET_WORDS = 800
 DEFAULT_MAX_CHARS = 18_000
 CHECKPOINT_VERSION = 10
 CANCEL_BACKOFF_POLL_SECONDS = 0.1
+# A DNS blip, VPN re-key, or Wi-Fi roam routinely outlasts a few seconds of
+# exponential backoff, so the network retry budget below is generous: six
+# attempts at a 2s base gives ~2 minutes of tolerance instead of ~7 seconds.
+DEFAULT_MAX_ATTEMPTS = 6
+DEFAULT_RETRY_BASE_DELAY = 2.0
+# Ceiling for a single backoff wait, including a server-supplied Retry-After
+# header, so a misbehaving response can't stall a worker for hours.
+MAX_RETRY_DELAY_SECONDS = 30.0
+# Flat wait used for DNS/connection-refused failures instead of exponential
+# backoff: the client is waiting for a link to come back, not easing load on
+# a server that is there but unhappy.
+DNS_RETRY_DELAY_SECONDS = 10.0
 CREDENTIAL_SERVICE = "AudioProcessor Cloudflare Access"
 CREDENTIAL_CLIENT_ID_KEY = "client-id"
 CREDENTIAL_CLIENT_SECRET_KEY = "client-secret"
@@ -446,8 +459,10 @@ class CleanupClient:
         max_chars: int = DEFAULT_MAX_CHARS,
         preceding_context_words: int = 100,
         timeout: float = 300.0,
-        max_attempts: int = 4,
-        retry_base_delay: float = 1.0,
+        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        retry_base_delay: float = DEFAULT_RETRY_BASE_DELAY,
+        max_retry_delay: float = MAX_RETRY_DELAY_SECONDS,
+        dns_retry_delay: float = DNS_RETRY_DELAY_SECONDS,
         transport: Transport | None = None,
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.time,
@@ -474,6 +489,12 @@ class CleanupClient:
             )
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
+        if retry_base_delay < 0:
+            raise ValueError("retry_base_delay cannot be negative")
+        if max_retry_delay < 0:
+            raise ValueError("max_retry_delay cannot be negative")
+        if dns_retry_delay < 0:
+            raise ValueError("dns_retry_delay cannot be negative")
         if preceding_context_words < 0:
             raise ValueError("preceding_context_words cannot be negative")
 
@@ -489,6 +510,8 @@ class CleanupClient:
         self.timeout = timeout
         self.max_attempts = max_attempts
         self.retry_base_delay = retry_base_delay
+        self.max_retry_delay = max_retry_delay
+        self.dns_retry_delay = dns_retry_delay
         self._transport = transport or _urllib_transport
         self._sleep = sleep
         self._clock = clock
@@ -612,7 +635,14 @@ class CleanupClient:
         run_dir: Path | None = None
         if checkpoint_dir is not None:
             run_dir = Path(checkpoint_dir) / input_sha256
-            run_dir.mkdir(parents=True, exist_ok=True)
+            # Create via the extended-path form so a long archive root plus the
+            # 64-character checksum directory name does not exceed Windows'
+            # traditional 260-character MAX_PATH. ``run_dir`` itself stays a
+            # plain path: `_load_checkpoint`/`_write_checkpoint` already apply
+            # `_windows_extended_path` to every filesystem call they make, and
+            # the helper short-circuits on an existing `\\?\` prefix, so
+            # wrapping it again here would be redundant.
+            Path(_windows_extended_path(run_dir)).mkdir(parents=True, exist_ok=True)
 
         preceding_text = ""
         for source_chunk in source_chunks:
@@ -839,6 +869,7 @@ class CleanupClient:
                     None,
                     cancel_check=cancel_check,
                     phase=phase,
+                    network_error=exc,
                 )
                 continue
 
@@ -881,10 +912,20 @@ class CleanupClient:
         *,
         cancel_check: CancelCheck | None = None,
         phase: str = "cleanup retry backoff",
+        network_error: BaseException | None = None,
     ) -> None:
-        delay = _parse_retry_after(retry_after, self._clock())
-        if delay is None:
-            delay = self.retry_base_delay * (2**attempt)
+        if network_error is not None and _is_dns_or_connection_error(network_error):
+            # DNS not resolving or the far end refusing connections means the
+            # client has no path to the server at all. Poll at a flat interval
+            # for the link to return instead of backing off exponentially,
+            # which is meant to ease load on a server that is reachable but
+            # struggling.
+            delay = self.dns_retry_delay
+        else:
+            delay = _parse_retry_after(retry_after, self._clock())
+            if delay is None:
+                delay = self.retry_base_delay * (2**attempt)
+        delay = min(delay, self.max_retry_delay)
         if delay <= 0:
             raise_if_cancelled(cancel_check, phase=phase)
             return
@@ -1143,6 +1184,28 @@ def _response_error_message(body: bytes) -> str:
     if isinstance(parsed, Mapping) and parsed.get("error"):
         return str(parsed["error"])[:500]
     return decoded[:500]
+
+
+def _is_dns_or_connection_error(exc: BaseException) -> bool:
+    """True for a DNS resolution failure or a refused connection.
+
+    These mean the client currently has no path to the server at all — DNS is
+    not resolving, or the far end is actively refusing connections — rather
+    than the server being reachable but overloaded. They get a flat retry
+    wait (waiting for the link to come back) instead of the exponential
+    backoff used for HTTP 429/5xx (easing load on a server).
+    """
+
+    if isinstance(exc, (socket.gaierror, ConnectionRefusedError)):
+        return True
+    if isinstance(exc, urllib.error.URLError):
+        reason = exc.reason
+        if isinstance(reason, (socket.gaierror, ConnectionRefusedError)):
+            return True
+        text = str(reason)
+        if "getaddrinfo failed" in text or "11001" in text:
+            return True
+    return False
 
 
 def _parse_retry_after(value: str | None, now: float) -> float | None:

@@ -78,6 +78,11 @@ FINAL_STATUSES = frozenset({"verified", "needs_review"})
 EXISTING_DOCX_MODES = frozenset({"skip", "all", "before"})
 SOURCE_DOCX_PUBLICATION_REPORT = "source-docx-publication-report.json"
 GLM_REVIEW_SUFFIX = " - GLM Review"
+# A job can be left with status "running" forever if the process dies mid-job
+# (killed, crashed, machine slept). "running" is not a final status, so such a
+# manifest is otherwise invisible to both retry logic and the run summary. Any
+# manifest still "running" after this many seconds is presumed abandoned.
+STALE_RUNNING_THRESHOLD_SECONDS = 2 * 60 * 60
 
 # Values which can materially change recognition, preprocessing, or prompt
 # bias.  They form part of the per-source STT request signature so a changed
@@ -172,18 +177,63 @@ def installed_version(distribution: str) -> str:
         return "missing"
 
 
+def _windows_extended_path(path: str | Path) -> str:
+    """Return an extended Windows path when a destination name exceeds MAX_PATH.
+
+    Duplicated from ``cleanup_client._windows_extended_path`` rather than
+    imported: this module intentionally does not import from the protected
+    cleanup client just for an 8-line path helper. ``\\\\?\\`` lets
+    ``os.replace`` address a durable final name without weakening the
+    atomic-write guarantee, even when the output root (e.g. a deeply nested
+    OneDrive folder) pushes the path past 260 characters.
+    """
+
+    value = os.path.abspath(os.fspath(path))
+    if os.name != "nt" or value.startswith("\\\\?\\"):
+        return value
+    if value.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + value[2:]
+    return "\\\\?\\" + value
+
+
+# os.replace onto an existing destination fails on Windows with
+# PermissionError [WinError 5] (or WinError 32, "used by another process")
+# whenever something else briefly has the file open -- OneDrive syncing the
+# folder or Defender scanning it on close are the usual culprits on a synced
+# output root. The lock is measured in milliseconds, so a short bounded retry
+# clears it without masking a genuine permissions problem.
+ATOMIC_REPLACE_MAX_ATTEMPTS = 5
+ATOMIC_REPLACE_RETRY_BASE_DELAY_SECONDS = 0.1
+
+
+def _is_retryable_replace_error(exc: OSError) -> bool:
+    return isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in (5, 32)
+
+
 def atomic_write_bytes(path: Path, value: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    parent = Path(_windows_extended_path(path.parent))
+    parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(parent)
     )
     temporary = Path(temporary_name)
+    destination = Path(_windows_extended_path(path))
     try:
         with os.fdopen(descriptor, "wb") as output:
             output.write(value)
             output.flush()
             os.fsync(output.fileno())
-        os.replace(temporary, path)
+        for attempt in range(ATOMIC_REPLACE_MAX_ATTEMPTS):
+            try:
+                os.replace(temporary, destination)
+                break
+            except OSError as exc:
+                if (
+                    not _is_retryable_replace_error(exc)
+                    or attempt == ATOMIC_REPLACE_MAX_ATTEMPTS - 1
+                ):
+                    raise
+                time.sleep(ATOMIC_REPLACE_RETRY_BASE_DELAY_SECONDS * (2 ** attempt))
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
@@ -203,6 +253,23 @@ def read_json(path: Path) -> dict[str, Any]:
         return parsed if isinstance(parsed, dict) else {}
     except (OSError, ValueError, TypeError):
         return {}
+
+
+def failure_error_category(error: Any) -> str:
+    """Return the leading exception type name from a manifest's error string.
+
+    ``process_one`` records failures as ``f"{type(exc).__name__}: {exc}"``
+    (e.g. ``"FileNotFoundError: [WinError 206] ..."``), so the substring
+    before the first colon is the exception class. Anything that does not
+    look like that -- including the reap step's own
+    ``"abandoned; process exited during '<stage>' stage"`` message, which has
+    no leading colon -- is grouped under its own full text instead.
+    """
+
+    if not isinstance(error, str) or not error.strip():
+        return "(no error recorded)"
+    name = error.split(":", 1)[0].strip()
+    return name or error.strip()
 
 
 def cleanup_record_summary(value: dict[str, Any]) -> dict[str, Any]:
@@ -2684,7 +2751,72 @@ class PipelineRunner:
         self._write_summary(counts)
         return counts
 
+    def _reap_stale_running_manifests(self) -> int:
+        """Rewrite manifests abandoned mid-job so they are never silently lost.
+
+        A process that dies between writing ``manifest["status"] = "running"``
+        and its outcome leaves a manifest stuck there forever: "running" is
+        not in ``FINAL_STATUSES``, so nothing about it is wrong from a schema
+        point of view, but it is also invisible to both the retry path and
+        the run summary. This scans the whole output tree -- independent of
+        which sources this particular invocation selected -- and rewrites any
+        manifest still "running" past ``STALE_RUNNING_THRESHOLD_SECONDS`` to a
+        clearly-labelled ``failed`` before this run makes any reuse/skip
+        decision from it.
+        """
+
+        output_root = self.config.output_root
+        if not output_root.is_dir():
+            return 0
+
+        now = time.time()
+        reaped = 0
+        for manifest_path in output_root.rglob("manifest.json"):
+            manifest = read_json(manifest_path)
+            if not isinstance(manifest, dict) or manifest.get("status") != "running":
+                continue
+            try:
+                age_seconds = now - manifest_path.stat().st_mtime
+            except OSError:
+                continue
+            if age_seconds < STALE_RUNNING_THRESHOLD_SECONDS:
+                continue
+            source_record = manifest.get("source")
+            source_value = (
+                source_record.get("path") if isinstance(source_record, dict) else None
+            )
+            relative_value = (
+                source_record.get("relative_path")
+                if isinstance(source_record, dict)
+                else None
+            )
+            if not isinstance(source_value, str) or not isinstance(relative_value, str):
+                continue
+            abandoned_stage = manifest.get("stage") or "unknown"
+            manifest["status"] = "failed"
+            manifest["stage"] = "failed"
+            manifest["error"] = (
+                f"abandoned; process exited during '{abandoned_stage}' stage "
+                f"(manifest was still 'running' after "
+                f"{int(STALE_RUNNING_THRESHOLD_SECONDS // 60)} minutes)"
+            )
+            paths = artifact_paths(manifest_path.parent)
+            self._save_manifest(
+                Path(source_value), Path(relative_value), paths, manifest
+            )
+            reaped += 1
+        if reaped:
+            message = (
+                f"Reaped {reaped:,} stale 'running' job(s) abandoned by a "
+                "previous process (see manifest error for the stage)."
+            )
+            print(message)
+            self._emit_progress("glm", message + "\n")
+        return reaped
+
     def run(self) -> dict[str, int]:
+        if not self.config.dry_run:
+            self._reap_stale_running_manifests()
         if (
             self._uses_parakeet
             and not self.config.existing_transcripts_only
@@ -2845,12 +2977,61 @@ class PipelineRunner:
         self._write_summary(counts)
         return counts
 
+    def _failure_breakdown(self, counts: dict[str, int]) -> dict[str, int]:
+        """Group this run's failed jobs by their leading exception type.
+
+        Without this, a run's failures are only visible as repeated bare
+        "failed" lines with no reason attached, and diagnosing a batch means
+        scripting over every manifest by hand. This reads each processed
+        job's manifest once (they are cheap, small JSON files) and tallies
+        ``failure_error_category(manifest["error"])``.
+        """
+
+        failed_total = counts.get("failed", 0)
+        if failed_total <= 0:
+            return {}
+
+        breakdown: dict[str, int] = {}
+        seen: set[Path] = set()
+        for manifest_path in self.processed_manifest_paths:
+            if manifest_path in seen:
+                continue
+            seen.add(manifest_path)
+            manifest = read_json(manifest_path)
+            if manifest.get("status") != "failed":
+                continue
+            category = failure_error_category(manifest.get("error"))
+            breakdown[category] = breakdown.get(category, 0) + 1
+
+        categorized = sum(breakdown.values())
+        if categorized < failed_total:
+            # Some failures (e.g. a preflight failure that short-circuits the
+            # whole batch before any manifest is touched) have no per-job
+            # manifest to attribute a reason to. Keep the printed total
+            # trustworthy rather than silently under-reporting it.
+            breakdown["(uncategorized)"] = breakdown.get(
+                "(uncategorized)", 0
+            ) + (failed_total - categorized)
+        return breakdown
+
+    def _print_failure_breakdown(self, counts: dict[str, int]) -> dict[str, int]:
+        breakdown = self._failure_breakdown(counts)
+        if not breakdown:
+            return breakdown
+        print(f"{counts.get('failed', 0):,} failed:")
+        for category, count in sorted(
+            breakdown.items(), key=lambda item: (-item[1], item[0])
+        ):
+            print(f"  {count:>4,}  {category}")
+        return breakdown
+
     def _write_summary(
         self,
         counts: dict[str, int],
         *,
         publication: Optional[dict[str, Any]] = None,
     ) -> None:
+        failure_breakdown = self._print_failure_breakdown(counts)
         summary: dict[str, Any] = {
             "pipeline_version": PIPELINE_VERSION,
             "finished_at": utc_now(),
@@ -2862,6 +3043,8 @@ class PipelineRunner:
             "retain_troubleshooting_artifacts": self.config.retain_troubleshooting_artifacts,
             "counts": counts,
         }
+        if failure_breakdown:
+            summary["failure_breakdown"] = failure_breakdown
         if publication is not None:
             summary["source_docx_publication"] = {
                 key: publication.get(key)

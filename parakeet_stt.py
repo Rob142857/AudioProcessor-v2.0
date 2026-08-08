@@ -22,6 +22,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from stt_coverage import finite_seconds
+
 
 DEFAULT_PARAKEET_MODEL = "nvidia/parakeet-tdt-0.6b-v3"
 PROTOCOL_MARKER = "__PARAKEET_RESULT__"
@@ -31,6 +33,18 @@ TRANSCRIBE_TIMEOUT_SECONDS = 60 * 60
 # durable pipeline artifacts. Restart once and retry the exact source before
 # treating that recording as failed.
 WORKER_CRASH_RETRIES = 1
+# NeMo's mel-spectrogram front end (AudioToMelSpectrogramPreprocessor) needs
+# at least one hop's worth of audio to produce a single mel frame. The
+# nvidia/parakeet-tdt-0.6b-v3 checkpoint's own model_config.yaml pins
+# sample_rate=16000 and window_stride=0.01s, i.e. hop_length = 160 samples =
+# 0.01s -- and right up to two hops of audio, NeMo's `normalize_batch` divides
+# by a torch.std() of nan and raises a raw ValueError ("received a tensor of
+# length 1 ... make sure your audio length has enough samples for a single
+# feature (at least hop_length for Mel Spectrograms)") instead of a usable
+# message. 0.1s is a ~10x margin over that boundary -- enough to comfortably
+# clear the 0/1-frame crash zone plus resampling rounding, without hard-coding
+# a specific downloaded checkpoint's exact internal hop length.
+MIN_TRANSCRIBABLE_SECONDS = 0.1
 
 
 class ParakeetError(RuntimeError):
@@ -51,6 +65,25 @@ def parakeet_python_path() -> Path:
             f"{candidate}. Run the reviewed Parakeet setup before selecting it."
         )
     return candidate
+
+
+def _probe_duration_seconds(source: Path) -> Optional[float]:
+    """Best-effort media duration probe for the pre-flight length check.
+
+    Reuses ``transcribe.get_media_duration`` -- the same primitive
+    ``archive_pipeline.py``'s ``probe_audio_duration_seconds`` calls to backfill
+    ``audio_duration_seconds`` for the STT coverage check in ``stt_coverage.py``
+    -- so this module does not grow a second duration probe. Any failure
+    (missing ffprobe, unreadable container, ...) is treated as "unknown" rather
+    than fatal; the pre-flight check simply does not run in that case.
+    """
+
+    try:
+        from transcribe import get_media_duration
+
+        return finite_seconds(get_media_duration(str(source)), positive=True)
+    except Exception:
+        return None
 
 
 class ParakeetSession:
@@ -142,6 +175,11 @@ class ParakeetSession:
         cancel_check: Optional[Callable[[], bool]] = None,
     ) -> dict[str, Any]:
         """Transcribe one source and return the archive STT details contract."""
+
+        source = Path(source)
+        duration = _probe_duration_seconds(source)
+        if duration is not None and duration < MIN_TRANSCRIBABLE_SECONDS:
+            raise ParakeetError(f"audio too short to transcribe: {duration:.2f}s")
 
         with self._lock:
             for attempt in range(WORKER_CRASH_RETRIES + 1):
@@ -284,6 +322,7 @@ class ParakeetSession:
 
 __all__ = [
     "DEFAULT_PARAKEET_MODEL",
+    "MIN_TRANSCRIBABLE_SECONDS",
     "ParakeetCancelledError",
     "ParakeetError",
     "ParakeetSession",

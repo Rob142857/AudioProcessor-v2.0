@@ -1,6 +1,7 @@
 import json
 import os
 import tempfile
+import time
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -8,15 +9,19 @@ from types import SimpleNamespace
 from unittest import mock
 
 from archive_pipeline import (
+    ATOMIC_REPLACE_MAX_ATTEMPTS,
     DEFAULT_GUI_STT_MODEL,
+    STALE_RUNNING_THRESHOLD_SECONDS,
     PipelineConfig,
     PipelineRunner,
     SOURCE_DOCX_PUBLICATION_REPORT,
     artifact_directory,
     artifact_paths,
+    atomic_write_bytes,
     compact_stt_metadata,
     discover_audio,
     execute_pipeline,
+    failure_error_category,
     main as pipeline_main,
     parse_args,
     publish_source_docx_batch,
@@ -1670,6 +1675,445 @@ class ArchivePipelineTests(unittest.TestCase):
                 manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
                 self.assertEqual(manifest["status"], "failed")
                 self.assertIn("decoder failed", manifest["error"])
+            finally:
+                runner.close()
+
+
+class AtomicReplaceRetryTests(unittest.TestCase):
+    """Fix 2 -- atomic_write_bytes retries a transient Windows replace lock."""
+
+    @staticmethod
+    def _permission_error(winerror: int, message: str = "Access is denied") -> PermissionError:
+        exc = PermissionError(f"[WinError {winerror}] {message}")
+        exc.winerror = winerror
+        return exc
+
+    def test_retries_transient_permission_error_then_succeeds(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / "manifest.json"
+            real_replace = os.replace
+            calls = []
+
+            def flaky_replace(source, destination):
+                calls.append((source, destination))
+                if len(calls) <= 2:
+                    raise self._permission_error(5)
+                return real_replace(source, destination)
+
+            with mock.patch(
+                "archive_pipeline.os.replace", side_effect=flaky_replace
+            ), mock.patch("archive_pipeline.time.sleep") as sleep_mock:
+                atomic_write_bytes(target, b"hello")
+
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(target.read_bytes(), b"hello")
+            self.assertEqual(sleep_mock.call_count, 2)
+
+    def test_retries_oserror_with_winerror_32_shared_violation(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / "manifest.json"
+            real_replace = os.replace
+            calls = []
+
+            def flaky_replace(source, destination):
+                calls.append((source, destination))
+                if len(calls) == 1:
+                    exc = OSError("The process cannot access the file")
+                    exc.winerror = 32
+                    raise exc
+                return real_replace(source, destination)
+
+            with mock.patch(
+                "archive_pipeline.os.replace", side_effect=flaky_replace
+            ), mock.patch("archive_pipeline.time.sleep"):
+                atomic_write_bytes(target, b"hello")
+
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(target.read_bytes(), b"hello")
+
+    def test_does_not_retry_unrelated_oserror(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / "manifest.json"
+            calls = []
+
+            def always_fail(source, destination):
+                calls.append((source, destination))
+                exc = OSError("The system cannot find the path specified")
+                exc.winerror = 3
+                raise exc
+
+            with mock.patch(
+                "archive_pipeline.os.replace", side_effect=always_fail
+            ), mock.patch("archive_pipeline.time.sleep") as sleep_mock:
+                with self.assertRaises(OSError):
+                    atomic_write_bytes(target, b"hello")
+
+            self.assertEqual(len(calls), 1)
+            sleep_mock.assert_not_called()
+            self.assertFalse(target.exists())
+
+    def test_reraises_once_retries_are_exhausted(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / "manifest.json"
+            calls = []
+            sleeps = []
+
+            def always_locked(source, destination):
+                calls.append((source, destination))
+                raise self._permission_error(5)
+
+            with mock.patch(
+                "archive_pipeline.os.replace", side_effect=always_locked
+            ), mock.patch("archive_pipeline.time.sleep", side_effect=sleeps.append):
+                with self.assertRaises(PermissionError):
+                    atomic_write_bytes(target, b"hello")
+
+            self.assertEqual(len(calls), ATOMIC_REPLACE_MAX_ATTEMPTS)
+            self.assertEqual(sleeps, [0.1, 0.2, 0.4, 0.8])
+            self.assertFalse(target.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows extended-path handling")
+    def test_replace_destination_uses_extended_windows_path(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / "manifest.json"
+            with mock.patch(
+                "archive_pipeline.os.replace", wraps=os.replace
+            ) as replace:
+                atomic_write_bytes(target, b"hello")
+
+            _source, destination = replace.call_args.args
+            self.assertTrue(str(destination).startswith("\\\\?\\"))
+            self.assertEqual(target.read_bytes(), b"hello")
+
+
+class ReapStaleRunningManifestTests(unittest.TestCase):
+    """Fix 5 -- a manifest abandoned mid-job must not stay 'running' forever."""
+
+    @staticmethod
+    def _write_stale_manifest(
+        manifest_path: Path,
+        *,
+        source: Path,
+        relative_name: str,
+        stage: str = "cleaning",
+        age_seconds: float,
+    ) -> None:
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "status": "running",
+                    "stage": stage,
+                    "attempts": 1,
+                    "source": {
+                        "path": str(source.resolve()),
+                        "relative_path": relative_name,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        stamp = time.time() - age_seconds
+        os.utime(manifest_path, (stamp, stamp))
+
+    def test_rewrites_manifest_older_than_threshold_to_failed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source_root = root / "archive"
+            output_root = root / "artifacts"
+            source_root.mkdir()
+            stuck_source = source_root / "stuck.aiff"
+            config = PipelineConfig(input_path=source_root, output_root=output_root)
+            runner = PipelineRunner(config)
+            try:
+                paths = artifact_paths(
+                    artifact_directory(stuck_source, source_root, output_root)
+                )
+                self._write_stale_manifest(
+                    paths["manifest"],
+                    source=stuck_source,
+                    relative_name="stuck.aiff",
+                    stage="cleaning",
+                    age_seconds=STALE_RUNNING_THRESHOLD_SECONDS + 60,
+                )
+
+                reaped = runner._reap_stale_running_manifests()
+
+                self.assertEqual(reaped, 1)
+                manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
+                self.assertEqual(manifest["status"], "failed")
+                self.assertEqual(manifest["stage"], "failed")
+                self.assertIn("abandoned", manifest["error"])
+                self.assertIn("cleaning", manifest["error"])
+            finally:
+                runner.close()
+
+    def test_leaves_recently_updated_running_manifest_untouched(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source_root = root / "archive"
+            output_root = root / "artifacts"
+            source_root.mkdir()
+            fresh_source = source_root / "fresh.aiff"
+            config = PipelineConfig(input_path=source_root, output_root=output_root)
+            runner = PipelineRunner(config)
+            try:
+                paths = artifact_paths(
+                    artifact_directory(fresh_source, source_root, output_root)
+                )
+                self._write_stale_manifest(
+                    paths["manifest"],
+                    source=fresh_source,
+                    relative_name="fresh.aiff",
+                    age_seconds=60,
+                )
+
+                reaped = runner._reap_stale_running_manifests()
+
+                self.assertEqual(reaped, 0)
+                manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
+                self.assertEqual(manifest["status"], "running")
+            finally:
+                runner.close()
+
+    def test_reap_is_skipped_during_dry_run(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source_root = root / "archive"
+            output_root = root / "artifacts"
+            source_root.mkdir()
+            stuck_source = source_root / "stuck.aiff"
+            config = PipelineConfig(
+                input_path=source_root, output_root=output_root, dry_run=True
+            )
+            runner = PipelineRunner(config)
+            try:
+                paths = artifact_paths(
+                    artifact_directory(stuck_source, source_root, output_root)
+                )
+                self._write_stale_manifest(
+                    paths["manifest"],
+                    source=stuck_source,
+                    relative_name="stuck.aiff",
+                    age_seconds=STALE_RUNNING_THRESHOLD_SECONDS + 60,
+                )
+
+                runner.run()
+
+                manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
+                self.assertEqual(manifest["status"], "running")
+            finally:
+                runner.close()
+
+    def test_reaped_job_is_reprocessed_within_the_same_run(self):
+        """The reap must happen before discover_audio's reuse/skip decision."""
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source_root = root / "archive"
+            output_root = root / "artifacts"
+            source_root.mkdir()
+            source = source_root / "lecture.aiff"
+            source.write_bytes(b"not-real-audio")
+            config = PipelineConfig(
+                input_path=source_root,
+                output_root=output_root,
+                cleanup_enabled=False,
+            )
+            runner = PipelineRunner(config)
+            transcribe_calls = []
+
+            def transcribe(path):
+                transcribe_calls.append(path)
+                return {
+                    "text": "faithfully transcribed spoken words here",
+                    "raw_text": "faithfully transcribed spoken words here",
+                    "segments": [
+                        {"start": 0.0, "end": 3.0, "text": "faithfully transcribed"},
+                        {"start": 3.1, "end": 6.0, "text": "spoken words here"},
+                    ],
+                    "metadata": {"model": "Faster-Whisper large-v3", "audio_duration_seconds": 6.0},
+                    "elapsed_seconds": 0.1,
+                }
+
+            def render(_source, _text, output_path, _metadata):
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes(b"x" * 1_200)
+                return output_path
+
+            runner._transcribe = transcribe
+            runner._render_docx = render
+            try:
+                paths = artifact_paths(
+                    artifact_directory(source, source_root, output_root)
+                )
+                # A real, fully-formed manifest first (mirrors what an actual
+                # job directory looks like -- a hand-rolled skeleton manifest
+                # would be missing keys ``process_one`` legitimately expects
+                # to already exist on a job it is resuming).
+                self.assertEqual(runner.process_one(source), "verified")
+                self.assertEqual(len(transcribe_calls), 1)
+
+                # Simulate the process dying mid-*second* attempt: still
+                # "running", well past the stale threshold.
+                manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
+                manifest["status"] = "running"
+                manifest["stage"] = "cleaning"
+                paths["manifest"].write_text(
+                    json.dumps(manifest), encoding="utf-8"
+                )
+                stamp = time.time() - (STALE_RUNNING_THRESHOLD_SECONDS + 60)
+                os.utime(paths["manifest"], (stamp, stamp))
+
+                counts = runner.run()
+
+                self.assertEqual(counts["verified"], 1)
+                manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
+                self.assertEqual(manifest["status"], "verified")
+            finally:
+                runner.close()
+
+
+class FailureSummaryTests(unittest.TestCase):
+    """Fix 7 -- operator-facing grouped tally of a run's failures."""
+
+    def test_failure_error_category_extracts_leading_exception_type(self):
+        self.assertEqual(
+            failure_error_category(
+                "FileNotFoundError: [WinError 206] The filename or extension is too long"
+            ),
+            "FileNotFoundError",
+        )
+        self.assertEqual(
+            failure_error_category(
+                "CleanupNetworkError: cleanup request failed after 4 attempts: "
+                "<urlopen error [Errno 11001] getaddrinfo failed>"
+            ),
+            "CleanupNetworkError",
+        )
+        self.assertEqual(
+            failure_error_category(
+                "abandoned; process exited during 'cleaning' stage "
+                "(manifest was still 'running' after 120 minutes)"
+            ),
+            "abandoned; process exited during 'cleaning' stage "
+            "(manifest was still 'running' after 120 minutes)",
+        )
+        self.assertEqual(failure_error_category(None), "(no error recorded)")
+        self.assertEqual(failure_error_category(""), "(no error recorded)")
+        self.assertEqual(failure_error_category("   "), "(no error recorded)")
+
+    def test_run_summary_groups_failures_by_exception_type_most_frequent_first(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source_root = root / "archive"
+            output_root = root / "artifacts"
+            source_root.mkdir()
+            for name in ("ok.aiff", "missing.aiff", "missing2.aiff", "locked.aiff"):
+                (source_root / name).write_bytes(b"not-real-audio")
+
+            config = PipelineConfig(
+                input_path=source_root,
+                output_root=output_root,
+                cleanup_enabled=False,
+            )
+            runner = PipelineRunner(config)
+
+            def transcribe(path):
+                if path.name == "ok.aiff":
+                    return {
+                        "text": "hello there friend",
+                        "raw_text": "hello there friend",
+                        "segments": [
+                            {"start": 0.0, "end": 2.0, "text": "hello there friend"}
+                        ],
+                        "metadata": {"model": "Faster-Whisper large-v3", "audio_duration_seconds": 2.0},
+                        "elapsed_seconds": 0.1,
+                    }
+                if path.name in ("missing.aiff", "missing2.aiff"):
+                    raise FileNotFoundError(f"[WinError 206] path too long: {path}")
+                raise PermissionError("[WinError 5] Access is denied")
+
+            def render(_source, _text, output_path, _metadata):
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes(b"x" * 1_200)
+                return output_path
+
+            runner._transcribe = transcribe
+            runner._render_docx = render
+            try:
+                with mock.patch("builtins.print") as mock_print:
+                    counts = runner.run()
+
+                self.assertEqual(counts["failed"], 3)
+                self.assertEqual(counts["verified"], 1)
+
+                summary = json.loads(
+                    (output_root / "last-run-summary.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertEqual(
+                    summary["failure_breakdown"],
+                    {"FileNotFoundError": 2, "PermissionError": 1},
+                )
+
+                printed = "\n".join(
+                    str(call.args[0])
+                    for call in mock_print.call_args_list
+                    if call.args
+                )
+                self.assertIn("3 failed:", printed)
+                fnf_index = printed.index("FileNotFoundError")
+                perm_index = printed.index("PermissionError")
+                self.assertLess(
+                    fnf_index, perm_index, "most-frequent category should print first"
+                )
+            finally:
+                runner.close()
+
+    def test_no_breakdown_emitted_when_run_has_no_failures(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source_root = root / "archive"
+            output_root = root / "artifacts"
+            source_root.mkdir()
+            source = source_root / "lecture.aiff"
+            source.write_bytes(b"not-real-audio")
+            config = PipelineConfig(
+                input_path=source_root,
+                output_root=output_root,
+                cleanup_enabled=False,
+            )
+            runner = PipelineRunner(config)
+
+            def transcribe(path):
+                return {
+                    "text": "faithfully transcribed spoken words here",
+                    "raw_text": "faithfully transcribed spoken words here",
+                    "segments": [
+                        {"start": 0.0, "end": 3.0, "text": "faithfully transcribed"},
+                        {"start": 3.1, "end": 6.0, "text": "spoken words here"},
+                    ],
+                    "metadata": {"model": "Faster-Whisper large-v3", "audio_duration_seconds": 6.0},
+                    "elapsed_seconds": 0.1,
+                }
+
+            def render(_source, _text, output_path, _metadata):
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes(b"x" * 1_200)
+                return output_path
+
+            runner._transcribe = transcribe
+            runner._render_docx = render
+            try:
+                counts = runner.run()
+                self.assertEqual(counts["verified"], 1)
+                summary = json.loads(
+                    (output_root / "last-run-summary.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                self.assertNotIn("failure_breakdown", summary)
             finally:
                 runner.close()
 

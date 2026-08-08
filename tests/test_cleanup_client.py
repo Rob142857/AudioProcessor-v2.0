@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
+import socket
 import tempfile
 import unittest
 import urllib.error
@@ -15,10 +17,16 @@ from cleanup_client import (
     CleanupAccessError,
     CleanupClient,
     CleanupConfigurationError,
+    CleanupNetworkError,
     CleanupProtocolError,
     CHECKPOINT_VERSION,
     DEFAULT_CLEANUP_PROFILE,
+    DEFAULT_MAX_ATTEMPTS,
+    DEFAULT_RETRY_BASE_DELAY,
+    DNS_RETRY_DELAY_SECONDS,
+    MAX_RETRY_DELAY_SECONDS,
     HttpResponse,
+    _windows_extended_path,
     chunk_text,
     normalize_access_credential,
 )
@@ -305,6 +313,39 @@ class CleanupClientTests(unittest.TestCase):
         _temporary, destination = replace.call_args.args
         self.assertTrue(str(destination).startswith("\\\\?\\"))
 
+    @unittest.skipUnless(os.name == "nt", "Windows path handling")
+    def test_cleanup_text_creates_checkpoint_dir_beyond_max_path(self):
+        # Regression test for WinError 206/3: `run_dir.mkdir(...)` used to be
+        # called with a plain path, which Windows rejects once the full path
+        # exceeds MAX_PATH (260 chars) unless LongPathsEnabled is set. Build a
+        # checkpoint_dir long enough that `<checkpoint_dir>/<sha256>` clears
+        # 260 chars regardless of how long the platform temp dir happens to
+        # be, then assert the run still completes and checkpoints land.
+        terms = response(200, "Gurdjieff\nFourth Way\n")
+        base = Path(tempfile.mkdtemp())
+        try:
+            sha256_component_len = 64
+            overhead = len(str(base)) + 1 + sha256_component_len + 1
+            padding = "x" * max(10, 300 - overhead)
+            checkpoint_dir = base / padding
+            self.assertGreater(
+                len(str(checkpoint_dir)) + 1 + sha256_component_len, 260
+            )
+
+            result = self.make_client(
+                ScriptedTransport([terms, cleanup_response("One two three.")]),
+                target_words=3,
+            ).cleanup_text("one two three", checkpoint_dir)
+
+            run_dir = checkpoint_dir / result.input_sha256
+            extended_run_dir = Path(_windows_extended_path(run_dir))
+            self.assertTrue(extended_run_dir.is_dir())
+            self.assertEqual(
+                len(list(extended_run_dir.glob("chunk-*.json"))), 1
+            )
+        finally:
+            shutil.rmtree(_windows_extended_path(base), ignore_errors=True)
+
     def test_recomputed_upstream_context_invalidates_downstream_checkpoints(self):
         terms = response(200, "Gurdjieff\nFourth Way\n")
         text = "one two three four five six"
@@ -496,6 +537,157 @@ class CleanupClientTests(unittest.TestCase):
         self.assertEqual(result.text, "Cleaned.")
         self.assertEqual(sleeps, [1, 3.0, 4])
         self.assertEqual(len(transport.calls), 5)
+
+    def test_default_retry_budget_survives_a_dns_blip(self):
+        # A real production run lost 9 jobs to a `getaddrinfo failed` DNS
+        # blip that outlasted the old ~7s retry budget (4 attempts, 1.0s
+        # base). The defaults must give a worker roughly two minutes.
+        client = CleanupClient(
+            client_id="client-id",
+            client_secret="client-secret",
+            endpoint="https://example.test/api/tooling/cleanup-chunk",
+        )
+        self.assertEqual(client.max_attempts, DEFAULT_MAX_ATTEMPTS)
+        self.assertEqual(client.max_attempts, 6)
+        self.assertEqual(client.retry_base_delay, DEFAULT_RETRY_BASE_DELAY)
+        self.assertEqual(client.retry_base_delay, 2.0)
+        self.assertEqual(client.max_retry_delay, MAX_RETRY_DELAY_SECONDS)
+        self.assertEqual(client.max_retry_delay, 30.0)
+        self.assertEqual(client.dns_retry_delay, DNS_RETRY_DELAY_SECONDS)
+        self.assertEqual(client.dns_retry_delay, 10.0)
+
+    def test_dns_failure_uses_flat_backoff_not_exponential(self):
+        sleeps = []
+        transport = ScriptedTransport(
+            [
+                response(200, "Gurdjieff\n"),
+                urllib.error.URLError(socket.gaierror(11001, "getaddrinfo failed")),
+                urllib.error.URLError(socket.gaierror(11001, "getaddrinfo failed")),
+                urllib.error.URLError(socket.gaierror(11001, "getaddrinfo failed")),
+                urllib.error.URLError(socket.gaierror(11001, "getaddrinfo failed")),
+                urllib.error.URLError(socket.gaierror(11001, "getaddrinfo failed")),
+                cleanup_response("Cleaned."),
+            ]
+        )
+        client = CleanupClient(
+            client_id="client-id",
+            client_secret="client-secret",
+            endpoint="https://example.test/api/tooling/cleanup-chunk",
+            transport=transport,
+            sleep=sleeps.append,
+            max_attempts=6,
+            retry_base_delay=2.0,
+        )
+
+        result = client.cleanup_text("cleaned")
+
+        self.assertEqual(result.text, "Cleaned.")
+        # Flat ~10s waits, not the exponential 2, 4, 8, 16, 32 an ordinary
+        # network error would use with these settings.
+        self.assertEqual(sleeps, [10.0, 10.0, 10.0, 10.0, 10.0])
+        self.assertEqual(len(transport.calls), 7)
+
+    def test_connection_refused_uses_flat_backoff(self):
+        sleeps = []
+        transport = ScriptedTransport(
+            [
+                response(200, "Gurdjieff\n"),
+                ConnectionRefusedError("connection refused"),
+                cleanup_response("Cleaned."),
+            ]
+        )
+        client = CleanupClient(
+            client_id="client-id",
+            client_secret="client-secret",
+            endpoint="https://example.test/api/tooling/cleanup-chunk",
+            transport=transport,
+            sleep=sleeps.append,
+        )
+
+        result = client.cleanup_text("cleaned")
+
+        self.assertEqual(result.text, "Cleaned.")
+        self.assertEqual(sleeps, [10.0])
+
+    def test_dns_retries_exhausted_raises_network_error(self):
+        sleeps = []
+        transport = ScriptedTransport(
+            [
+                response(200, "Gurdjieff\n"),
+                *(
+                    urllib.error.URLError(socket.gaierror(11001, "getaddrinfo failed"))
+                    for _ in range(6)
+                ),
+            ]
+        )
+        client = CleanupClient(
+            client_id="client-id",
+            client_secret="client-secret",
+            endpoint="https://example.test/api/tooling/cleanup-chunk",
+            transport=transport,
+            sleep=sleeps.append,
+            max_attempts=6,
+        )
+
+        with self.assertRaises(CleanupNetworkError):
+            client.cleanup_text("cleaned")
+
+        self.assertEqual(sleeps, [10.0, 10.0, 10.0, 10.0, 10.0])
+        self.assertEqual(len(transport.calls), 7)
+
+    def test_retry_after_header_is_capped_at_max_retry_delay(self):
+        # A Retry-After header must not stall a worker for hours.
+        sleeps = []
+        transport = ScriptedTransport(
+            [
+                response(200, "Gurdjieff\n"),
+                response(429, '{"error":"rate limited"}', **{"Retry-After": "9999"}),
+                cleanup_response("Cleaned."),
+            ]
+        )
+        client = CleanupClient(
+            client_id="client-id",
+            client_secret="client-secret",
+            endpoint="https://example.test/api/tooling/cleanup-chunk",
+            transport=transport,
+            sleep=sleeps.append,
+            max_retry_delay=30.0,
+        )
+
+        result = client.cleanup_text("cleaned")
+
+        self.assertEqual(result.text, "Cleaned.")
+        self.assertEqual(sleeps, [30.0])
+
+    def test_exponential_backoff_is_capped_at_max_retry_delay(self):
+        sleeps = []
+        transport = ScriptedTransport(
+            [
+                response(200, "Gurdjieff\n"),
+                response(503, '{"error":"busy"}'),
+                response(503, '{"error":"busy"}'),
+                response(503, '{"error":"busy"}'),
+                response(503, '{"error":"busy"}'),
+                cleanup_response("Cleaned."),
+            ]
+        )
+        client = CleanupClient(
+            client_id="client-id",
+            client_secret="client-secret",
+            endpoint="https://example.test/api/tooling/cleanup-chunk",
+            transport=transport,
+            sleep=sleeps.append,
+            max_attempts=6,
+            retry_base_delay=10.0,
+            max_retry_delay=30.0,
+        )
+
+        result = client.cleanup_text("cleaned")
+
+        self.assertEqual(result.text, "Cleaned.")
+        # Uncapped this would be 10, 20, 40, 80; the 30s ceiling clips the
+        # last two waits.
+        self.assertEqual(sleeps, [10.0, 20.0, 30.0, 30.0])
 
     def test_cloudflare_access_html_has_a_clear_error(self):
         transport = ScriptedTransport(
