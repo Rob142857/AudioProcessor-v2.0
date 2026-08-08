@@ -285,7 +285,7 @@ def _run_polished_pipeline(input_path: str, settings: dict, q: queue.Queue) -> i
         replace_before_date=cutoff,
         existing_transcripts_only=existing_transcripts_only,
         retain_troubleshooting_artifacts=retain_troubleshooting_artifacts,
-        glm_workers=10,
+        glm_workers=30,
         progress_callback=lambda lane, message: q.put(("progress", lane, message)),
     )
     q.put(f"Polished artifacts: {output_root}\n")
@@ -304,7 +304,7 @@ def _run_polished_pipeline(input_path: str, settings: dict, q: queue.Queue) -> i
         if selected_stt_model.casefold().startswith("nvidia/parakeet-"):
             q.put(
                 "Pipeline: one local Parakeet GPU worker -> durable raw '<name>.docx'; "
-                "ten protected GLM-4.7-Flash workers review the completed queue independently.\n"
+                "thirty protected GLM-4.7-Flash workers review the completed queue independently.\n"
             )
         else:
             q.put(
@@ -743,7 +743,7 @@ def launch_gui():
 
     # ── Live pipeline lanes ──────────────────────────────────────────
     # The two panes expose the actual producer/consumer hand-off: one GPU
-    # Parakeet worker continues with the next recording while ten GLM workers
+    # Parakeet worker continues with the next recording while thirty GLM workers
     # independently review already-durable raw transcripts.
     logs = tk.Frame(outer, bg=BG)
     logs.grid(row=4, column=0, sticky="nsew", pady=(0, 0))
@@ -759,7 +759,7 @@ def launch_gui():
     ).grid(row=0, column=0, sticky="w", pady=(0, 4))
     tk.Label(
         logs,
-        text="GLM review queue (ten protected workers)",
+        text="GLM review queue (thirty protected workers)",
         bg=BG,
         fg="#0f766e",
         font=("Segoe UI", 9, "bold"),

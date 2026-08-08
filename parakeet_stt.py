@@ -223,6 +223,17 @@ class ParakeetSession:
             try:
                 line = self._output.get(timeout=0.25)
             except queue.Empty:
+                # On Windows a native CUDA abort can close stdout a fraction
+                # before ``Popen.poll()`` reports the final exit code.  The
+                # reader has already delivered its single EOF marker by then;
+                # without checking again here the parent waits until the full
+                # transcription timeout rather than taking the one safe retry.
+                return_code = process.poll()
+                if return_code is not None:
+                    self.close()
+                    raise ParakeetError(
+                        f"Parakeet worker exited unexpectedly (code {return_code})"
+                    )
                 continue
             if line is None:
                 return_code = process.poll()

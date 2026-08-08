@@ -2,7 +2,7 @@
 
 Audio and video transcription for Windows x64 using local NVIDIA Parakeet or Faster-Whisper, with protected GLM cleanup for the Dr Philip Groves archive.
 
-For archive-wide work, use the resume-safe pipeline documented in [docs/UNIFIED_PIPELINE.md](docs/UNIFIED_PIPELINE.md). It writes durable raw text before review, checkpoints each stage, uses the complete pinned glossary for GLM cleanup, and writes working artifacts into a separate output tree. With the Parakeet default, one local GPU worker continues to the next recording as soon as its raw transcript is durable, while two independent GLM review workers consume that queue. Fresh STT publishes `<name>.docx` plus `<name> - GLM Review.docx`; existing-transcript mode leaves the source `<name>.docx` byte-for-byte unchanged and publishes only the review sibling. Every GLM Review copy carries a removable `Needs human review.` notice beneath its provenance statement.
+For archive-wide work, use the resume-safe pipeline documented in [docs/UNIFIED_PIPELINE.md](docs/UNIFIED_PIPELINE.md). It writes durable raw text before review, checkpoints each stage, uses the complete pinned glossary for GLM cleanup, and writes working artifacts into a separate output tree. With the Parakeet default, one local GPU worker continues to the next recording as soon as its raw transcript is durable, while thirty independent GLM review workers consume that queue. Fresh STT publishes `<name>.docx` plus `<name> - GLM Review.docx`; existing-transcript mode leaves the source `<name>.docx` byte-for-byte unchanged and publishes only the review sibling. Every GLM Review copy carries a removable `Needs human review.` notice beneath its provenance statement.
 
 ## What It Does
 
@@ -11,7 +11,7 @@ Converts audio/video files into professionally formatted DOCX transcripts. It de
 ### Key Features
 
 - **NVIDIA Parakeet TDT 0.6B v3** — fast local archive default, loaded once per batch
-- **Ten GLM review workers** — begin as each durable Parakeet transcript is ready, without holding the GPU lane
+- **Thirty GLM review workers** — begin as each durable Parakeet transcript is ready, without holding the GPU lane
 - **Faster-Whisper Large-v3** — retained comparison/fallback option
 - **Faster-Whisper Large-v3-turbo** — faster comparison/overflow option
 - **Native Whisper Large-v3** — OpenAI fallback (GPU or CPU)
@@ -42,7 +42,7 @@ The installer tries registered `py -3.12` first, then `%LOCALAPPDATA%\Programs\P
 ```
 
 The GUI defaults to **Polished archive pipeline**: local NVIDIA Parakeet,
-ten protected GLM-4.7-Flash cleanup workers, and separate human-review Word
+thirty protected GLM-4.7-Flash cleanup workers, and separate human-review Word
 publication. Its two live panes show the GPU speech-to-text lane and the GLM
 review queue independently.
 It runs the full environment and protected-access preflight before opening any

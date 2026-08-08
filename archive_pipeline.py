@@ -42,7 +42,10 @@ configure_safe_stdio()
 PIPELINE_VERSION = "3.1.0"
 DEFAULT_STT_MODEL = "faster-whisper-large-v3"
 DEFAULT_GUI_STT_MODEL = "nvidia/parakeet-tdt-0.6b-v3"
-DEFAULT_GLM_REVIEW_WORKERS = 10
+# GLM review is remote and independent of the single local GPU STT lane.  A
+# wider pool prevents completed Parakeet transcripts from accumulating while
+# long archival recordings are being cleaned in chunks.
+DEFAULT_GLM_REVIEW_WORKERS = 30
 PARAKEET_MODEL_PREFIX = "nvidia/parakeet-"
 DEFAULT_CLEANUP_ENDPOINT = (
     "https://pg.objectiveartefacts.com.au/api/tooling/cleanup-chunk"
@@ -484,6 +487,62 @@ def _existing_transcript_discovery(
     return selected, stats
 
 
+def _unfinished_manifest_sources(
+    input_path: Path,
+    output_root: Path,
+    *,
+    recursive: bool,
+) -> set[Path]:
+    """Find durable jobs which must resume despite the DOCX selection filter.
+
+    Fresh STT publishes a sibling raw Word document before GLM review.  On a
+    restart, that new document would ordinarily be excluded by ``skip`` or
+    ``before`` selection.  The manifest is the authoritative durable state,
+    so non-final jobs are reintroduced here and continue from their raw
+    checkpoint instead of needlessly running speech-to-text again.
+    """
+
+    output_root = output_root.resolve()
+    if not output_root.is_dir():
+        return set()
+
+    requested = input_path.resolve()
+    archive_root = requested if requested.is_dir() else requested.parent
+    selected: set[Path] = set()
+    for manifest_path in output_root.rglob("manifest.json"):
+        manifest = read_json(manifest_path)
+        if not isinstance(manifest, dict):
+            continue
+        if manifest.get("status") in FINAL_STATUSES | {"skipped"}:
+            continue
+        source_record = manifest.get("source")
+        if not isinstance(source_record, dict):
+            continue
+        source_value = source_record.get("path")
+        if not isinstance(source_value, str) or not source_value.strip():
+            continue
+        try:
+            source = Path(source_value).resolve()
+        except OSError:
+            continue
+        if (
+            not source.is_file()
+            or source.suffix.casefold() not in SUPPORTED_AUDIO_EXTENSIONS
+            or _is_relative_to(source, output_root)
+        ):
+            continue
+        if requested.is_file():
+            if source == requested:
+                selected.add(source)
+            continue
+        if not _is_relative_to(source, archive_root):
+            continue
+        if not recursive and source.parent != archive_root:
+            continue
+        selected.add(source)
+    return selected
+
+
 def discover_audio(
     input_path: Path,
     output_root: Path,
@@ -518,10 +577,16 @@ def discover_audio(
             raise ValueError(f"Unsupported audio/video extension: {input_path.suffix}")
         return (
             [input_path]
-            if should_process_existing_docx(
-                input_path,
-                existing_docx_mode,
-                replace_before_date,
+            if (
+                should_process_existing_docx(
+                    input_path,
+                    existing_docx_mode,
+                    replace_before_date,
+                )
+                or input_path
+                in _unfinished_manifest_sources(
+                    input_path, output_root, recursive=recursive
+                )
             )
             else []
         )
@@ -548,6 +613,15 @@ def discover_audio(
                 os.path.abspath(str(resolved.with_suffix(".docx")))
             )
             grouped.setdefault(key, []).append(resolved)
+
+    # Resume is stronger than the presentation-oriented source DOCX policy:
+    # it prevents an interrupted GLM review from being stranded just because
+    # the corresponding raw DOCX was already published.
+    for source in _unfinished_manifest_sources(
+        input_path, output_root, recursive=recursive
+    ):
+        key = os.path.normcase(os.path.abspath(str(source.with_suffix(".docx"))))
+        grouped.setdefault(key, []).append(source)
 
     def canonical_variant(candidates: list[Path]) -> Path:
         return min(

@@ -97,9 +97,9 @@ class ArchivePipelineTests(unittest.TestCase):
         self.assertFalse(config.publish_source_docx)
         self.assertFalse(config.existing_transcripts_only)
         self.assertTrue(config.retain_troubleshooting_artifacts)
-        self.assertEqual(config.glm_workers, 10)
+        self.assertEqual(config.glm_workers, 30)
         self.assertFalse(parse_args(["archive"]).publish_source_docx)
-        self.assertEqual(parse_args(["archive"]).glm_workers, 10)
+        self.assertEqual(parse_args(["archive"]).glm_workers, 30)
         self.assertTrue(
             parse_args(["archive", "--no-troubleshooting-logs"]).no_troubleshooting_logs
         )
@@ -292,6 +292,56 @@ class ArchivePipelineTests(unittest.TestCase):
             self.assertEqual(selected_all, [missing.resolve(), old.resolve(), recent.resolve()])
             self.assertEqual(selected_skip, [missing.resolve()])
             self.assertEqual(selected_before, [missing.resolve(), old.resolve()])
+
+    def test_incomplete_manifest_overrides_existing_docx_filter_on_resume(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source_root = root / "archive"
+            output_root = root / "output"
+            source_root.mkdir()
+            source = source_root / "interrupted.mp3"
+            source.write_bytes(b"synthetic-audio-placeholder")
+            source.with_suffix(".docx").write_bytes(b"durable raw transcript")
+
+            # The freshly published raw DOCX is deliberately outside this
+            # replacement window, so ordinary discovery excludes it.
+            self.assertEqual(
+                [],
+                discover_audio(
+                    source_root,
+                    output_root,
+                    existing_docx_mode="before",
+                    replace_before_date="2022-01-01",
+                ),
+            )
+
+            paths = artifact_paths(
+                artifact_directory(source, source_root, output_root)
+            )
+            paths["manifest"].parent.mkdir(parents=True)
+            paths["manifest"].write_text(
+                json.dumps(
+                    {
+                        "status": "cancelled",
+                        "stage": "cleaning",
+                        "source": {
+                            "path": str(source.resolve()),
+                            "relative_path": source.name,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                [source.resolve()],
+                discover_audio(
+                    source_root,
+                    output_root,
+                    existing_docx_mode="before",
+                    replace_before_date="2022-01-01",
+                ),
+            )
 
     def test_non_recursive_discovery_excludes_nested_recordings(self):
         with tempfile.TemporaryDirectory() as folder:
