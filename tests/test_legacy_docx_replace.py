@@ -4,6 +4,7 @@ import json
 import hashlib
 import os
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
 from unittest import mock
@@ -304,6 +305,88 @@ class LegacyReplacementTests(unittest.TestCase):
             self.assertFalse(
                 (backup_root / "1985 MW/0122 Topic - GLM Review.docx").exists()
             )
+
+    @unittest.skipUnless(os.name == "nt", "extended-path handling is Windows-specific")
+    def test_success_survives_a_backup_path_beyond_max_path(self):
+        # Regression test for a live production failure: `_copy_to_new_path`
+        # called `destination.parent.mkdir(...)` and `os.replace(...)` with
+        # plain paths. The backup directory itself (a run-timestamped folder
+        # under `publication-backups/`, nested under the source's own
+        # subfolder structure) can be under 260 chars while the temp file
+        # `mkstemp` creates inside it -- which echoes the destination's full
+        # original filename -- is not, so mkdir silently succeeded and the
+        # temp file write failed with a bare "[Errno 2] No such file or
+        # directory". Build a relative source long enough that the backup
+        # temp file path clears 260 chars regardless of the platform temp
+        # dir's length, then assert the replacement still completes.
+        temporary = tempfile.mkdtemp()
+        try:
+            _root, generated, legacy = self.roots(temporary)
+            backup_root = generated / "publication-backups" / "20260809-000000-000000"
+            base_relative = Path(
+                "Tapes From Joe (MW, RL, et al)/public lectures/Lecture.mp3"
+            )
+            # Pad so the *fixture's own* job directory under `generated`
+            # (shorter -- no publication-backups/<run-id> prefix) stays safely
+            # under MAX_PATH while still being able to hold its longest inner
+            # filename, but the backup copy's temp file -- nested deeper,
+            # under backup_root, with mkstemp's own overhead added on top --
+            # clears 260 regardless of this machine's temp dir length.
+            innermost_fixture_filename = len("raw.segments.json") + 1
+            job_dir_overhead = len(
+                str(generated / base_relative.parent / f"{base_relative.stem}__mp3")
+            )
+            padding = "x" * max(10, 235 - innermost_fixture_filename - job_dir_overhead)
+            relative_source = base_relative.with_name(
+                f"{base_relative.stem}{padding}{base_relative.suffix}"
+            )
+
+            job_dir = (
+                generated
+                / relative_source.parent
+                / f"{relative_source.stem}__mp3"
+            )
+            self.assertLess(
+                len(str(job_dir)) + innermost_fixture_filename,
+                260,
+                "test setup itself must stay under MAX_PATH",
+            )
+
+            new_review, new_raw, raw_target, review_target, original = add_job(
+                generated, legacy, relative_source.as_posix(), "long"
+            )
+            plan = replacement.plan_legacy_docx_replacements(generated, legacy)
+            backup_file = backup_root / relative_source.with_suffix(".docx")
+            temp_file_overhead = 14  # ".", destination name repeated, ".", 8 random chars, ".tmp"
+            self.assertGreater(
+                len(str(backup_file)) + temp_file_overhead,
+                260,
+                "test setup must actually exercise a path beyond MAX_PATH",
+            )
+
+            replaced = replacement.apply_legacy_docx_replacements(
+                plan,
+                expected_scope_root=legacy,
+                backup_root=backup_root,
+                confirm=True,
+                expected_count=2,
+            )
+
+            self.assertEqual(
+                set(replaced), {raw_target.resolve(), review_target.resolve()}
+            )
+            self.assertEqual(raw_target.read_bytes(), new_raw.read_bytes())
+            self.assertEqual(review_target.read_bytes(), new_review.read_bytes())
+            self.assertEqual(
+                Path(replacement._windows_extended_path(backup_file)).read_bytes(),
+                original,
+            )
+        finally:
+            # A plain shutil.rmtree (as used by tempfile.TemporaryDirectory's
+            # own __exit__) hits the exact same MAX_PATH limit on cleanup that
+            # this test exists to exercise, so it must be torn down through
+            # the same extended-path helper under test.
+            shutil.rmtree(replacement._windows_extended_path(temporary), ignore_errors=True)
 
     def test_success_creates_source_adjacent_docx_when_none_exists(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -24,6 +24,29 @@ import zipfile
 from stt_coverage import assess_stt_coverage, coverage_record_is_passed, finite_seconds
 
 
+def _windows_extended_path(path: str | Path) -> str:
+    """Return an extended Windows path when a destination name exceeds MAX_PATH.
+
+    Duplicated from ``cleanup_client._windows_extended_path`` /
+    ``archive_pipeline._windows_extended_path``: the per-run backup tree nests
+    a full source-relative path (e.g. ``Tapes From Joe (MW, RL, et al)\\public
+    lectures\\``) under a timestamped ``publication-backups\\<run-id>\\`` root
+    on top of an already-long OneDrive archive path, and the destination's
+    long original filename is echoed into the temp file's own name
+    (``.{name}.{random}.tmp``). The directory itself can be under 260
+    characters while the temp file inside it is not, so ``mkdir`` silently
+    succeeds and the ``tempfile.mkstemp``/``os.replace`` call that follows is
+    the one that fails with ``[Errno 2] No such file or directory``.
+    """
+
+    value = os.path.abspath(os.fspath(path))
+    if os.name != "nt" or value.startswith("\\\\?\\"):
+        return value
+    if value.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + value[2:]
+    return "\\\\?\\" + value
+
+
 class ReplacementError(RuntimeError):
     """A replacement plan or transaction failed a safety condition."""
 
@@ -91,7 +114,12 @@ class LegacyReplacementPlan:
 
 def _sha256_file(path: Path, block_size: int = 1024 * 1024) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as source:
+    # A caller may hold a plain, un-prefixed reference to a path this module
+    # itself only ever wrote through its extended-path form (e.g. a backup
+    # nested under a run-timestamped publication-backups/ tree). The file
+    # exists either way, but Windows still rejects a plain path over 260
+    # chars when *opening* it, regardless of how it was created.
+    with Path(_windows_extended_path(path)).open("rb") as source:
         while block := source.read(block_size):
             digest.update(block)
     return digest.hexdigest()
@@ -117,10 +145,11 @@ def validate_docx(path: Path) -> None:
     """Validate ZIP integrity and the minimum WordprocessingML members."""
 
     path = Path(path)
-    if not path.is_file() or path.is_symlink():
+    extended_path = Path(_windows_extended_path(path))
+    if not extended_path.is_file() or extended_path.is_symlink():
         raise ReplacementError(f"DOCX is missing, not a file, or a symlink: {path}")
     try:
-        with zipfile.ZipFile(path) as package:
+        with zipfile.ZipFile(extended_path) as package:
             names = set(package.namelist())
             required = {"[Content_Types].xml", "word/document.xml"}
             missing = required - names
@@ -669,9 +698,10 @@ def plan_legacy_docx_replacements(
 
 
 def _copy_to_new_path(source: Path, destination: Path) -> None:
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    extended_parent = _windows_extended_path(destination.parent)
+    Path(extended_parent).mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{destination.name}.", suffix=".tmp", dir=str(destination.parent)
+        prefix=f".{destination.name}.", suffix=".tmp", dir=extended_parent
     )
     temporary = Path(temporary_name)
     try:
@@ -681,7 +711,7 @@ def _copy_to_new_path(source: Path, destination: Path) -> None:
             os.fsync(output_stream.fileno())
         if destination.exists():
             raise ReplacementError(f"refusing to overwrite backup: {destination}")
-        os.replace(temporary, destination)
+        os.replace(temporary, Path(_windows_extended_path(destination)))
     except BaseException:
         try:
             os.close(descriptor)
@@ -693,7 +723,9 @@ def _copy_to_new_path(source: Path, destination: Path) -> None:
 
 def _stage_generated(source: Path, target: Path, *, validate: bool = True) -> Path:
     descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{target.stem}.replacement.", suffix=".tmp.docx", dir=str(target.parent)
+        prefix=f".{target.stem}.replacement.",
+        suffix=".tmp.docx",
+        dir=_windows_extended_path(target.parent),
     )
     temporary = Path(temporary_name)
     try:
@@ -714,7 +746,7 @@ def _stage_generated(source: Path, target: Path, *, validate: bool = True) -> Pa
 
 
 def _commit_stage(staged: Path, target: Path) -> None:
-    os.replace(staged, target)
+    os.replace(staged, Path(_windows_extended_path(target)))
 
 
 def _restore_backup(backup: Path, target: Path) -> None:
@@ -722,7 +754,7 @@ def _restore_backup(backup: Path, target: Path) -> None:
     # DOCX package.  Replacement is not permission to discard source material.
     staged = _stage_generated(backup, target, validate=False)
     try:
-        os.replace(staged, target)
+        os.replace(staged, Path(_windows_extended_path(target)))
     finally:
         staged.unlink(missing_ok=True)
 
