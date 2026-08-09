@@ -206,6 +206,132 @@ class LegacyReplacementTests(unittest.TestCase):
                 with self.assertRaisesRegex(replacement.ReplacementError, "STT"):
                     replacement.plan_legacy_docx_replacements(generated, legacy)
 
+    def test_music_tail_with_verified_clip_evidence_is_publishable(self):
+        # A genuine music tail: the last text-bearing segment ends far short
+        # of the audio duration (well beyond the trailing-silence tolerance),
+        # but stt.metadata carries proof that every clip covering the gap was
+        # verified to have returned a (silent/no-text) result rather than
+        # being silently dropped. assess_stt_coverage downgrades the
+        # over-tolerance gap to a "notes" entry instead of a blocking reason,
+        # and publication must proceed.
+        with tempfile.TemporaryDirectory() as temporary:
+            _root, generated, legacy = self.roots(temporary)
+            add_job(generated, legacy, "1985 MW/0122 Topic.mp3", "music")
+            manifest_path = next(generated.rglob("manifest.json"))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            segment_path = Path(manifest["artifacts"]["segments"])
+
+            duration = 100.0
+            segments = [
+                {"start": 0.0, "end": 45.0, "text": "A complete timestamped lecture"},
+                {"start": 45.0, "end": 50.0, "text": "continues until the music starts"},
+            ]
+            encoded = json.dumps(segments).encode("utf-8")
+            segment_path.write_bytes(encoded)
+
+            metadata = {
+                "audio_duration_seconds": duration,
+                "clip_seconds": 20.0,
+                "clip_count": 5,
+                "clip_results_verified": True,
+                "empty_clip_count": 2,
+            }
+            manifest["stt"]["metadata"] = metadata
+            manifest["stt"]["segments_sha256"] = hashlib.sha256(encoded).hexdigest()
+            manifest["qa"]["stt_coverage"] = assess_stt_coverage(
+                segments, duration, stt_metadata=metadata
+            )
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            plan = replacement.plan_legacy_docx_replacements(generated, legacy)
+
+            self.assertEqual(len(plan.items), 2)
+
+    def test_music_tail_without_verified_clip_evidence_is_rejected(self):
+        # Same over-tolerance gap as above, but neither the metadata nor the
+        # persisted coverage record carries verified-clip-grid evidence, so
+        # the transcript looks indistinguishable from a truncated one and
+        # must keep failing exactly as it did before the evidence contract
+        # existed.
+        with tempfile.TemporaryDirectory() as temporary:
+            _root, generated, legacy = self.roots(temporary)
+            add_job(generated, legacy, "1985 MW/0122 Topic.mp3", "music")
+            manifest_path = next(generated.rglob("manifest.json"))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            segment_path = Path(manifest["artifacts"]["segments"])
+
+            duration = 100.0
+            segments = [
+                {"start": 0.0, "end": 45.0, "text": "A complete timestamped lecture"},
+                {"start": 45.0, "end": 50.0, "text": "continues until the music starts"},
+            ]
+            encoded = json.dumps(segments).encode("utf-8")
+            segment_path.write_bytes(encoded)
+
+            metadata = {
+                "audio_duration_seconds": duration,
+                "clip_seconds": 20.0,
+                "clip_count": 5,
+                "empty_clip_count": 2,
+            }
+            manifest["stt"]["metadata"] = metadata
+            manifest["stt"]["segments_sha256"] = hashlib.sha256(encoded).hexdigest()
+            coverage = assess_stt_coverage(segments, duration, stt_metadata=metadata)
+            coverage.pop("clip_results_verified", None)
+            coverage.pop("clip_seconds", None)
+            coverage.pop("clip_count", None)
+            manifest["qa"]["stt_coverage"] = coverage
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                replacement.ReplacementError, "lacks passing STT coverage evidence"
+            ):
+                replacement.plan_legacy_docx_replacements(generated, legacy)
+
+    def test_music_tail_evidence_tamper_mismatch_is_rejected(self):
+        # The persisted "passed" coverage record claims verified-clip-grid
+        # evidence, but the metadata actually on disk no longer backs that
+        # claim (e.g. a stale record left over after metadata was edited or
+        # regenerated). The publish-time recheck recomputes coverage from the
+        # *current* metadata rather than trusting the stale recorded record,
+        # so this must still be rejected.
+        with tempfile.TemporaryDirectory() as temporary:
+            _root, generated, legacy = self.roots(temporary)
+            add_job(generated, legacy, "1985 MW/0122 Topic.mp3", "music")
+            manifest_path = next(generated.rglob("manifest.json"))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            segment_path = Path(manifest["artifacts"]["segments"])
+
+            duration = 100.0
+            segments = [
+                {"start": 0.0, "end": 45.0, "text": "A complete timestamped lecture"},
+                {"start": 45.0, "end": 50.0, "text": "continues until the music starts"},
+            ]
+            encoded = json.dumps(segments).encode("utf-8")
+            segment_path.write_bytes(encoded)
+            manifest["stt"]["segments_sha256"] = hashlib.sha256(encoded).hexdigest()
+
+            valid_metadata = {
+                "audio_duration_seconds": duration,
+                "clip_seconds": 20.0,
+                "clip_count": 5,
+                "clip_results_verified": True,
+                "empty_clip_count": 2,
+            }
+            # The recorded coverage record was produced while the metadata
+            # still carried valid clip evidence...
+            manifest["qa"]["stt_coverage"] = assess_stt_coverage(
+                segments, duration, stt_metadata=valid_metadata
+            )
+            # ...but the metadata now on disk has lost that evidence.
+            weakened_metadata = dict(valid_metadata)
+            weakened_metadata.pop("clip_results_verified")
+            manifest["stt"]["metadata"] = weakened_metadata
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            with self.assertRaisesRegex(replacement.ReplacementError, "STT"):
+                replacement.plan_legacy_docx_replacements(generated, legacy)
+
     def test_same_stem_multiple_formats_are_refused(self):
         with tempfile.TemporaryDirectory() as temporary:
             _root, generated, legacy = self.roots(temporary)

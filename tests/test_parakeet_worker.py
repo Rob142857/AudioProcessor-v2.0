@@ -180,6 +180,43 @@ class TranscribeOneMismatchGuardTests(unittest.TestCase):
             self.assertEqual(result["segments"][0]["text"], "first clip")
             self.assertEqual(result["segments"][1]["text"], "second clip")
 
+            metadata = result["metadata"]
+            self.assertIs(metadata["clip_results_verified"], True)
+            self.assertEqual(metadata["clip_seconds"], 20.0)
+            self.assertEqual(metadata["empty_clip_count"], 0)
+
+    def test_empty_clip_text_is_excluded_from_segments_and_counted(self):
+        import torch  # noqa: F401
+
+        with mock.patch.object(parakeet_worker, "prepare_mono_audio") as prepare:
+            def fake_prepare(source, destination):
+                self._write_silence_wav(Path(destination), seconds=25.0)
+
+            prepare.side_effect = fake_prepare
+
+            model = mock.MagicMock()
+            fake_parameter = mock.MagicMock(device=mock.MagicMock(type="cpu"))
+            model.parameters.side_effect = lambda: iter([fake_parameter])
+            # Two clips submitted (0-20s, 20-25s); the second (music tail)
+            # comes back with no speech text, but is still a verified result
+            # -- it passed the count-mismatch guard, it just carries no text.
+            model.transcribe.return_value = [
+                mock.MagicMock(text="first clip"),
+                mock.MagicMock(text=""),
+            ]
+
+            result = parakeet_worker.transcribe_one(
+                model, Path("unused.wav"), model_name="test-model"
+            )
+
+            self.assertEqual(len(result["segments"]), 1)
+            self.assertEqual(result["segments"][0]["text"], "first clip")
+
+            metadata = result["metadata"]
+            self.assertIs(metadata["clip_results_verified"], True)
+            self.assertEqual(metadata["clip_seconds"], 20.0)
+            self.assertEqual(metadata["empty_clip_count"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

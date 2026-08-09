@@ -255,6 +255,108 @@ def read_json(path: Path) -> dict[str, Any]:
         return {}
 
 
+RUN_LOCK_FILENAME = ".pipeline-run.lock"
+# A stale-lock reclaim (unlink() followed by a fresh O_EXCL create()) is not
+# atomic on its own: two processes can each independently decide the same
+# lock is stale, and the second process's unlink() would then delete the
+# *first* process's brand-new live lock -- unlink() matches by path, not by
+# the content that was actually inspected -- letting both processes create
+# successfully and both believe they exclusively hold the lock. This second
+# marker, itself created with O_EXCL, serializes the whole reclaim so only
+# one process is ever between "decided stale" and "recreated" at a time.
+RUN_LOCK_RECLAIM_SUFFIX = ".reclaim"
+
+
+class PipelineRunLockError(RuntimeError):
+    """Raised when another pipeline run already holds the output root's lock."""
+
+
+def acquire_run_lock(output_root: Path) -> Path:
+    """Exclusively claim ``output_root`` so only one pipeline run can write it.
+
+    A second process silently rewriting the same output root while a first
+    run is mid-write can corrupt hours of already-checkpointed work, so this
+    creates a small marker file with ``O_EXCL`` and refuses to proceed unless
+    it can prove the process that created any existing lock file has exited.
+    """
+
+    output_root.mkdir(parents=True, exist_ok=True)
+    lock_path = output_root / RUN_LOCK_FILENAME
+
+    def _create_exclusive(path: Path) -> None:
+        descriptor = os.open(
+            _windows_extended_path(path),
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+        )
+        payload = json.dumps(
+            {"pid": os.getpid(), "created_at": utc_now()}
+        ).encode("utf-8")
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+
+    try:
+        _create_exclusive(lock_path)
+        return lock_path
+    except FileExistsError:
+        pass
+
+    # The lock exists and may be stale. Only one process may evaluate and
+    # reclaim it at a time -- see RUN_LOCK_RECLAIM_SUFFIX above.
+    reclaim_mutex = output_root / (RUN_LOCK_FILENAME + RUN_LOCK_RECLAIM_SUFFIX)
+    try:
+        _create_exclusive(reclaim_mutex)
+    except FileExistsError:
+        raise PipelineRunLockError(
+            "another process is currently evaluating the pipeline run lock at "
+            f"{lock_path}; retry in a moment, or delete {reclaim_mutex} if you "
+            "are certain no run is active or starting."
+        ) from None
+
+    try:
+        holder = read_json(lock_path)
+        holder_pid = holder.get("pid")
+        holder_created_at = holder.get("created_at")
+        if type(holder_pid) is not int:
+            # Garbage or missing pid: nothing to verify liveness of.
+            alive = False
+        else:
+            try:
+                import psutil
+            except ImportError:
+                # A plausible-looking pid whose liveness cannot be verified
+                # without psutil; treat the lock as live rather than risk two
+                # runs writing the same output root.
+                alive = True
+            else:
+                alive = psutil.pid_exists(holder_pid)
+
+        if alive:
+            raise PipelineRunLockError(
+                f"another pipeline run already holds the lock (pid {holder_pid}, "
+                f"created {holder_created_at}) at {lock_path}; close the other "
+                "AudioProcessor window, or delete this lock file if you are "
+                "certain no run is active."
+            )
+
+        Path(_windows_extended_path(lock_path)).unlink(missing_ok=True)
+        try:
+            _create_exclusive(lock_path)
+            return lock_path
+        except FileExistsError:
+            raise PipelineRunLockError(
+                f"another process claimed the pipeline run lock at {lock_path} "
+                "while this one was starting up; close the other AudioProcessor "
+                "window, or delete this lock file if you are certain no run is "
+                "active."
+            ) from None
+    finally:
+        Path(_windows_extended_path(reclaim_mutex)).unlink(missing_ok=True)
+
+
+def release_run_lock(lock_path: Path) -> None:
+    Path(_windows_extended_path(lock_path)).unlink(missing_ok=True)
+
+
 def failure_error_category(error: Any) -> str:
     """Return the leading exception type name from a manifest's error string.
 
@@ -1055,6 +1157,7 @@ def validate_artifacts(
     requested_stt_model: Optional[str] = None,
     actual_stt_model: Optional[str] = None,
     audio_duration_seconds: Any = None,
+    stt_metadata: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     reasons: list[str] = []
     raw_words = len(raw_text.split())
@@ -1083,7 +1186,7 @@ def validate_artifacts(
         previous_start = start
     if timestamp_errors:
         reasons.append(f"{timestamp_errors} non-monotonic/invalid timestamp segment(s)")
-    stt_coverage = assess_stt_coverage(segments, audio_duration_seconds)
+    stt_coverage = assess_stt_coverage(segments, audio_duration_seconds, stt_metadata)
     reasons.extend(stt_coverage["reasons"])
     if cleanup_needs_review:
         reasons.append("cleanup service marked one or more chunks for review")
@@ -1367,6 +1470,8 @@ class PipelineRunner:
         self.processed_manifest_paths: list[Path] = []
         self.per_job_publication_reports: list[dict[str, Any]] = []
         self.incremental_publication_handled = False
+        self.publication_failure_categories: dict[str, int] = {}
+        self._publication_failure_lock = threading.Lock()
         self.stt_runtime_versions = (
             {}
             if self.config.existing_transcripts_only
@@ -1391,6 +1496,13 @@ class PipelineRunner:
             except Exception:
                 # GUI diagnostics must never make an archive job fail.
                 pass
+
+    def _record_publication_failure(self, exc: BaseException) -> None:
+        category = type(exc).__name__
+        with self._publication_failure_lock:
+            self.publication_failure_categories[category] = (
+                self.publication_failure_categories.get(category, 0) + 1
+            )
 
     @property
     def _uses_parakeet(self) -> bool:
@@ -2360,6 +2472,7 @@ class PipelineRunner:
                     requested_stt_model=manifest.get("stt", {}).get("requested_model"),
                     actual_stt_model=manifest.get("stt", {}).get("actual_model"),
                     audio_duration_seconds=audio_duration_seconds,
+                    stt_metadata=stt_metadata,
                 )
             atomic_write_json(paths["qa"], qa)
             manifest["qa"] = qa
@@ -2715,6 +2828,7 @@ class PipelineRunner:
                                 "glm", f"Published reviewed Word output for {source.name}.\n"
                             )
                     except Exception as exc:
+                        self._record_publication_failure(exc)
                         with publication_lock:
                             counts["publication_failed"] = counts.get(
                                 "publication_failed", 0
@@ -2815,6 +2929,13 @@ class PipelineRunner:
         return reaped
 
     def run(self) -> dict[str, int]:
+        lock_path = acquire_run_lock(self.config.output_root)
+        try:
+            return self._run_unlocked()
+        finally:
+            release_run_lock(lock_path)
+
+    def _run_unlocked(self) -> dict[str, int]:
         if not self.config.dry_run:
             self._reap_stale_running_manifests()
         if (
@@ -2964,6 +3085,7 @@ class PipelineRunner:
                             f"  -> published sibling Word output(s): {changed} changed"
                         )
                 except Exception as exc:
+                    self._record_publication_failure(exc)
                     counts["publication_failed"] = counts.get(
                         "publication_failed", 0
                     ) + 1
@@ -3025,6 +3147,19 @@ class PipelineRunner:
             print(f"  {count:>4,}  {category}")
         return breakdown
 
+    def _print_publication_failure_breakdown(self) -> dict[str, int]:
+        with self._publication_failure_lock:
+            breakdown = dict(self.publication_failure_categories)
+        if not breakdown:
+            return breakdown
+        total = sum(breakdown.values())
+        print(f"{total:,} Word publication(s) declined safely:")
+        for category, count in sorted(
+            breakdown.items(), key=lambda item: (-item[1], item[0])
+        ):
+            print(f"  {count:>4,}  {category}")
+        return breakdown
+
     def _write_summary(
         self,
         counts: dict[str, int],
@@ -3032,6 +3167,7 @@ class PipelineRunner:
         publication: Optional[dict[str, Any]] = None,
     ) -> None:
         failure_breakdown = self._print_failure_breakdown(counts)
+        publication_failure_breakdown = self._print_publication_failure_breakdown()
         summary: dict[str, Any] = {
             "pipeline_version": PIPELINE_VERSION,
             "finished_at": utc_now(),
@@ -3045,6 +3181,8 @@ class PipelineRunner:
         }
         if failure_breakdown:
             summary["failure_breakdown"] = failure_breakdown
+        if publication_failure_breakdown:
+            summary["publication_failure_breakdown"] = publication_failure_breakdown
         if publication is not None:
             summary["source_docx_publication"] = {
                 key: publication.get(key)

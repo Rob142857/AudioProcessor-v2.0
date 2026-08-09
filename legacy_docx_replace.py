@@ -264,12 +264,17 @@ def _require_publishable_stt(
         segments = json.loads(segment_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ReplacementError(f"invalid STT segment artifact {segment_path}: {exc}") from exc
-    assessment = assess_stt_coverage(segments, audio_duration)
+    assessment = assess_stt_coverage(segments, audio_duration, stt_metadata=metadata)
     if assessment["status"] != "passed":
         detail = "; ".join(assessment["reasons"])
         raise ReplacementError(f"STT coverage is not publishable: {detail}: {manifest_path}")
 
-    for key in ("segment_count", "text_segment_count"):
+    for key in (
+        "segment_count",
+        "text_segment_count",
+        "clip_results_verified",
+        "clip_count",
+    ):
         if coverage.get(key) != assessment.get(key):
             raise ReplacementError(
                 f"manifest STT coverage does not match its segment artifact: {manifest_path}"
@@ -285,6 +290,24 @@ def _require_publishable_stt(
             assessment.get(key), positive=key == "audio_duration_seconds"
         )
         if recorded is None or measured is None or abs(recorded - measured) > 0.001:
+            raise ReplacementError(
+                f"manifest STT coverage does not match its segment artifact: {manifest_path}"
+            )
+
+    recorded_clip_seconds = coverage.get("clip_seconds")
+    measured_clip_seconds = assessment.get("clip_seconds")
+    if (recorded_clip_seconds is None) != (measured_clip_seconds is None):
+        raise ReplacementError(
+            f"manifest STT coverage does not match its segment artifact: {manifest_path}"
+        )
+    if recorded_clip_seconds is not None and measured_clip_seconds is not None:
+        recorded_clip_value = finite_seconds(recorded_clip_seconds)
+        measured_clip_value = finite_seconds(measured_clip_seconds)
+        if (
+            recorded_clip_value is None
+            or measured_clip_value is None
+            or abs(recorded_clip_value - measured_clip_value) > 0.001
+        ):
             raise ReplacementError(
                 f"manifest STT coverage does not match its segment artifact: {manifest_path}"
             )

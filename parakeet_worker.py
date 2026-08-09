@@ -22,6 +22,10 @@ DEFAULT_MODEL = "nvidia/parakeet-tdt-0.6b-v3"
 # ``transcribe`` invocation can leave allocator state resident on older CUDA
 # cards; a group boundary gives the CUDA cache an explicit reset point.
 MAX_CLIPS_PER_INFERENCE = 48
+# Length of each clip split_wav() cuts audio into before submission to
+# Parakeet; also recorded in transcribe_one()'s metadata so downstream
+# coverage checks can verify how much audio each clip result covers.
+CLIP_SECONDS = 20
 
 
 def send(value: dict[str, Any]) -> None:
@@ -69,7 +73,9 @@ def prepare_mono_audio(source: Path, destination: Path) -> None:
 MIN_TRAILING_CLIP_SECONDS = 1.0
 
 
-def split_wav(source: Path, output_dir: Path, *, seconds: int = 20) -> tuple[list[Path], float]:
+def split_wav(
+    source: Path, output_dir: Path, *, seconds: int = CLIP_SECONDS
+) -> tuple[list[Path], float]:
     with wave.open(str(source), "rb") as reader:
         if reader.getnchannels() != 1:
             raise RuntimeError("Parakeet preparation did not produce mono audio")
@@ -185,12 +191,12 @@ def transcribe_one(model: Any, source: Path, *, model_name: str) -> dict[str, An
     texts = [str(getattr(item, "text", item)).strip() for item in hypotheses]
     if not any(texts):
         raise RuntimeError("Parakeet returned no speech text")
-    clip_seconds = duration / len(clips) if len(clips) == 1 else 20.0
+    empty_clip_count = sum(1 for text in texts if not text)
     segments = [
         {
             "id": index,
-            "start": round(index * 20.0, 3),
-            "end": round(min(duration, (index + 1) * 20.0), 3),
+            "start": round(index * float(CLIP_SECONDS), 3),
+            "end": round(min(duration, (index + 1) * float(CLIP_SECONDS)), 3),
             "text": text,
             "timing": "clip-aligned",
         }
@@ -213,6 +219,15 @@ def transcribe_one(model: Any, source: Path, *, model_name: str) -> dict[str, An
             "audio_duration_seconds": round(duration, 3),
             "timing_evidence": "20-second clip-aligned segments (not word timestamps)",
             "clip_count": len(clips),
+            "clip_seconds": float(CLIP_SECONDS),
+            # Every batch that reached `hypotheses.extend(...)` above passed
+            # the count-mismatch guard immediately above it (raising
+            # RuntimeError on any len(batch_hypotheses) != len(batch)), so
+            # each clip here is verified to have produced exactly one
+            # aligned result -- an empty result is evidence of non-speech
+            # audio, not a dropped/misaligned clip.
+            "clip_results_verified": True,
+            "empty_clip_count": empty_clip_count,
         },
     }
 

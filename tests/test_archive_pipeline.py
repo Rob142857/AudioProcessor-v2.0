@@ -1,6 +1,7 @@
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime
@@ -11,10 +12,14 @@ from unittest import mock
 from archive_pipeline import (
     ATOMIC_REPLACE_MAX_ATTEMPTS,
     DEFAULT_GUI_STT_MODEL,
+    RUN_LOCK_FILENAME,
+    RUN_LOCK_RECLAIM_SUFFIX,
     STALE_RUNNING_THRESHOLD_SECONDS,
     PipelineConfig,
+    PipelineRunLockError,
     PipelineRunner,
     SOURCE_DOCX_PUBLICATION_REPORT,
+    acquire_run_lock,
     artifact_directory,
     artifact_paths,
     atomic_write_bytes,
@@ -25,6 +30,7 @@ from archive_pipeline import (
     main as pipeline_main,
     parse_args,
     publish_source_docx_batch,
+    release_run_lock,
     sha256_text,
     source_publication_scope,
     validate_artifacts,
@@ -33,6 +39,11 @@ from archive_pipeline import (
 )
 from stt_coverage import trailing_silence_tolerance_seconds
 from pipeline_control import PipelineCancelledError
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 
 class FakeCleanupResult:
@@ -954,6 +965,36 @@ class ArchivePipelineTests(unittest.TestCase):
         self.assertTrue(
             any("audio duration is unavailable" in reason for reason in qa["reasons"])
         )
+
+    def test_qa_excuses_music_tail_only_with_verified_clip_evidence(self):
+        # 30 verified 20s clips fully cover a 600s recording, but the only
+        # text-bearing segment ends at 400s -- a 200s trailing gap that is
+        # far past the documented trailing-silence tolerance (30s here).
+        duration = 600.0
+        segments = [{"start": 0.0, "end": 400.0, "text": "spoken words"}]
+
+        with_evidence = validate_artifacts(
+            "faithfully spoken words",
+            "faithfully spoken words",
+            segments,
+            False,
+            audio_duration_seconds=duration,
+            stt_metadata={
+                "clip_results_verified": True,
+                "clip_seconds": 20.0,
+                "clip_count": 30,
+            },
+        )
+        without_evidence = validate_artifacts(
+            "faithfully spoken words",
+            "faithfully spoken words",
+            segments,
+            False,
+            audio_duration_seconds=duration,
+        )
+
+        self.assertEqual(with_evidence["stt_coverage"]["status"], "passed")
+        self.assertEqual(without_evidence["stt_coverage"]["status"], "needs_review")
 
     def test_publication_rejects_nested_output_before_creating_runner_state(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -2114,6 +2155,203 @@ class FailureSummaryTests(unittest.TestCase):
                     )
                 )
                 self.assertNotIn("failure_breakdown", summary)
+            finally:
+                runner.close()
+
+
+class RunLockTests(unittest.TestCase):
+    """A stale second process must never silently write the same output root."""
+
+    def test_acquire_and_release_round_trip(self):
+        with tempfile.TemporaryDirectory() as folder:
+            output_root = Path(folder) / "artifacts"
+
+            lock_path = acquire_run_lock(output_root)
+
+            self.assertEqual(lock_path, output_root / RUN_LOCK_FILENAME)
+            self.assertTrue(lock_path.exists())
+            payload = json.loads(lock_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["pid"], os.getpid())
+            self.assertIn("created_at", payload)
+
+            release_run_lock(lock_path)
+
+            self.assertFalse(lock_path.exists())
+            # Releasing an already-released lock must not raise.
+            release_run_lock(lock_path)
+
+    @unittest.skipUnless(psutil is not None, "psutil is not installed")
+    def test_second_acquire_against_live_pid_raises(self):
+        with tempfile.TemporaryDirectory() as folder:
+            output_root = Path(folder) / "artifacts"
+            lock_path = acquire_run_lock(output_root)
+            try:
+                with self.assertRaises(PipelineRunLockError) as cm:
+                    acquire_run_lock(output_root)
+                self.assertIn(str(os.getpid()), str(cm.exception))
+            finally:
+                release_run_lock(lock_path)
+
+    @unittest.skipUnless(psutil is not None, "psutil is not installed")
+    def test_stale_pid_lock_is_replaced(self):
+        with tempfile.TemporaryDirectory() as folder:
+            output_root = Path(folder) / "artifacts"
+            output_root.mkdir(parents=True)
+            lock_path = output_root / RUN_LOCK_FILENAME
+            lock_path.write_text(
+                json.dumps({"pid": 999999999, "created_at": "2020-01-01T00:00:00Z"}),
+                encoding="utf-8",
+            )
+
+            returned = acquire_run_lock(output_root)
+
+            self.assertEqual(returned, lock_path)
+            payload = json.loads(lock_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["pid"], os.getpid())
+            release_run_lock(lock_path)
+
+    def test_garbage_lock_content_is_replaced(self):
+        with tempfile.TemporaryDirectory() as folder:
+            output_root = Path(folder) / "artifacts"
+            output_root.mkdir(parents=True)
+            lock_path = output_root / RUN_LOCK_FILENAME
+            lock_path.write_bytes(b"not json at all {{{")
+
+            returned = acquire_run_lock(output_root)
+
+            self.assertEqual(returned, lock_path)
+            payload = json.loads(lock_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["pid"], os.getpid())
+            release_run_lock(lock_path)
+
+    def test_concurrent_reclaim_attempt_fails_closed_instead_of_stealing(self):
+        # A stale-lock reclaim is unlink() then create(), which is not atomic
+        # on its own. Simulate a second process already mid-reclaim (holding
+        # the reclaim mutex) and assert the first process fails closed rather
+        # than racing it: it must NOT delete/replace the original lock file
+        # out from under the in-progress reclaimer.
+        with tempfile.TemporaryDirectory() as folder:
+            output_root = Path(folder) / "artifacts"
+            output_root.mkdir(parents=True)
+            lock_path = output_root / RUN_LOCK_FILENAME
+            stale_payload = json.dumps(
+                {"pid": 999999999, "created_at": "2020-01-01T00:00:00Z"}
+            )
+            lock_path.write_text(stale_payload, encoding="utf-8")
+            reclaim_mutex = output_root / (RUN_LOCK_FILENAME + RUN_LOCK_RECLAIM_SUFFIX)
+            reclaim_mutex.write_bytes(b"held by another process")
+
+            with self.assertRaises(PipelineRunLockError) as cm:
+                acquire_run_lock(output_root)
+            self.assertIn("evaluating the pipeline run lock", str(cm.exception))
+
+            # The stale lock must be left completely untouched: this process
+            # must not have unlinked or recreated it while the mutex was held.
+            self.assertEqual(lock_path.read_text(encoding="utf-8"), stale_payload)
+            self.assertTrue(reclaim_mutex.exists())
+
+    def test_successful_reclaim_leaves_no_leftover_mutex_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            output_root = Path(folder) / "artifacts"
+            output_root.mkdir(parents=True)
+            lock_path = output_root / RUN_LOCK_FILENAME
+            lock_path.write_text(
+                json.dumps({"pid": 999999999, "created_at": "2020-01-01T00:00:00Z"}),
+                encoding="utf-8",
+            )
+
+            returned = acquire_run_lock(output_root)
+
+            self.assertEqual(returned, lock_path)
+            reclaim_mutex = output_root / (RUN_LOCK_FILENAME + RUN_LOCK_RECLAIM_SUFFIX)
+            self.assertFalse(reclaim_mutex.exists())
+            release_run_lock(lock_path)
+
+    def test_racing_stale_reclaims_never_both_succeed(self):
+        # Regression test for a reproduced race: two processes independently
+        # decide the same stale lock is dead and both reclaim it via
+        # unlink() + create(). Before the reclaim mutex existed, the second
+        # unlink() would silently delete the first process's brand-new live
+        # lock (unlink matches by path, not by the content that was actually
+        # inspected), so both acquire_run_lock() calls could return
+        # successfully even though only one lock file exists on disk -- both
+        # callers would then believe they exclusively hold it. Threads share
+        # a pid, so once one thread's reclaim creates a fresh live lock, the
+        # other thread's liveness re-check (real pid, always alive) or the
+        # reclaim mutex must make it lose deterministically.
+        for _ in range(20):
+            with tempfile.TemporaryDirectory() as folder:
+                output_root = Path(folder) / "artifacts"
+                output_root.mkdir(parents=True)
+                lock_path = output_root / RUN_LOCK_FILENAME
+                lock_path.write_text(
+                    json.dumps(
+                        {"pid": 999999999, "created_at": "2020-01-01T00:00:00Z"}
+                    ),
+                    encoding="utf-8",
+                )
+
+                barrier = threading.Barrier(2)
+                results: list[tuple[bool, object]] = []
+                results_lock = threading.Lock()
+
+                def attempt() -> None:
+                    barrier.wait()
+                    try:
+                        returned = acquire_run_lock(output_root)
+                        with results_lock:
+                            results.append((True, returned))
+                    except PipelineRunLockError as exc:
+                        with results_lock:
+                            results.append((False, exc))
+
+                threads = [threading.Thread(target=attempt) for _ in range(2)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=10)
+
+                self.assertEqual(len(results), 2)
+                successes = [value for ok, value in results if ok]
+                failures = [value for ok, value in results if not ok]
+                # Exactly one thread must win; the other must fail closed.
+                self.assertEqual(len(successes), 1, results)
+                self.assertEqual(len(failures), 1)
+
+                self.assertTrue(lock_path.exists())
+                payload = json.loads(lock_path.read_text(encoding="utf-8"))
+                self.assertEqual(payload["pid"], os.getpid())
+
+                reclaim_mutex = output_root / (
+                    RUN_LOCK_FILENAME + RUN_LOCK_RECLAIM_SUFFIX
+                )
+                self.assertFalse(reclaim_mutex.exists())
+
+                release_run_lock(successes[0])
+
+
+class PublicationFailureBreakdownTests(unittest.TestCase):
+    def test_record_publication_failure_tallies_by_exception_type(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source_root = root / "archive"
+            output_root = root / "artifacts"
+            source_root.mkdir()
+            config = PipelineConfig(
+                input_path=source_root,
+                output_root=output_root,
+                cleanup_enabled=False,
+            )
+            runner = PipelineRunner(config)
+            try:
+                runner._record_publication_failure(PermissionError("locked"))
+                runner._record_publication_failure(PermissionError("locked again"))
+                runner._record_publication_failure(FileNotFoundError("missing"))
+
+                self.assertEqual(
+                    runner.publication_failure_categories,
+                    {"PermissionError": 2, "FileNotFoundError": 1},
+                )
             finally:
                 runner.close()
 
