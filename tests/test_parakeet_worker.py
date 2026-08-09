@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import tempfile
 import unittest
 import wave
 from pathlib import Path
@@ -9,6 +10,68 @@ from unittest import mock
 import parakeet_worker
 
 _HAS_TORCH = importlib.util.find_spec("torch") is not None
+
+
+def _write_wav(path: Path, *, seconds: float, sample_rate: int = 16000) -> None:
+    with wave.open(str(path), "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(sample_rate)
+        writer.writeframes(b"\x00\x00" * int(seconds * sample_rate))
+
+
+class SplitWavTrailingRemainderTests(unittest.TestCase):
+    """`split_wav` needs no torch/nemo -- it only uses the stdlib `wave` module."""
+
+    def test_exact_multiple_of_clip_length_produces_no_remainder(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source.wav"
+            _write_wav(source, seconds=40.0)  # exactly two 20s clips
+            clips, duration = parakeet_worker.split_wav(source, Path(temporary), seconds=20)
+            self.assertEqual(len(clips), 2)
+            self.assertAlmostEqual(duration, 40.0, places=2)
+
+    def test_tiny_trailing_remainder_is_merged_into_previous_clip_not_standalone(self):
+        # 20s + 0.3s: production crash shape -- a long recording whose
+        # duration isn't an exact multiple of the clip length leaves a
+        # sub-second final chunk that used to be submitted to NeMo on its
+        # own and crash transcribe() with a fatal ValueError.
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source.wav"
+            _write_wav(source, seconds=20.3)
+            clips, duration = parakeet_worker.split_wav(source, Path(temporary), seconds=20)
+            self.assertEqual(len(clips), 1, "the short remainder must not become its own clip")
+            with wave.open(str(clips[0]), "rb") as reader:
+                merged_seconds = reader.getnframes() / reader.getframerate()
+            self.assertAlmostEqual(merged_seconds, 20.3, places=2)
+
+    def test_substantial_trailing_remainder_stays_its_own_clip(self):
+        # 20s + 15s: a real, well-formed final clip -- must NOT be merged
+        # away just because it's shorter than a full 20s period.
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source.wav"
+            _write_wav(source, seconds=35.0)
+            clips, duration = parakeet_worker.split_wav(source, Path(temporary), seconds=20)
+            self.assertEqual(len(clips), 2)
+            with wave.open(str(clips[-1]), "rb") as reader:
+                last_seconds = reader.getnframes() / reader.getframerate()
+            self.assertAlmostEqual(last_seconds, 15.0, places=2)
+
+    def test_single_short_clip_total_has_nothing_to_merge_into(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source.wav"
+            _write_wav(source, seconds=0.3)
+            clips, duration = parakeet_worker.split_wav(source, Path(temporary), seconds=20)
+            self.assertEqual(len(clips), 1)
+
+    def test_merged_clip_never_falls_below_the_trailing_minimum(self):
+        for extra_seconds in (0.05, 0.5, 0.99):
+            with self.subTest(extra_seconds=extra_seconds):
+                with tempfile.TemporaryDirectory() as temporary:
+                    source = Path(temporary) / "source.wav"
+                    _write_wav(source, seconds=20 + extra_seconds)
+                    clips, _ = parakeet_worker.split_wav(source, Path(temporary), seconds=20)
+                    self.assertEqual(len(clips), 1)
 
 
 class ClipBatchesTests(unittest.TestCase):

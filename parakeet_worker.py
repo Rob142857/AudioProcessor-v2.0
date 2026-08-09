@@ -56,8 +56,20 @@ def prepare_mono_audio(source: Path, destination: Path) -> None:
         raise RuntimeError(f"Could not prepare mono audio for Parakeet: {detail}")
 
 
+# A source whose duration isn't an exact multiple of the clip length leaves
+# a short trailing remainder (could be a fraction of a second). Submitted to
+# NeMo on its own, this crashes transcribe() with a fatal ValueError inside
+# normalize_batch ("received a tensor of length 1 ... torch.std() returning
+# nan") -- the same whole-file-too-short crash MIN_TRANSCRIBABLE_SECONDS in
+# parakeet_stt.py guards against, just at the per-clip level instead, and
+# unguarded there since that check only ever looks at the whole file's total
+# duration. Confirmed happening in production on a ~3 hour recording whose
+# last clip was well under a second. Merge a remainder shorter than this
+# into the previous clip rather than submit it standalone.
+MIN_TRAILING_CLIP_SECONDS = 1.0
+
+
 def split_wav(source: Path, output_dir: Path, *, seconds: int = 20) -> tuple[list[Path], float]:
-    clips: list[Path] = []
     with wave.open(str(source), "rb") as reader:
         if reader.getnchannels() != 1:
             raise RuntimeError("Parakeet preparation did not produce mono audio")
@@ -65,16 +77,28 @@ def split_wav(source: Path, output_dir: Path, *, seconds: int = 20) -> tuple[lis
         duration = reader.getnframes() / sample_rate
         frames_per_clip = sample_rate * seconds
         parameters = reader.getparams()
-        index = 1
+        chunks: list[bytes] = []
         while frames := reader.readframes(frames_per_clip):
-            clip = output_dir / f"clip-{index:05d}.wav"
-            with wave.open(str(clip), "wb") as writer:
-                writer.setparams(parameters)
-                writer.writeframes(frames)
-            clips.append(clip)
-            index += 1
-    if not clips:
+            chunks.append(frames)
+
+    if not chunks:
         raise RuntimeError("Prepared audio contains no samples")
+
+    if len(chunks) > 1:
+        min_trailing_bytes = (
+            int(sample_rate * MIN_TRAILING_CLIP_SECONDS) * parameters.sampwidth
+        )
+        if len(chunks[-1]) < min_trailing_bytes:
+            trailing = chunks.pop()
+            chunks[-1] = chunks[-1] + trailing
+
+    clips: list[Path] = []
+    for index, frames in enumerate(chunks, 1):
+        clip = output_dir / f"clip-{index:05d}.wav"
+        with wave.open(str(clip), "wb") as writer:
+            writer.setparams(parameters)
+            writer.writeframes(frames)
+        clips.append(clip)
     return clips, duration
 
 
