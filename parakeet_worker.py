@@ -78,6 +78,30 @@ def split_wav(source: Path, output_dir: Path, *, seconds: int = 20) -> tuple[lis
     return clips, duration
 
 
+def _clip_batches(clip_count: int, max_size: int) -> list[tuple[int, int]]:
+    """Return (start, length) pairs covering every clip, chunked by max_size.
+
+    Every native CUDA crash observed in production landed on a final batch
+    of exactly one clip (e.g. 145 clips = 48+48+48+1) -- model.transcribe()
+    aborted the whole process with a fatal, non-Python-catchable exception
+    each time. Rather than submit a lone trailing clip on its own, fold it
+    into the previous batch so no batch this function returns is ever size 1
+    (except when the source has only one clip in total, which has nothing
+    to fold into).
+    """
+
+    boundaries: list[tuple[int, int]] = []
+    start = 0
+    while start < clip_count:
+        remaining = clip_count - start
+        size = min(max_size, remaining)
+        if remaining - size == 1:
+            size += 1
+        boundaries.append((start, size))
+        start += size
+    return boundaries
+
+
 def transcribe_one(model: Any, source: Path, *, model_name: str) -> dict[str, Any]:
     import torch
 
@@ -89,9 +113,10 @@ def transcribe_one(model: Any, source: Path, *, model_name: str) -> dict[str, An
         clips, duration = split_wav(prepared, temporary_path)
         device = next(model.parameters()).device
         hypotheses: list[Any] = []
-        total_batches = (len(clips) + MAX_CLIPS_PER_INFERENCE - 1) // MAX_CLIPS_PER_INFERENCE
-        for batch_index, start in enumerate(range(0, len(clips), MAX_CLIPS_PER_INFERENCE), 1):
-            batch = clips[start : start + MAX_CLIPS_PER_INFERENCE]
+        batches = _clip_batches(len(clips), MAX_CLIPS_PER_INFERENCE)
+        total_batches = len(batches)
+        for batch_index, (start, size) in enumerate(batches, 1):
+            batch = clips[start : start + size]
             print(
                 f"Transcribing clip batch {batch_index}/{total_batches} "
                 f"({start + 1}-{start + len(batch)} of {len(clips)})",
@@ -105,6 +130,26 @@ def transcribe_one(model: Any, source: Path, *, model_name: str) -> dict[str, An
                     num_workers=0,
                     use_lhotse=False,
                     verbose=False,
+                )
+            # Every downstream segment timestamp is derived purely from its
+            # position in `hypotheses` (`start = index * 20.0`), on the
+            # assumption that result N always corresponds to clip N. NeMo is
+            # not guaranteed to preserve that 1:1 correspondence -- a single
+            # silently dropped or reordered clip anywhere in a batch shifts
+            # every later timestamp, and because the audio's true tail then
+            # has no slot left in the (now-short) list, real trailing speech
+            # is silently discarded rather than merely mislabelled. This was
+            # confirmed happening in production: several multi-hour lectures
+            # had 5-30+ minutes of real, non-silent speech missing from the
+            # end of their transcripts with no error raised anywhere. Treat
+            # any count mismatch as fatal rather than let it corrupt the
+            # timeline silently.
+            if len(batch_hypotheses) != len(batch):
+                raise RuntimeError(
+                    f"Parakeet returned {len(batch_hypotheses)} result(s) for "
+                    f"clip batch {batch_index}/{total_batches} but {len(batch)} "
+                    "clip(s) were submitted; refusing to build a transcript "
+                    "with drifted timestamps"
                 )
             hypotheses.extend(batch_hypotheses)
             if device.type == "cuda":
