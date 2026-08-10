@@ -16,6 +16,7 @@ left completely untouched: that is the safety gate, not an incidental check.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import shutil
 from pathlib import Path
@@ -59,6 +60,33 @@ def _windows_extended_path(path: str | Path) -> str:
 class PlannedMove(NamedTuple):
     source: Path
     destination: Path
+
+
+def _sha256(path: Path) -> str:
+    """Hash a file's contents.
+
+    Called at act time, never at plan time, so a stale plan can't hide a
+    source or destination that changed underneath it.
+    """
+
+    digest = hashlib.sha256()
+    with open(_windows_extended_path(path), "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _conflict_path(destination: Path) -> Path:
+    """First available "<stem> - conflict[-N].docx" sibling of destination."""
+
+    candidate = destination.with_name(f"{destination.stem} - conflict{destination.suffix}")
+    counter = 2
+    while candidate.exists():
+        candidate = destination.with_name(
+            f"{destination.stem} - conflict-{counter}{destination.suffix}"
+        )
+        counter += 1
+    return candidate
 
 
 def plan_moves(source_root: Path) -> tuple[PlannedMove, ...]:
@@ -113,7 +141,11 @@ def plan_moves(source_root: Path) -> tuple[PlannedMove, ...]:
 
 
 def apply_moves(
-    moves: tuple[PlannedMove, ...], *, confirm: bool, expected_count: int
+    moves: tuple[PlannedMove, ...],
+    *,
+    confirm: bool,
+    expected_count: int,
+    replace_identical_destination: bool = False,
 ) -> tuple[Path, ...]:
     if not confirm:
         raise ValueError("apply_moves is dry-run only unless confirm=True")
@@ -129,7 +161,35 @@ def apply_moves(
         if not move.source.is_file() or move.source.is_symlink():
             raise ValueError(f"planned source changed type or disappeared: {move.source}")
         if move.destination.exists():
-            raise ValueError(f"refusing to overwrite an existing file: {move.destination}")
+            if not replace_identical_destination:
+                raise ValueError(f"refusing to overwrite an existing file: {move.destination}")
+            # Re-hash both files now, at act time, not against anything
+            # recorded at plan time -- the plan may be stale.
+            if _sha256(move.source) == _sha256(move.destination):
+                # Provably lossless: the two files are byte-identical, so
+                # replacing one with the other discards nothing. This is how
+                # the transcription pipeline's own re-publication of an
+                # unchanged job shows up here -- it byte-copies the same
+                # whisper.docx sibling next to the audio every time.
+                os.replace(
+                    _windows_extended_path(move.source),
+                    _windows_extended_path(move.destination),
+                )
+                moved.append(move.destination)
+                continue
+            # Content differs: never overwrite. Park the source next to its
+            # conflicting sibling under a distinguishing name instead, so
+            # both versions survive intact for the owner to reconcile by
+            # hand.
+            conflict_destination = _conflict_path(move.destination)
+            extended_parent = Path(_windows_extended_path(conflict_destination.parent))
+            extended_parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(
+                _windows_extended_path(move.source),
+                _windows_extended_path(conflict_destination),
+            )
+            moved.append(conflict_destination)
+            continue
         extended_parent = Path(_windows_extended_path(move.destination.parent))
         extended_parent.mkdir(parents=True, exist_ok=True)
         shutil.move(
@@ -153,6 +213,17 @@ def main() -> int:
         default=None,
         help="Required with --confirm-move: exact number of files the plan must match.",
     )
+    parser.add_argument(
+        "--replace-identical-destination",
+        action="store_true",
+        help=(
+            "When a planned destination already exists, replace it if (and only "
+            "if) source and destination are byte-identical at run time -- "
+            "provably lossless. If they differ, the source is parked next to it "
+            "as \"<name> - conflict.docx\" instead, preserving both. Without "
+            "this flag, any existing destination aborts the run (the default)."
+        ),
+    )
     args = parser.parse_args()
 
     moves = plan_moves(args.source_root)
@@ -171,8 +242,27 @@ def main() -> int:
     if args.expect is None:
         parser.error("--confirm-move requires --expect N (see the dry-run output)")
 
-    moved = apply_moves(moves, confirm=True, expected_count=args.expect)
+    pre_existing_destinations = {move.destination for move in moves if move.destination.exists()}
+    moved = apply_moves(
+        moves,
+        confirm=True,
+        expected_count=args.expect,
+        replace_identical_destination=args.replace_identical_destination,
+    )
     print(f"Moved {len(moved)} file(s).")
+
+    if args.replace_identical_destination:
+        clean = replaced = conflicts = 0
+        for move, result in zip(moves, moved):
+            if result != move.destination:
+                conflicts += 1
+            elif move.destination in pre_existing_destinations:
+                replaced += 1
+            else:
+                clean += 1
+        print(f"  clean moves (no prior destination): {clean}")
+        print(f"  replaced (byte-identical destination): {replaced}")
+        print(f"  parked as conflicts (destination content differed): {conflicts}")
     return 0
 
 

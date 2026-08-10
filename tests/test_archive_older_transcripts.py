@@ -147,6 +147,75 @@ class ArchiveOlderTranscriptsTests(unittest.TestCase):
                 tool.apply_moves(moves, confirm=True, expected_count=len(moves))
             self.assertTrue((root / "0122 Topic.docx").exists())
 
+    def test_replace_identical_destination_is_lossless(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self.roots(temporary)
+            (root / "0122 Topic.mp3").write_bytes(b"audio")
+            (root / "0122 Topic.docx").write_bytes(b"old transcript")
+            (root / "0122 Topic - GLM Review.docx").write_bytes(b"new transcript")
+            moves = tool.plan_moves(root)
+            dest_root = root.resolve().parent / "source - Older transcripts for review"
+            dest_root.mkdir(parents=True)
+            # Same bytes as the source docx -- e.g. the pipeline re-published
+            # an unchanged job and byte-copied the same whisper.docx sibling.
+            (dest_root / "0122 Topic.docx").write_bytes(b"old transcript")
+
+            moved = tool.apply_moves(
+                moves,
+                confirm=True,
+                expected_count=len(moves),
+                replace_identical_destination=True,
+            )
+
+            self.assertFalse((root / "0122 Topic.docx").exists())
+            self.assertEqual(moved, (dest_root / "0122 Topic.docx",))
+            self.assertEqual((dest_root / "0122 Topic.docx").read_bytes(), b"old transcript")
+            # No conflict file was created -- exactly one docx at the destination.
+            self.assertEqual([p.name for p in dest_root.glob("*.docx")], ["0122 Topic.docx"])
+
+    def test_replace_identical_destination_parks_differing_content_as_conflict(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self.roots(temporary)
+            (root / "0122 Topic.mp3").write_bytes(b"audio")
+            (root / "0122 Topic.docx").write_bytes(b"new source content")
+            (root / "0122 Topic - GLM Review.docx").write_bytes(b"new transcript")
+            moves = tool.plan_moves(root)
+            dest_root = root.resolve().parent / "source - Older transcripts for review"
+            dest_root.mkdir(parents=True)
+            (dest_root / "0122 Topic.docx").write_bytes(b"different archived content")
+
+            moved = tool.apply_moves(
+                moves,
+                confirm=True,
+                expected_count=len(moves),
+                replace_identical_destination=True,
+            )
+
+            self.assertFalse((root / "0122 Topic.docx").exists())
+            conflict_path = dest_root / "0122 Topic - conflict.docx"
+            self.assertEqual(moved, (conflict_path,))
+            # Both versions survive intact.
+            self.assertEqual(
+                (dest_root / "0122 Topic.docx").read_bytes(), b"different archived content"
+            )
+            self.assertEqual(conflict_path.read_bytes(), b"new source content")
+
+    def test_default_mode_still_refuses_even_when_destination_is_byte_identical(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self.roots(temporary)
+            (root / "0122 Topic.mp3").write_bytes(b"audio")
+            (root / "0122 Topic.docx").write_bytes(b"old transcript")
+            (root / "0122 Topic - GLM Review.docx").write_bytes(b"new transcript")
+            moves = tool.plan_moves(root)
+            dest_root = root.resolve().parent / "source - Older transcripts for review"
+            dest_root.mkdir(parents=True)
+            (dest_root / "0122 Topic.docx").write_bytes(b"old transcript")
+
+            with self.assertRaisesRegex(ValueError, "refusing to overwrite"):
+                tool.apply_moves(moves, confirm=True, expected_count=len(moves))
+            self.assertTrue((root / "0122 Topic.docx").exists())
+            self.assertEqual((dest_root / "0122 Topic.docx").read_bytes(), b"old transcript")
+
     def test_other_recordings_glm_review_keeper_is_never_swept_by_prefix_collision(self):
         # "0122 Topic" and "0122 Topic - clean no music" are two distinct
         # recordings sharing a folder, where one's stem is a strict prefix of
