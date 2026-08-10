@@ -80,8 +80,15 @@ def plan_moves(source_root: Path) -> tuple[PlannedMove, ...]:
             continue  # No reviewed replacement yet -- leave everything alone.
 
         for candidate in sorted(directory.glob("*.docx")):
-            if candidate.name == glm_review.name:
-                continue  # The keeper.
+            if candidate.name.endswith(GLM_REVIEW_SUFFIX):
+                # Never sweep in a GLM Review file -- not even one that isn't
+                # this recording's own keeper. Two distinct recordings can
+                # share a directory where one's stem is a strict prefix of
+                # the other's (e.g. "A" and "A - clean no music"); recording
+                # B's own keeper "A - clean no music - GLM Review.docx"
+                # starts with "A - " and would otherwise be misidentified as
+                # belonging to recording A's DOCX family and moved away.
+                continue
             if candidate.stem != stem and not candidate.stem.startswith(f"{stem} - "):
                 continue  # Not part of this recording's DOCX family.
             relative = candidate.relative_to(source_root)

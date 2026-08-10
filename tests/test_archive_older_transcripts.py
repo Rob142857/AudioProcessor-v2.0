@@ -147,6 +147,31 @@ class ArchiveOlderTranscriptsTests(unittest.TestCase):
                 tool.apply_moves(moves, confirm=True, expected_count=len(moves))
             self.assertTrue((root / "0122 Topic.docx").exists())
 
+    def test_other_recordings_glm_review_keeper_is_never_swept_by_prefix_collision(self):
+        # "0122 Topic" and "0122 Topic - clean no music" are two distinct
+        # recordings sharing a folder, where one's stem is a strict prefix of
+        # the other's. Each has its own audio, its own plain transcript, and
+        # its own GLM Review keeper. Processing "0122 Topic" must not sweep
+        # up "0122 Topic - clean no music - GLM Review.docx" just because its
+        # name starts with "0122 Topic - ".
+        with tempfile.TemporaryDirectory() as temporary:
+            root = self.roots(temporary)
+            (root / "0122 Topic.mp3").write_bytes(b"audio")
+            (root / "0122 Topic.docx").write_bytes(b"old transcript")
+            (root / "0122 Topic - GLM Review.docx").write_bytes(b"new transcript")
+            (root / "0122 Topic - clean no music.mp3").write_bytes(b"audio-clean")
+            (root / "0122 Topic - clean no music.docx").write_bytes(b"old transcript-clean")
+            (root / "0122 Topic - clean no music - GLM Review.docx").write_bytes(
+                b"new transcript-clean"
+            )
+
+            moves = tool.plan_moves(root)
+
+            self.assertEqual(
+                {m.source.name for m in moves},
+                {"0122 Topic.docx", "0122 Topic - clean no music.docx"},
+            )
+
     def test_same_stem_variant_docx_other_than_glm_review_is_also_moved(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = self.roots(temporary)
