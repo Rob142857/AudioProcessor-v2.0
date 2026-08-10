@@ -111,6 +111,10 @@ class ArchivePipelineTests(unittest.TestCase):
         config = PipelineConfig(input_path=Path("archive"), output_root=Path("output"))
 
         self.assertFalse(config.publish_source_docx)
+        # Owner's directive: the plain raw-transcript "<stem>.docx" sibling is
+        # no longer published next to source recordings by default -- only
+        # the "<stem> - GLM Review.docx" document is.
+        self.assertFalse(config.publish_raw_transcript_sibling)
         self.assertFalse(config.existing_transcripts_only)
         self.assertTrue(config.retain_troubleshooting_artifacts)
         self.assertEqual(config.glm_workers, 30)
@@ -1124,6 +1128,7 @@ class ArchivePipelineTests(unittest.TestCase):
                 output_root.resolve(),
                 source_root.resolve(),
                 manifest_paths=[output_root.resolve() / "job" / "manifest.json"],
+                publish_raw_transcript_sibling=False,
             )
             apply_batch.assert_called_once_with(
                 plan,
@@ -1264,6 +1269,51 @@ class ArchivePipelineTests(unittest.TestCase):
                 output_root.resolve(),
                 source_root.resolve(),
                 manifest_paths=[output_root.resolve() / "job" / "manifest.json"],
+                publish_raw_transcript_sibling=False,
+            )
+
+    def test_publish_raw_transcript_sibling_opt_in_is_threaded_to_planner(self):
+        # publish_raw_transcript_sibling restores the old two-document
+        # behaviour when a caller explicitly opts back in; confirm the
+        # pipeline passes the config value through rather than always
+        # defaulting the planner call to False.
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source_root = root / "archive"
+            output_root = root / "generated"
+            source_root.mkdir()
+            manifest_path = output_root / "job" / "manifest.json"
+            manifest_path.parent.mkdir(parents=True)
+            manifest_path.write_text(
+                json.dumps({"status": "verified"}), encoding="utf-8"
+            )
+            config = PipelineConfig(
+                input_path=source_root,
+                output_root=output_root,
+                publish_source_docx=True,
+                publish_raw_transcript_sibling=True,
+            )
+            plan = SimpleNamespace(
+                items=(SimpleNamespace(operation="create"),),
+                plan_sha256="c" * 64,
+                to_dict=lambda: {"count": 1, "plan_sha256": "c" * 64},
+            )
+            target = source_root / "lecture.docx"
+            with mock.patch(
+                "legacy_docx_replace.plan_legacy_docx_replacements",
+                return_value=plan,
+            ) as planner, mock.patch(
+                "legacy_docx_replace.apply_legacy_docx_replacements",
+                return_value=(target,),
+            ):
+                report = publish_source_docx_batch(config, self.clean_counts(discovered=1))
+
+            self.assertEqual(report["status"], "published")
+            planner.assert_called_once_with(
+                output_root.resolve(),
+                source_root.resolve(),
+                manifest_paths=[output_root.resolve() / "job" / "manifest.json"],
+                publish_raw_transcript_sibling=True,
             )
 
     def test_dry_run_suppresses_source_publication(self):

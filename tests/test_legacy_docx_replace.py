@@ -130,6 +130,50 @@ class LegacyReplacementTests(unittest.TestCase):
             self.assertFalse(review_target.exists())
             self.assertEqual(len(plan.plan_sha256), 64)
 
+    def test_default_publishes_only_glm_review_target(self):
+        # Owner's directive: publish_raw_transcript_sibling defaults to False
+        # via PipelineConfig, and the pipeline always passes that value
+        # through explicitly. plan_legacy_docx_replacements itself defaults
+        # the keyword to True so unrelated existing callers keep the old
+        # two-document behaviour unless they opt out; this test exercises
+        # the opted-out (new normal) path directly.
+        with tempfile.TemporaryDirectory() as temporary:
+            _root, generated, legacy = self.roots(temporary)
+            _new, _raw_new, raw_target, review_target, original = add_job(
+                generated, legacy, "1985 MW/0122 Topic.mp3", "one"
+            )
+
+            plan = replacement.plan_legacy_docx_replacements(
+                generated, legacy, publish_raw_transcript_sibling=False
+            )
+
+            self.assertEqual(len(plan.items), 1)
+            self.assertEqual(plan.items[0].target, review_target.resolve())
+            self.assertEqual(plan.items[0].operation, "create")
+            # The plain raw-transcript sibling is left completely alone: no
+            # plan item, and the file on disk is untouched.
+            self.assertEqual(raw_target.read_bytes(), original)
+
+    def test_opt_in_restores_two_document_publication(self):
+        # publish_raw_transcript_sibling=True restores the old behaviour of
+        # publishing both the plain "<stem>.docx" Whisper sibling and the
+        # "<stem> - GLM Review.docx" target.
+        with tempfile.TemporaryDirectory() as temporary:
+            _root, generated, legacy = self.roots(temporary)
+            _new, _raw_new, raw_target, review_target, _original = add_job(
+                generated, legacy, "1985 MW/0122 Topic.mp3", "one"
+            )
+
+            plan = replacement.plan_legacy_docx_replacements(
+                generated, legacy, publish_raw_transcript_sibling=True
+            )
+
+            self.assertEqual(len(plan.items), 2)
+            self.assertEqual(
+                {item.target for item in plan.items},
+                {raw_target.resolve(), review_target.resolve()},
+            )
+
     def test_needs_review_transcript_is_publishable_for_human_checking(self):
         with tempfile.TemporaryDirectory() as temporary:
             _root, generated, legacy = self.roots(temporary)

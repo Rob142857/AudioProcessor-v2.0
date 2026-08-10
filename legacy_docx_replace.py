@@ -477,8 +477,18 @@ def plan_legacy_docx_replacements(
     legacy_root: Path,
     *,
     manifest_paths: Optional[Iterable[Path]] = None,
+    publish_raw_transcript_sibling: bool = True,
 ) -> LegacyReplacementPlan:
-    """Build a read-only replacement plan from verified pipeline manifests."""
+    """Build a read-only replacement plan from verified pipeline manifests.
+
+    ``publish_raw_transcript_sibling`` controls whether a fresh-STT job also
+    plans a create/replace item for the plain ``<stem>.docx`` Whisper sibling
+    next to the ``<stem> - GLM Review.docx`` target. It defaults to True so
+    existing callers (and the CLI ``main`` below) keep their prior behaviour
+    unless they opt in to the newer, review-only publication policy; the
+    pipeline itself always passes this explicitly from
+    ``PipelineConfig.publish_raw_transcript_sibling``, whose default is False.
+    """
 
     generated_root = Path(generated_root).resolve()
     legacy_root = Path(legacy_root).resolve()
@@ -653,7 +663,12 @@ def plan_legacy_docx_replacements(
             )
         )
 
-        if imported_input is None:
+        if imported_input is None and publish_raw_transcript_sibling:
+            # The owner's directive: the GLM Review document is the only file
+            # that belongs next to a source recording. When the sibling is
+            # not being published, skip the Whisper-DOCX block entirely
+            # (both its validation and its plan item) rather than planning
+            # and then discarding a create/replace for it.
             whisper_value = artifacts.get("whisper_docx") if isinstance(
                 artifacts, dict
             ) else None

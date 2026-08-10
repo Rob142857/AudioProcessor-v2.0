@@ -537,6 +537,12 @@ def should_process_existing_docx(
     cutoff = validate_existing_docx_policy(mode, replace_before_date)
     target = Path(source).with_suffix(".docx")
     if not target.is_file():
+        # With publish_raw_transcript_sibling defaulting to False, the plain
+        # "<stem>.docx" this checks for is no longer published next to new
+        # recordings, so this now almost always finds nothing and returns
+        # True (always reprocess-eligible). That is intentional and matches
+        # how the archive works now: the GLM Review document, not this
+        # Whisper sibling, is the durable marker of a completed transcript.
         return True
     if mode == "all":
         return True
@@ -1296,6 +1302,13 @@ class PipelineConfig:
     retry_review: bool = False
     dry_run: bool = False
     publish_source_docx: bool = False
+    # Owner's directive (2026-08): the "<stem> - GLM Review.docx" is the only
+    # document that belongs next to a source recording. Publishing the plain
+    # raw-transcript "<stem>.docx" sibling as well forced a separate archive
+    # -organizing agent to keep moving it away, and every pipeline run
+    # republished it (~2,160 files re-created in one day). Default OFF is the
+    # new normal; set True only to restore the old two-document publication.
+    publish_raw_transcript_sibling: bool = False
     recursive: bool = True
     existing_docx_mode: str = "all"
     replace_before_date: Optional[str] = None
@@ -3369,6 +3382,7 @@ def publish_source_docx_batch(
             generated_root,
             scope_root,
             manifest_paths=eligible_manifests,
+            publish_raw_transcript_sibling=config.publish_raw_transcript_sibling,
         )
         operations = {"create": 0, "replace": 0}
         for item in plan.items:
