@@ -12,6 +12,7 @@ import gc
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -171,7 +172,7 @@ def _validate_replace_policy(mode: str, cutoff_date: str) -> Optional[str]:
 def _validate_polished_selection(settings: dict) -> Optional[str]:
     """Validate the GUI's polished-pipeline selection before saving or running."""
 
-    mode = str(settings.get("replace_mode", "skip"))
+    mode = str(settings.get("existing_docx_mode", settings.get("replace_mode", "skip")))
     cutoff = _validate_replace_policy(
         mode, str(settings.get("replace_before_date", ""))
     )
@@ -251,6 +252,7 @@ def _run_polished_pipeline(input_path: str, settings: dict, q: queue.Queue) -> i
     """Run the resumable local STT -> GLM -> Word path used by the GUI."""
 
     from archive_pipeline import PipelineConfig, default_output_root, execute_pipeline
+    from pipeline_config import resolve_pipeline_settings
 
     source = Path(input_path).expanduser().resolve()
     if source.is_file():
@@ -264,15 +266,14 @@ def _run_polished_pipeline(input_path: str, settings: dict, q: queue.Queue) -> i
         )
     else:
         output_root = default_output_root(source)
+    effective = resolve_pipeline_settings(gui_values=settings)
     existing_transcripts_only = bool(
         settings.get("existing_transcripts_only", False)
     )
     retain_troubleshooting_artifacts = bool(
         settings.get("retain_troubleshooting_artifacts", True)
     )
-    selected_stt_model = str(
-        settings.get("whisper_model", "nvidia/parakeet-tdt-0.6b-v3")
-    )
+    selected_stt_model = effective.stt_model
     cutoff = _validate_polished_selection(settings)
     config = PipelineConfig(
         input_path=source,
@@ -281,14 +282,15 @@ def _run_polished_pipeline(input_path: str, settings: dict, q: queue.Queue) -> i
         force=bool(settings.get("force_reprocess", False)),
         publish_source_docx=True,
         recursive=bool(settings.get("recursive", True)),
-        existing_docx_mode=str(settings.get("replace_mode", "skip")),
-        replace_before_date=cutoff,
+        existing_docx_mode=effective.existing_docx_mode,
+        replace_before_date=cutoff or effective.replace_before_date,
         existing_transcripts_only=existing_transcripts_only,
         retain_troubleshooting_artifacts=retain_troubleshooting_artifacts,
-        glm_workers=30,
+        glm_workers=effective.glm_workers,
         progress_callback=lambda lane, message: q.put(("progress", lane, message)),
     )
     q.put(f"Polished artifacts: {output_root}\n")
+    q.put(effective.startup_log() + "\n")
     if not retain_troubleshooting_artifacts:
         q.put(
             "Optional per-job event logging is off; compact hash-bound resume and "
@@ -426,6 +428,8 @@ class _QueueWriter:
 #  Main GUI
 # ═══════════════════════════════════════════════════════════════════
 def launch_gui():
+    from pipeline_config import resolve_pipeline_settings
+    from progress_window import init_progress_window
     root = tk.Tk()
     root.title("AudioProcessor v2.0 — Speech-to-Text")
     root.geometry("1060x760")
@@ -437,6 +441,7 @@ def launch_gui():
         root.state("zoomed")
     except Exception:
         pass
+    compact_progress = init_progress_window(root)
 
     style = ttk.Style()
     style.configure("Clean.TFrame", background=BG)
@@ -475,7 +480,11 @@ def launch_gui():
     input_panel.grid(row=1, column=0, sticky="ew", pady=(0, 10))
 
     # ── Settings panel ───────────────────────────────────────────────
-    settings_panel = SettingsPanel(outer, proj_settings=proj)
+    settings_panel = SettingsPanel(
+        outer,
+        proj_settings=proj,
+        glm_workers=resolve_pipeline_settings(saved_settings=proj).glm_workers,
+    )
     settings_panel.grid(row=2, column=0, sticky="ew", pady=(0, 10))
 
     # ── Buttons ──────────────────────────────────────────────────────
@@ -490,6 +499,8 @@ def launch_gui():
     }
 
     def finish_worker():
+        compact_progress.set_status("Stopped" if STOP_FLAG.is_set() else "Finished")
+        compact_progress.set_text("Run finished; see the two pipeline logs for its final result.")
         worker_state["active"] = False
         worker_state["existing_transcripts_only"] = False
         run_btn.configure(state="normal")
@@ -512,7 +523,7 @@ def launch_gui():
                 _validate_polished_selection(snap)
                 if snap.get("polished_pipeline", 1)
                 else _validate_replace_policy(
-                    str(snap.get("replace_mode", "skip")),
+                    str(snap.get("existing_docx_mode", snap.get("replace_mode", "skip"))),
                     str(snap.get("replace_before_date", "")),
                 )
             )
@@ -538,6 +549,10 @@ def launch_gui():
         worker_state["active"] = True
         worker_state["existing_transcripts_only"] = existing_only_run
         STOP_FLAG.clear()
+        compact_progress.set_status("Starting")
+        compact_progress.set_progress(0)
+        compact_progress.set_text("Checking pipeline prerequisites...")
+        compact_progress.show()
         # Also reset the engine's internal stop event
         if not existing_only_run:
             try:
@@ -563,10 +578,10 @@ def launch_gui():
                 # transcription engine; only archive_pipeline's DOCX import,
                 # protected cleanup, and rendering paths are entered.
                 if not existing_only_run:
-                    os.environ["TRANSCRIBE_MODEL_NAME"] = snap["whisper_model"]
-                    if snap["whisper_model"].casefold().startswith("nvidia/parakeet-"):
+                    os.environ["TRANSCRIBE_MODEL_NAME"] = snap["stt_model"]
+                    if snap["stt_model"].casefold().startswith("nvidia/parakeet-"):
                         os.environ.pop("TRANSCRIBE_FORCE_NATIVE_WHISPER", None)
-                    elif snap["whisper_model"].startswith("faster-whisper-"):
+                    elif snap["stt_model"].startswith("faster-whisper-"):
                         os.environ.pop("TRANSCRIBE_FORCE_NATIVE_WHISPER", None)
                     else:
                         os.environ["TRANSCRIBE_FORCE_NATIVE_WHISPER"] = "1"
@@ -587,7 +602,7 @@ def launch_gui():
                     if not _run_polished_preflight(
                         q,
                         existing_transcripts_only=existing_transcripts_only,
-                        stt_model=str(snap.get("whisper_model", "nvidia/parakeet-tdt-0.6b-v3")),
+                        stt_model=str(snap.get("stt_model", "nvidia/parakeet-tdt-0.6b-v3")),
                     ):
                         return
                     exit_code = _run_polished_pipeline(inp, snap, q)
@@ -613,7 +628,7 @@ def launch_gui():
                     files = _collect_files(
                         inp,
                         recursive=bool(snap["recursive"]),
-                        replace_mode=snap["replace_mode"],
+                        replace_mode=snap["existing_docx_mode"],
                         cutoff_date=snap["replace_before_date"],
                         q=q,
                     )
@@ -622,7 +637,7 @@ def launch_gui():
                     else:
                         q.put("No eligible files found.\n")
                 else:
-                    if _should_process(inp, snap["replace_mode"],
+                    if _should_process(inp, snap["existing_docx_mode"],
                                        snap["replace_before_date"]):
                         _run_single(inp, None, q)
                     else:
@@ -652,6 +667,8 @@ def launch_gui():
             except Exception:
                 pass
         stop_btn.configure(state="disabled")
+        compact_progress.set_status("Stopping")
+        compact_progress.set_text("Preserving completed checkpoints...")
         stt_log.append(
             "\nCancellation requested. The current speech-to-text operation will stop safely; "
             "completed raw transcripts and GLM checkpoints are preserved.\n"
@@ -743,7 +760,7 @@ def launch_gui():
 
     # ── Live pipeline lanes ──────────────────────────────────────────
     # The two panes expose the actual producer/consumer hand-off: one GPU
-    # Parakeet worker continues with the next recording while thirty GLM workers
+    # Parakeet worker continues with the next recording while the configured GLM workers
     # independently review already-durable raw transcripts.
     logs = tk.Frame(outer, bg=BG)
     logs.grid(row=4, column=0, sticky="nsew", pady=(0, 0))
@@ -759,7 +776,7 @@ def launch_gui():
     ).grid(row=0, column=0, sticky="w", pady=(0, 4))
     tk.Label(
         logs,
-        text="GLM review queue (thirty protected workers)",
+        text=f"GLM review queue ({settings_panel.glm_workers} protected workers)",
         bg=BG,
         fg="#0f766e",
         font=("Segoe UI", 9, "bold"),
@@ -800,7 +817,19 @@ def launch_gui():
                     and msg[0] == "progress"
                 ):
                     _marker, lane, text = msg
-                    (glm_log if lane == "glm" else stt_log).append(str(text))
+                    message = str(text)
+                    (glm_log if lane == "glm" else stt_log).append(message)
+                    compact_progress.set_status("GLM review" if lane == "glm" else "Speech-to-text")
+                    compact_progress.set_text(message)
+                    if lane == "stt":
+                        match = re.search(r"\[(\d[\d,]*)/(\d[\d,]*)\]\s+(.+?)\s+—", message)
+                        if match:
+                            current = int(match.group(1).replace(",", ""))
+                            total = int(match.group(2).replace(",", ""))
+                            compact_progress.set_file(match.group(3))
+                            compact_progress.set_file_progress(current, total)
+                            completed = current if "raw transcript durable" in message or "already complete" in message else current - 1
+                            compact_progress.set_progress(100 * max(0, completed) / max(1, total))
                 else:
                     stt_log.append(str(msg))
         except queue.Empty:

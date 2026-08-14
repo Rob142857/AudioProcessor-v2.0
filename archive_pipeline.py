@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import importlib.metadata
 import json
 import os
@@ -28,6 +27,24 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Optional
 
 from console_compat import configure_safe_stdio
+from fsutil import (
+    ATOMIC_REPLACE_MAX_ATTEMPTS,
+    ATOMIC_REPLACE_RETRY_BASE_DELAY_SECONDS,
+    append_jsonl_locked,
+    atomic_write_bytes as _fsutil_atomic_write_bytes,
+    atomic_write_json,
+    atomic_write_text,
+    sha256_file,
+    sha256_text,
+    windows_extended_path,
+)
+from pipeline_config import (
+    DEFAULT_CLEANUP_ENDPOINT as CONFIG_DEFAULT_CLEANUP_ENDPOINT,
+    DEFAULT_CLEANUP_MODEL as CONFIG_DEFAULT_CLEANUP_MODEL,
+    DEFAULT_GLM_WORKERS as CONFIG_DEFAULT_GLM_WORKERS,
+    DEFAULT_STT_MODEL as CONFIG_DEFAULT_STT_MODEL,
+    resolve_pipeline_settings,
+)
 from pipeline_control import PipelineCancelledError, raise_if_cancelled
 from stt_coverage import (
     assess_stt_coverage,
@@ -40,17 +57,16 @@ configure_safe_stdio()
 
 
 PIPELINE_VERSION = "3.1.0"
-DEFAULT_STT_MODEL = "faster-whisper-large-v3"
-DEFAULT_GUI_STT_MODEL = "nvidia/parakeet-tdt-0.6b-v3"
+DEFAULT_STT_MODEL = CONFIG_DEFAULT_STT_MODEL
+# Retained import name for GUI/API compatibility; there is now one default.
+DEFAULT_GUI_STT_MODEL = DEFAULT_STT_MODEL
 # GLM review is remote and independent of the single local GPU STT lane.  A
 # wider pool prevents completed Parakeet transcripts from accumulating while
 # long archival recordings are being cleaned in chunks.
-DEFAULT_GLM_REVIEW_WORKERS = 30
+DEFAULT_GLM_REVIEW_WORKERS = CONFIG_DEFAULT_GLM_WORKERS
 PARAKEET_MODEL_PREFIX = "nvidia/parakeet-"
-DEFAULT_CLEANUP_ENDPOINT = (
-    "https://pg.objectiveartefacts.com.au/api/tooling/cleanup-chunk"
-)
-DEFAULT_CLEANUP_MODEL = "@cf/zai-org/glm-4.7-flash"
+DEFAULT_CLEANUP_ENDPOINT = CONFIG_DEFAULT_CLEANUP_ENDPOINT
+DEFAULT_CLEANUP_MODEL = CONFIG_DEFAULT_CLEANUP_MODEL
 DEFAULT_CLEANUP_PROFILE = "semantic-conservative-repair-v9"
 HOTWORD_SELECTION_VERSION = "faster-whisper-hotwords-v1"
 SUPPORTED_AUDIO_EXTENSIONS = frozenset(
@@ -77,6 +93,8 @@ SUPPORTED_AUDIO_EXTENSIONS = frozenset(
 FINAL_STATUSES = frozenset({"verified", "needs_review"})
 EXISTING_DOCX_MODES = frozenset({"skip", "all", "before"})
 SOURCE_DOCX_PUBLICATION_REPORT = "source-docx-publication-report.json"
+PUBLICATION_MANIFEST_DIRECTORY = ".transcription-manifest"
+PUBLICATION_MANIFEST_FILENAME = "publications.jsonl"
 GLM_REVIEW_SUFFIX = " - GLM Review"
 # A job can be left with status "running" forever if the process dies mid-job
 # (killed, crashed, machine slept). "running" is not a final status, so such a
@@ -148,18 +166,6 @@ def stable_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def sha256_text(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
-
-def sha256_file(path: Path, block_size: int = 4 * 1024 * 1024) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        while block := source.read(block_size):
-            digest.update(block)
-    return digest.hexdigest()
-
-
 def file_hash_matches(path: Path, expected: Any) -> bool:
     """Return false, rather than trusting existence, for stale/corrupt artifacts."""
     if not isinstance(expected, str) or len(expected) != 64 or not path.is_file():
@@ -177,74 +183,25 @@ def installed_version(distribution: str) -> str:
         return "missing"
 
 
-def _windows_extended_path(path: str | Path) -> str:
-    """Return an extended Windows path when a destination name exceeds MAX_PATH.
-
-    Duplicated from ``cleanup_client._windows_extended_path`` rather than
-    imported: this module intentionally does not import from the protected
-    cleanup client just for an 8-line path helper. ``\\\\?\\`` lets
-    ``os.replace`` address a durable final name without weakening the
-    atomic-write guarantee, even when the output root (e.g. a deeply nested
-    OneDrive folder) pushes the path past 260 characters.
-    """
-
-    value = os.path.abspath(os.fspath(path))
-    if os.name != "nt" or value.startswith("\\\\?\\"):
-        return value
-    if value.startswith("\\\\"):
-        return "\\\\?\\UNC\\" + value[2:]
-    return "\\\\?\\" + value
-
-
-# os.replace onto an existing destination fails on Windows with
-# PermissionError [WinError 5] (or WinError 32, "used by another process")
-# whenever something else briefly has the file open -- OneDrive syncing the
-# folder or Defender scanning it on close are the usual culprits on a synced
-# output root. The lock is measured in milliseconds, so a short bounded retry
-# clears it without masking a genuine permissions problem.
-ATOMIC_REPLACE_MAX_ATTEMPTS = 5
-ATOMIC_REPLACE_RETRY_BASE_DELAY_SECONDS = 0.1
-
-
-def _is_retryable_replace_error(exc: OSError) -> bool:
-    return isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in (5, 32)
+# Compatibility alias for callers/tests while all implementation uses fsutil.
+_windows_extended_path = windows_extended_path
 
 
 def atomic_write_bytes(path: Path, value: bytes) -> None:
-    parent = Path(_windows_extended_path(path.parent))
-    parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=str(parent)
+    """Compatibility seam around the shared durable writer.
+
+    The explicit sleep dependency preserves the pipeline's existing retry
+    observability and lets its focused Windows-lock regression tests mock the
+    wait without duplicating the implementation.
+    """
+
+    _fsutil_atomic_write_bytes(
+        path,
+        value,
+        max_attempts=ATOMIC_REPLACE_MAX_ATTEMPTS,
+        base_delay_seconds=ATOMIC_REPLACE_RETRY_BASE_DELAY_SECONDS,
+        sleep=time.sleep,
     )
-    temporary = Path(temporary_name)
-    destination = Path(_windows_extended_path(path))
-    try:
-        with os.fdopen(descriptor, "wb") as output:
-            output.write(value)
-            output.flush()
-            os.fsync(output.fileno())
-        for attempt in range(ATOMIC_REPLACE_MAX_ATTEMPTS):
-            try:
-                os.replace(temporary, destination)
-                break
-            except OSError as exc:
-                if (
-                    not _is_retryable_replace_error(exc)
-                    or attempt == ATOMIC_REPLACE_MAX_ATTEMPTS - 1
-                ):
-                    raise
-                time.sleep(ATOMIC_REPLACE_RETRY_BASE_DELAY_SECONDS * (2 ** attempt))
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
-
-
-def atomic_write_text(path: Path, value: str) -> None:
-    atomic_write_bytes(path, value.encode("utf-8"))
-
-
-def atomic_write_json(path: Path, value: Any) -> None:
-    atomic_write_text(path, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -429,6 +386,80 @@ def source_publication_scope(input_path: Path) -> Path:
 
     input_path = Path(input_path).resolve()
     return input_path if input_path.is_dir() else input_path.parent
+
+
+def publication_manifest_path(archive_root: Path) -> Path:
+    """Return the append-only, cross-tool publication feed for an archive."""
+
+    return (
+        Path(archive_root).resolve()
+        / PUBLICATION_MANIFEST_DIRECTORY
+        / PUBLICATION_MANIFEST_FILENAME
+    )
+
+
+def _manifest_relative_path(path: Path, archive_root: Path) -> str:
+    """Return a checked, portable archive-relative path for the JSONL contract."""
+
+    try:
+        return Path(path).resolve().relative_to(Path(archive_root).resolve()).as_posix()
+    except ValueError as exc:
+        raise PipelineConfigurationError(
+            f"publication path escapes archive root: {path}"
+        ) from exc
+
+
+def append_publication_manifest_events(
+    plan: Any,
+    *,
+    archive_root: Path,
+    run_id: str,
+) -> list[dict[str, str | int]]:
+    """Append one versioned event per newly published GLM Review DOCX.
+
+    The legacy filename convention remains the source-side publication
+    mechanism. This feed is additive: it gives downstream ingestion an
+    explicit identity contract without changing what is published or named.
+    """
+
+    manifest_path = publication_manifest_path(archive_root)
+    events: list[dict[str, str | int]] = []
+    for item in getattr(plan, "items", ()):
+        # Kept permissive for lightweight callers that pass a planning summary
+        # rather than the concrete LegacyDocxReplacement objects.
+        if not all(hasattr(item, name) for name in ("target", "source", "manifest")):
+            continue
+        target = Path(item.target)
+        # Raw sibling publication is intentionally not an ingestion event.
+        if not is_glm_review_docx(target):
+            continue
+        if not target.is_file() or target.is_symlink():
+            raise PipelineConfigurationError(
+                f"published GLM Review DOCX is missing or unsafe: {target}"
+            )
+        actual_hash = sha256_file(target)
+        expected_hash = getattr(item, "generated_sha256", None)
+        if isinstance(expected_hash, str) and actual_hash.casefold() != expected_hash.casefold():
+            raise PipelineConfigurationError(
+                f"published GLM Review hash changed before manifest append: {target}"
+            )
+        job_manifest = read_json(Path(item.manifest))
+        cleanup = job_manifest.get("cleanup")
+        profile = cleanup.get("profile") if isinstance(cleanup, dict) else None
+        if not isinstance(profile, str) or not profile.strip():
+            profile = DEFAULT_CLEANUP_PROFILE
+        event: dict[str, str | int] = {
+            "schema_version": 1,
+            "source_path": _manifest_relative_path(Path(item.source), archive_root),
+            "docx_path": _manifest_relative_path(target, archive_root),
+            "content_hash": f"sha256:{actual_hash}",
+            "published_at": utc_now(),
+            "run_id": run_id,
+            "cleanup_profile": profile,
+        }
+        append_jsonl_locked(manifest_path, event)
+        events.append(event)
+    return events
 
 
 def is_glm_review_docx(path: Path) -> bool:
@@ -3418,6 +3449,27 @@ def publish_source_docx_batch(
                 "finished_at": utc_now(),
             }
         )
+        try:
+            events = append_publication_manifest_events(
+                plan,
+                archive_root=scope_root,
+                run_id=run_id,
+            )
+        except Exception as manifest_exc:
+            # The DOCX transaction has already completed and may be valuable
+            # to a reviewer. Do not misreport it as rolled back; retain a
+            # precise report so the append-only feed can be repaired safely.
+            report["publication_manifest"] = {
+                "status": "failed",
+                "path": str(publication_manifest_path(scope_root)),
+                "error": f"{type(manifest_exc).__name__}: {manifest_exc}",
+            }
+        else:
+            report["publication_manifest"] = {
+                "status": "published",
+                "path": str(publication_manifest_path(scope_root)),
+                "events": len(events),
+            }
         write_report_snapshot()
         return report
     except PipelineCancelledError as exc:
@@ -3480,12 +3532,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("input", nargs="?", help="Audio file or archive folder")
     parser.add_argument("--output", help="Separate artifact/output root")
     parser.add_argument(
-        "--model", default=DEFAULT_GUI_STT_MODEL, help="Local STT model"
+        "--model", default=None, help=f"Local STT model (default: {DEFAULT_STT_MODEL})"
     )
     parser.add_argument(
         "--glm-workers",
         type=int,
-        default=DEFAULT_GLM_REVIEW_WORKERS,
+        default=None,
         help=(
             "Independent protected GLM review workers after Parakeet raw STT "
             f"(default: {DEFAULT_GLM_REVIEW_WORKERS})"
@@ -3493,11 +3545,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--threads", type=int, help="CPU thread limit")
     parser.add_argument(
-        "--cleanup-endpoint", default=os.environ.get("PG_CLEANUP_ENDPOINT", DEFAULT_CLEANUP_ENDPOINT)
+        "--cleanup-endpoint", default=None
     )
     parser.add_argument(
         "--cleanup-model",
-        default=os.environ.get("PG_CLEANUP_MODEL", DEFAULT_CLEANUP_MODEL),
+        default=None,
         help="Pinned cleanup model (default: GLM-4.7-Flash)",
     )
     parser.add_argument("--no-cleanup", action="store_true", help="Skip remote GLM cleanup")
@@ -3529,7 +3581,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--existing-docx-mode",
         choices=sorted(EXISTING_DOCX_MODES),
-        default="all",
+        default=None,
         help=(
             "Select recordings by the source-adjacent Word transcript: "
             "skip existing, process all, or replace only documents before a date"
@@ -3695,13 +3747,28 @@ def main(argv: Optional[list[str]] = None) -> int:
         if args.output
         else default_output_root(input_path)
     )
+    try:
+        effective = resolve_pipeline_settings(
+            cli_values={
+                "stt_model": args.model,
+                "cleanup_endpoint": args.cleanup_endpoint,
+                "cleanup_model": args.cleanup_model,
+                "glm_workers": args.glm_workers,
+                "existing_docx_mode": args.existing_docx_mode,
+                "replace_before_date": args.replace_before_date,
+            }
+        )
+    except ValueError as exc:
+        print(f"Invalid pipeline configuration: {exc}", file=sys.stderr)
+        return 2
+    print(effective.startup_log())
     config = PipelineConfig(
         input_path=input_path,
         output_root=output_root,
-        stt_model=args.model,
+        stt_model=effective.stt_model,
         cleanup_enabled=not args.no_cleanup,
-        cleanup_endpoint=args.cleanup_endpoint,
-        cleanup_model=args.cleanup_model,
+        cleanup_endpoint=effective.cleanup_endpoint,
+        cleanup_model=effective.cleanup_model,
         threads=args.threads,
         force=args.force,
         cleanup_only=args.cleanup_only,
@@ -3710,11 +3777,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         dry_run=args.dry_run,
         publish_source_docx=args.publish_source_docx,
         recursive=not args.no_recursive,
-        existing_docx_mode=args.existing_docx_mode,
-        replace_before_date=args.replace_before_date,
+        existing_docx_mode=effective.existing_docx_mode,
+        replace_before_date=effective.replace_before_date,
         existing_transcripts_only=args.existing_transcripts_only,
         retain_troubleshooting_artifacts=not args.no_troubleshooting_logs,
-        glm_workers=args.glm_workers,
+        glm_workers=effective.glm_workers,
         limit=args.limit,
     )
     return execute_pipeline(config)

@@ -1,0 +1,12 @@
+title = "AudioProcessor secret scanning"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Documented non-secret placeholders and generated test fixtures"
+regexes = [
+  '''your-token-here''',
+  '''example-token''',
+  '''<REDACTED>''',
+]

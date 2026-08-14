@@ -194,8 +194,13 @@ def quarantine_candidates(plan: DocxCleanupPlan, *, expected_count: int) -> tupl
     return tuple(moved)
 
 
-def _default_polished_root(archive_root: Path) -> Path:
+def default_polished_root(archive_root: Path) -> Path:
+    """Return the conventional sibling workspace used by the pipeline."""
     return archive_root.parent / f"{archive_root.name} - Polished"
+
+
+# Compatibility for callers from before archive_doctor exposed this helper.
+_default_polished_root = default_polished_root
 
 
 def _print_paths(label: str, paths: Iterable[Path]) -> None:
@@ -228,7 +233,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     archive_root = args.archive.resolve()
-    polished_root = (args.polished_output or _default_polished_root(archive_root)).resolve()
+    polished_root = (args.polished_output or default_polished_root(archive_root)).resolve()
     plan = build_cleanup_plan(archive_root, polished_root)
     print(f"Completed Parakeet manifests inspected: {plan.manifest_count:,}")
     _print_paths("Kept proven Parakeet GLM Review DOCX", plan.kept_final_glm_docx)

@@ -92,7 +92,43 @@ For a complete unrestricted archive-folder run, `run_full_pipeline.bat` publishe
 
 The GUI checkbox **Retain detailed troubleshooting logging** defaults on. Turning it off prevents optional `run.jsonl` event logs and stores compact terminology digests instead of duplicating the full selected/dropped glossary lists. Operational manifests, hashes and checkpoints remain because safe resume and provenance depend on them.
 
+## Secret hygiene
+
+Cloudflare Access credentials belong in Windows Credential Manager or the
+documented environment variables; never place them in settings files or source
+control. CI scans every push and pull request with Gitleaks. Contributors can
+enable the same staged-file check locally with:
+
+```powershell
+git config core.hooksPath .githooks
+```
+
+The hook fails closed when Gitleaks is unavailable so a missing local scanner
+cannot be mistaken for a clean result.
+
 ## Source DOCX cleanup after review
+
+`archive_doctor.py` is the consolidated, dry-run-first entry point for all
+archive maintenance.  The older scripts remain available for compatibility,
+but new work should use its subcommands.  Every action requires the same
+explicit confirmation pattern: review the output, then repeat it with
+`--confirm --expect N` using the exact displayed count.  All destructive-looking
+operations move files into a recoverable location; none silently delete source
+documents.
+
+```powershell
+# Plan source DOCX cleanup after review (the default is read-only)
+python archive_doctor.py prepare-cleanup "C:\path\to\archive"
+
+# Quarantine old source transcripts only where a sibling GLM Review exists
+python archive_doctor.py quarantine "C:\path\to\archive"
+
+# Requeue only the guarded pre-fix trailing-gap cases
+python archive_doctor.py requeue "C:\path\to\archive - Polished"
+
+# Rollback-safe DOCX publication from a completed generated workspace
+python archive_doctor.py replace-docx "C:\generated" "C:\legacy-scope" "C:\generated\publication-backups\manual-run"
+```
 
 When the archive run is complete and its GLM Review documents are accepted, use
 the separate planner below. It is **read-only by default**. It recursively

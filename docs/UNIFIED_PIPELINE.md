@@ -1,6 +1,6 @@
 # Unified archival transcription pipeline
 
-Status: bridge implementation complete. The pinned Python/CUDA environment and a real 81.7-second tape canary have passed on the GTX 1070 Ti using Faster-Whisper tiny with CUDA/INT8. Review a representative large-v3 canary before the unrestricted archive run.
+Status: bridge implementation complete. The archive default is NVIDIA Parakeet TDT 0.6B v3 on the pinned CUDA environment; Faster-Whisper remains an explicit comparison option.
 
 ## What is now wired together
 
@@ -9,7 +9,7 @@ The local tool remains responsible for reading private audio and producing the f
 ```text
 recording
   -> local tape preprocessing
-  -> Faster-Whisper large-v3 + token-budgeted pinned-glossary hotwords
+  -> NVIDIA Parakeet TDT 0.6B v3 (or explicitly selected Faster-Whisper)
   -> immutable raw text + segment JSON + VTT + SRT
   -> pinned glossary snapshot
   -> protected GLM-4.7-Flash cleanup
@@ -70,7 +70,7 @@ Use a dedicated Cloudflare Access service token whose policy is limited to the t
 For an unattended process, `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` may instead be supplied together in that process's environment; they override the credential store. Use `configure_cleanup_credentials.py --clear` to remove the saved pair.
 
 The desktop GUI is launched with `run.bat`. Its **Polished archive pipeline**
-switch is on by default and shows the fixed route: local Faster-Whisper Word →
+switch is on by default and shows the fixed route: local Parakeet Word →
 protected GLM-4.7-Flash cleanup → separate GLM Review Word. It uses the same manifests,
 checksums, cleanup credentials, separate polished output root, verification,
 backup, and guarded source-DOCX publisher as the command-line runner.
@@ -137,6 +137,18 @@ Useful controls:
 
 The batch launcher enables UTF-8 console/Python I/O, selects the doctor mode which matches the requested work, and requires CUDA for any run that transcribes audio. Cleanup-only and render-only runs do not require the GPU; dry runs use the inventory-only doctor mode.
 
+### Configuration resolution
+
+The canonical settings names are `stt_model`, `existing_docx_mode`,
+`replace_before_date`, `cleanup_endpoint`, `cleanup_model`, and `glm_workers`.
+For backwards compatibility, old GUI files using `whisper_model` and
+`replace_mode` are read once and saved back with the canonical names. Effective
+values are resolved in this order: defaults, environment, saved settings, CLI,
+then GUI controls. Startup output records both each effective value and its
+winning source. Environment overrides are `TRANSCRIBE_MODEL_NAME`,
+`PG_CLEANUP_ENDPOINT`, `PG_CLEANUP_MODEL`, `TRANSCRIPT_GLM_WORKERS`,
+`TRANSCRIPT_EXISTING_DOCX_MODE`, and `TRANSCRIPT_REPLACE_BEFORE_DATE`.
+
 ### Safe source-adjacent review publication
 
 The launcher adds `--publish-source-docx` by default. Publication occurs per completed recording. For fresh STT it publishes the pre-GLM Word transcript as `<stem>.docx` and the cleaned document as `<stem> - GLM Review.docx`. Imported-DOCX mode publishes only the review sibling and requires the source DOCX container hash to remain exactly unchanged.
@@ -148,6 +160,16 @@ Single-file publication is intentionally supported for a reviewed canary. Its gu
 ```
 
 Both `verified` and `needs_review` final jobs may produce a review copy because the document is explicitly awaiting a human word-for-word check. QA status and approval are not conflated: every review manifest, publication record and transaction report says `approval_state: pending_human_review`. Failed, cancelled and incomplete jobs do not publish. Dry runs and limited runs remain non-publishing.
+
+After each successful GLM Review Word transaction, the pipeline appends a
+versioned ingestion event to
+`<archive>/.transcription-manifest/publications.jsonl`. The event contains only
+archive-relative source/review paths, the exact published DOCX SHA-256, UTC
+publication time, run ID, and cleanup profile. Raw speech-to-text siblings never
+enter this feed. Appends are cross-process locked and fsynced; if an append
+fails after Word publication, the transaction report records that failure
+without falsely claiming the already-published document was rolled back. A
+safe rerun can append the missing current-state event.
 
 Each GLM Review document ends with a restrained provenance note in this form: `Processed by speech-to-text from a digitised tape recording originally recorded in person by MW on 22 January 1985.` A second removable line reads `Needs human review.` until a person has completed the word-for-word check. Raw Whisper documents do not carry the GLM review notice. Old cleanup timestamps, model/device details, and earlier generated provenance text are removed during rendering rather than appearing in the publication.
 
@@ -169,6 +191,11 @@ replacement additionally requires its byte-exact original backup. It can then
 finish safely without ever importing a ` - GLM Review.docx` as source text.
 
 The service token is never written to settings, logs, manifests, or checkpoint files. The client refuses insecure non-local HTTP endpoints and Access login redirects/HTML, and validates access once before creating per-recording work.
+
+The GUI also opens a compact always-on-top progress window when a run begins.
+It mirrors the live STT/GLM lane, current recording, batch position, and
+file-level completion percentage. The two full log panes remain the source of
+truth for chunk detail and the final result.
 
 ## Archive findings
 

@@ -132,9 +132,16 @@ class SettingsPanel(tk.Frame):
         ("large-v3",                      "Native Whisper Large-v3  (GPU / CPU fallback)"),
     ]
 
-    def __init__(self, parent, proj_settings: dict | None = None):
+    def __init__(
+        self,
+        parent,
+        proj_settings: dict | None = None,
+        *,
+        glm_workers: int = 30,
+    ):
         super().__init__(parent, bg=CARD_BG)
         ps = proj_settings or {}
+        self.glm_workers = max(1, int(glm_workers))
         self.columnconfigure(1, weight=1)
         row = 0
 
@@ -163,7 +170,7 @@ class SettingsPanel(tk.Frame):
         self.pipeline_flow = tk.Label(
             self,
             text=(
-                "Local NVIDIA Parakeet Word  →  ten protected GLM-4.7-Flash review workers  "
+                f"Local NVIDIA Parakeet Word  →  {self.glm_workers} protected GLM-4.7-Flash review workers  "
                 "→  separate GLM Review Word"
             ),
             bg="#eff6ff",
@@ -227,7 +234,7 @@ class SettingsPanel(tk.Frame):
         # Model
         tk.Label(self, text="Model:", bg=CARD_BG, fg=FG,
                  font=("Segoe UI", 10, "bold")).grid(row=row, column=0, sticky="w", padx=16, pady=(4, 6))
-        saved_model = ps.get("whisper_model", "nvidia/parakeet-tdt-0.6b-v3")
+        saved_model = ps.get("stt_model", ps.get("whisper_model", "nvidia/parakeet-tdt-0.6b-v3"))
         if saved_model not in valid_models:
             saved_model = "nvidia/parakeet-tdt-0.6b-v3"  # reset stale/invalid model names
         self.model_var = tk.StringVar(value=saved_model)
@@ -405,7 +412,7 @@ class SettingsPanel(tk.Frame):
                     "→  separate GLM Review Word (no audio inference)"
                     if existing_only
                 else (
-                    "Local NVIDIA Parakeet Word  →  ten protected GLM-4.7-Flash review workers  "
+                    f"Local NVIDIA Parakeet Word  →  {self.glm_workers} protected GLM-4.7-Flash review workers  "
                     "→  separate GLM Review Word"
                     if uses_parakeet
                     else "Local Faster-Whisper Word  →  protected GLM-4.7-Flash cleanup  "
@@ -445,7 +452,7 @@ class SettingsPanel(tk.Frame):
         """Apply a project-settings dict to the panel widgets."""
         valid_models = {k for k, _ in self.MODEL_OPTIONS}
         display_map = {k: v for k, v in self.MODEL_OPTIONS}
-        saved_model = ps.get("whisper_model", "nvidia/parakeet-tdt-0.6b-v3")
+        saved_model = ps.get("stt_model", ps.get("whisper_model", "nvidia/parakeet-tdt-0.6b-v3"))
         if saved_model not in valid_models:
             saved_model = "nvidia/parakeet-tdt-0.6b-v3"  # reset stale/invalid model names
         self.model_var.set(saved_model)
@@ -456,7 +463,7 @@ class SettingsPanel(tk.Frame):
         )
         self.recursive_var.set(ps.get("recursive", 1))
         self.quality_var.set(ps.get("quality_mode", 1))
-        self.replace_var.set(ps.get("replace_mode", "skip"))
+        self.replace_var.set(ps.get("existing_docx_mode", ps.get("replace_mode", "skip")))
         self.date_var.set(ps.get("replace_before_date", datetime.date.today().isoformat()))
         self.force_var.set(int(bool(ps.get("force_reprocess", 0))))
         self.retain_troubleshooting_var.set(
@@ -470,10 +477,10 @@ class SettingsPanel(tk.Frame):
         return {
             "polished_pipeline": self.pipeline_var.get(),
             "existing_transcripts_only": self.existing_transcripts_var.get(),
-            "whisper_model": self.model_var.get(),
+            "stt_model": self.model_var.get(),
             "recursive": self.recursive_var.get(),
             "quality_mode": self.quality_var.get(),
-            "replace_mode": self.replace_var.get(),
+            "existing_docx_mode": self.replace_var.get(),
             "replace_before_date": self.date_var.get(),
             "force_reprocess": self.force_var.get(),
             "retain_troubleshooting_artifacts": self.retain_troubleshooting_var.get(),

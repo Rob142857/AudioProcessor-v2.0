@@ -4,10 +4,10 @@
     "C:\\path\\to\\audio-collection": {
       "polished_pipeline": 1,
       "existing_transcripts_only": 0,
-      "whisper_model": "faster-whisper-large-v3",
+      "stt_model": "nvidia/parakeet-tdt-0.6b-v3",
       "recursive": 1,
       "quality_mode": 1,
-      "replace_mode": "skip",
+      "existing_docx_mode": "skip",
       "replace_before_date": "2026-01-01",
       "force_reprocess": 0,
       "retain_troubleshooting_artifacts": 1

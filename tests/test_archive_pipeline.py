@@ -22,6 +22,7 @@ from archive_pipeline import (
     acquire_run_lock,
     artifact_directory,
     artifact_paths,
+    append_publication_manifest_events,
     atomic_write_bytes,
     compact_stt_metadata,
     discover_audio,
@@ -30,6 +31,7 @@ from archive_pipeline import (
     main as pipeline_main,
     parse_args,
     publish_source_docx_batch,
+    publication_manifest_path,
     release_run_lock,
     sha256_text,
     source_publication_scope,
@@ -44,6 +46,71 @@ try:
     import psutil
 except ImportError:
     psutil = None
+
+
+class PublicationManifestContractTests(unittest.TestCase):
+    def test_glm_review_publication_emits_versioned_archive_relative_event(self):
+        with tempfile.TemporaryDirectory() as folder:
+            archive = Path(folder) / "archive"
+            source = archive / "1985 MW" / "0312.mp3"
+            target = archive / "1985 MW" / "0312 - GLM Review.docx"
+            job_manifest = Path(folder) / "generated" / "job" / "manifest.json"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"audio")
+            target.write_bytes(b"reviewed docx bytes")
+            job_manifest.parent.mkdir(parents=True)
+            job_manifest.write_text(
+                json.dumps({"cleanup": {"profile": "semantic-conservative-repair-v9"}}),
+                encoding="utf-8",
+            )
+            item = SimpleNamespace(
+                source=source,
+                target=target,
+                manifest=job_manifest,
+                generated_sha256=__import__("hashlib").sha256(target.read_bytes()).hexdigest(),
+            )
+
+            events = append_publication_manifest_events(
+                SimpleNamespace(items=(item,)), archive_root=archive, run_id="run-123"
+            )
+
+            self.assertEqual(1, len(events))
+            event = events[0]
+            self.assertEqual(1, event["schema_version"])
+            self.assertEqual("1985 MW/0312.mp3", event["source_path"])
+            self.assertEqual("1985 MW/0312 - GLM Review.docx", event["docx_path"])
+            self.assertTrue(str(event["content_hash"]).startswith("sha256:"))
+            self.assertEqual("run-123", event["run_id"])
+            self.assertEqual(
+                [event],
+                [
+                    json.loads(line)
+                    for line in publication_manifest_path(archive).read_text(
+                        encoding="utf-8"
+                    ).splitlines()
+                ],
+            )
+
+    def test_raw_sibling_does_not_enter_glm_ingestion_feed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            archive = Path(folder) / "archive"
+            source = archive / "lecture.mp3"
+            raw_target = archive / "lecture.docx"
+            job_manifest = Path(folder) / "generated" / "manifest.json"
+            archive.mkdir()
+            source.write_bytes(b"audio")
+            raw_target.write_bytes(b"raw")
+            job_manifest.parent.mkdir(parents=True)
+            job_manifest.write_text("{}", encoding="utf-8")
+            item = SimpleNamespace(source=source, target=raw_target, manifest=job_manifest)
+
+            self.assertEqual(
+                [],
+                append_publication_manifest_events(
+                    SimpleNamespace(items=(item,)), archive_root=archive, run_id="run-raw"
+                ),
+            )
+            self.assertFalse(publication_manifest_path(archive).exists())
 
 
 class FakeCleanupResult:
@@ -119,7 +186,9 @@ class ArchivePipelineTests(unittest.TestCase):
         self.assertTrue(config.retain_troubleshooting_artifacts)
         self.assertEqual(config.glm_workers, 30)
         self.assertFalse(parse_args(["archive"]).publish_source_docx)
-        self.assertEqual(parse_args(["archive"]).glm_workers, 30)
+        # The raw parser leaves omitted config values unset so environment
+        # precedence can be applied by the canonical resolver in main().
+        self.assertIsNone(parse_args(["archive"]).glm_workers)
         self.assertTrue(
             parse_args(["archive", "--no-troubleshooting-logs"]).no_troubleshooting_logs
         )
@@ -667,6 +736,7 @@ class ArchivePipelineTests(unittest.TestCase):
                     input_path=source_root,
                     output_root=output_root,
                     cleanup_enabled=False,
+                    stt_model="faster-whisper-large-v3",
                 ),
                 cancel_check=lambda: cancelled["value"],
             )
@@ -683,7 +753,7 @@ class ArchivePipelineTests(unittest.TestCase):
                         }
                     ],
                     "metadata": {
-                        "model": "Faster-Whisper large-v3",
+                        "model": runner.config.stt_model,
                         "audio_duration_seconds": 10.0,
                     },
                     "elapsed_seconds": 1.0,
@@ -744,6 +814,7 @@ class ArchivePipelineTests(unittest.TestCase):
                     input_path=source_root,
                     output_root=output_root,
                     publish_source_docx=True,
+                    stt_model="faster-whisper-large-v3",
                 ),
                 cancel_check=lambda: cancelled["value"],
             )
@@ -1449,6 +1520,7 @@ class ArchivePipelineTests(unittest.TestCase):
         config = PipelineConfig(
             input_path=source_root,
             output_root=output_root,
+            stt_model="faster-whisper-large-v3",
             cleanup_enabled=cleanup,
             cleanup_only=cleanup_only,
             retry_review=retry_review,
@@ -1468,7 +1540,7 @@ class ArchivePipelineTests(unittest.TestCase):
                     {"start": 3.4, "end": 7.0, "text": "transcribed spoken words"},
                 ],
                 "metadata": {
-                    "model": "Faster-Whisper large-v3",
+                    "model": runner.config.stt_model,
                     "audio_duration_seconds": 7.5,
                 },
                 "elapsed_seconds": 1.0,
@@ -2009,6 +2081,7 @@ class ReapStaleRunningManifestTests(unittest.TestCase):
                 input_path=source_root,
                 output_root=output_root,
                 cleanup_enabled=False,
+                stt_model="faster-whisper-large-v3",
             )
             runner = PipelineRunner(config)
             transcribe_calls = []
@@ -2022,7 +2095,7 @@ class ReapStaleRunningManifestTests(unittest.TestCase):
                         {"start": 0.0, "end": 3.0, "text": "faithfully transcribed"},
                         {"start": 3.1, "end": 6.0, "text": "spoken words here"},
                     ],
-                    "metadata": {"model": "Faster-Whisper large-v3", "audio_duration_seconds": 6.0},
+                    "metadata": {"model": runner.config.stt_model, "audio_duration_seconds": 6.0},
                     "elapsed_seconds": 0.1,
                 }
 
@@ -2106,6 +2179,7 @@ class FailureSummaryTests(unittest.TestCase):
                 input_path=source_root,
                 output_root=output_root,
                 cleanup_enabled=False,
+                stt_model="faster-whisper-large-v3",
             )
             runner = PipelineRunner(config)
 
@@ -2117,7 +2191,7 @@ class FailureSummaryTests(unittest.TestCase):
                         "segments": [
                             {"start": 0.0, "end": 2.0, "text": "hello there friend"}
                         ],
-                        "metadata": {"model": "Faster-Whisper large-v3", "audio_duration_seconds": 2.0},
+                        "metadata": {"model": runner.config.stt_model, "audio_duration_seconds": 2.0},
                         "elapsed_seconds": 0.1,
                     }
                 if path.name in ("missing.aiff", "missing2.aiff"):
@@ -2174,6 +2248,7 @@ class FailureSummaryTests(unittest.TestCase):
                 input_path=source_root,
                 output_root=output_root,
                 cleanup_enabled=False,
+                stt_model="faster-whisper-large-v3",
             )
             runner = PipelineRunner(config)
 
@@ -2185,7 +2260,7 @@ class FailureSummaryTests(unittest.TestCase):
                         {"start": 0.0, "end": 3.0, "text": "faithfully transcribed"},
                         {"start": 3.1, "end": 6.0, "text": "spoken words here"},
                     ],
-                    "metadata": {"model": "Faster-Whisper large-v3", "audio_duration_seconds": 6.0},
+                    "metadata": {"model": runner.config.stt_model, "audio_duration_seconds": 6.0},
                     "elapsed_seconds": 0.1,
                 }
 

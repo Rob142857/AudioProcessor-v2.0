@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "gitleaks is required by this repository's pre-commit hook." >&2
+  echo "Install it, or rely on the mandatory CI secret scan before merging." >&2
+  exit 1
+fi
+
+gitleaks git --pre-commit --staged --verbose --redact --config .gitleaks.toml

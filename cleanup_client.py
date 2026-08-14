@@ -25,6 +25,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from fsutil import sha256_text, windows_extended_path
 from pipeline_control import CancelCheck, raise_if_cancelled
 
 
@@ -72,22 +73,10 @@ _REPAIR_COUNT_FIELDS = (
 )
 
 
-def _windows_extended_path(path: str | Path) -> str:
-    """Return an extended Windows path when a checkpoint name exceeds MAX_PATH.
-
-    The generated archive root is intentionally descriptive. A long lecture
-    name plus its checksum directory can therefore make the final checkpoint
-    filename longer than Windows' traditional 260-character limit, even when
-    its temporary filename is short. ``\\\\?\\`` lets ``os.replace`` address the
-    durable final name without weakening the atomic-write guarantee.
-    """
-
-    value = os.path.abspath(os.fspath(path))
-    if os.name != "nt" or value.startswith("\\\\?\\"):
-        return value
-    if value.startswith("\\\\"):
-        return "\\\\?\\UNC\\" + value[2:]
-    return "\\\\?\\" + value
+# Private aliases retain the established client API while the implementation
+# lives in the shared, independently tested filesystem module.
+_windows_extended_path = windows_extended_path
+_sha256_text = sha256_text
 
 
 class CleanupClientError(RuntimeError):
@@ -1116,10 +1105,6 @@ def _derive_terms_endpoint(endpoint: str) -> str:
     return urllib.parse.urlunsplit(
         (parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment)
     )
-
-
-def _sha256_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _tail_words(text: str, limit: int) -> str:
